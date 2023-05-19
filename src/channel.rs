@@ -27,6 +27,9 @@ pub struct ChannelData {
     /// [`Event::ChannelOpen`][crate::Event::ChannelOpen].
     pub id: ChannelId,
 
+    /// SCTP Stream id
+    pub sctp_stream_id: u16,
+
     /// Tells whether the sender sent this data as binary or text.
     pub binary: bool,
 

@@ -733,13 +733,13 @@ pub enum Event {
     ///
     /// For [`SdpApi`]: The first ever data channel results in an SDP
     /// negotiation, and this events comes at the end of that.
-    ChannelOpen(ChannelId, String),
+    ChannelOpen(ChannelId, u16, String),
 
     /// Incoming data channel data from the remote peer.
     ChannelData(ChannelData),
 
     /// A data channel has been closed.
-    ChannelClose(ChannelId),
+    ChannelClose(ChannelId, u16),
 
     /// Statistics event for the Rtc instance
     ///
@@ -1117,24 +1117,36 @@ impl Rtc {
                         break;
                     }
                 }
-                SctpEvent::Open { id, label } => {
-                    self.chan.ensure_channel_id_for(id);
-                    let id = self.chan.channel_id_by_stream_id(id).unwrap();
-                    return Ok(Output::Event(Event::ChannelOpen(id, label)));
+                SctpEvent::Open {
+                    id: sctp_stream_id,
+                    label,
+                } => {
+                    self.chan.ensure_channel_id_for(sctp_stream_id);
+                    let id = self.chan.channel_id_by_stream_id(sctp_stream_id).unwrap();
+                    return Ok(Output::Event(Event::ChannelOpen(id, sctp_stream_id, label)));
                 }
-                SctpEvent::Close { id } => {
-                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
-                        warn!("Drop ChannelClose event for id: {:?}", id);
+                SctpEvent::Close { id: sctp_stream_id } => {
+                    let Some(id) = self.chan.channel_id_by_stream_id(sctp_stream_id) else {
+                        warn!("Drop ChannelClose event for id: {:?}", sctp_stream_id);
                         continue;
                     };
-                    return Ok(Output::Event(Event::ChannelClose(id)));
+                    return Ok(Output::Event(Event::ChannelClose(id, sctp_stream_id)));
                 }
-                SctpEvent::Data { id, binary, data } => {
-                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
-                        warn!("Drop ChannelData event for id: {:?}", id);
+                SctpEvent::Data {
+                    id: sctp_stream_id,
+                    binary,
+                    data,
+                } => {
+                    let Some(id) = self.chan.channel_id_by_stream_id(sctp_stream_id) else {
+                        warn!("Drop ChannelData event for id: {:?}", sctp_stream_id);
                         continue;
                     };
-                    let cd = ChannelData { id, binary, data };
+                    let cd = ChannelData {
+                        id,
+                        sctp_stream_id,
+                        binary,
+                        data,
+                    };
                     return Ok(Output::Event(Event::ChannelData(cd)));
                 }
             }
@@ -1764,9 +1776,11 @@ impl PartialEq for Event {
             (Self::IceConnectionStateChange(l0), Self::IceConnectionStateChange(r0)) => l0 == r0,
             (Self::MediaAdded(m0), Self::MediaAdded(m1)) => m0 == m1,
             (Self::MediaData(m1), Self::MediaData(m2)) => m1 == m2,
-            (Self::ChannelOpen(l0, l1), Self::ChannelOpen(r0, r1)) => l0 == r0 && l1 == r1,
+            (Self::ChannelOpen(l0, l1, l2), Self::ChannelOpen(r0, r1, r2)) => {
+                l0 == r0 && l1 == r1 && l2 == r2
+            }
             (Self::ChannelData(l0), Self::ChannelData(r0)) => l0 == r0,
-            (Self::ChannelClose(l0), Self::ChannelClose(r0)) => l0 == r0,
+            (Self::ChannelClose(l0, l1), Self::ChannelClose(r0, r1)) => l0 == r0 && l1 == r1,
             _ => false,
         }
     }

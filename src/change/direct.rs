@@ -99,6 +99,16 @@ impl<'a> DirectApi<'a> {
         id
     }
 
+    /// Write to data channel using sctp_stream_id
+    pub fn write_data_channel(
+        &mut self,
+        sctp_stream_id: u16,
+        binary: bool,
+        buf: &[u8],
+    ) -> Result<usize, RtcError> {
+        Ok(self.rtc.sctp.write(sctp_stream_id, binary, buf)?)
+    }
+
     /// Set whether to enable ice-lite.
     pub fn set_ice_lite(&mut self, ice_lite: bool) {
         self.rtc.ice.set_ice_lite(ice_lite);

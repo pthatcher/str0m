@@ -81,7 +81,7 @@ pub fn data_channel_direct() -> Result<(), RtcError> {
     assert!(l
         .events
         .iter()
-        .any(|event| event == &Event::ChannelOpen(cid, "my-chan".into())));
+        .any(|event| event == &Event::ChannelOpen(cid, 1, "my-chan".into())));
 
     Ok(())
 }
