@@ -146,7 +146,7 @@ impl Session {
             twcc_rx_register: TwccRecvRegister::new(100),
             twcc_tx_register: TwccSendRegister::new(1000),
             bwe,
-            enable_twcc_feedback: false,
+            enable_twcc_feedback: true,
             pacer,
             poll_packet_buf: vec![0; 2000],
             ice_lite: config.ice_lite,
