@@ -311,7 +311,7 @@ impl MediaInner {
         // We don't actually want this buffer here, but it must be created before we
         // get to the do_packetize() (as part of handle_timeout).
         let _ = self.buffers_tx.entry(pt).or_insert_with(|| {
-            let max_retain = if is_audio { 3 } else { 10 };
+            let max_retain = if is_audio { 50 } else { 34 };
             PacketizingBuffer::new(codec.into(), max_retain)
         });
 
