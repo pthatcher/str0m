@@ -1,11 +1,15 @@
 use std::fmt;
 
+use openssl::cipher;
+use openssl::cipher_ctx::CipherCtx;
+
 use openssl::symm::{Cipher, Crypter, Mode};
 
 use crate::dtls::KeyingMaterial;
 use crate::io::Sha1;
 
 use super::header::RtpHeader;
+use super::Ssrc;
 
 pub const SRTP_BLOCK_SIZE: usize = 16;
 const SRTP_HMAC_LEN: usize = 10;
@@ -30,6 +34,12 @@ pub struct SrtpContext {
     rtcp: Derived,
     /// Counter for outgoing SRTCP packets.
     srtcp_index: u32,
+
+    rtp_encrypter: RtpEncrypter,
+    rtp_decrypter: RtpDecrypter,
+
+    rtcp_encrypter: RtpEncrypter,
+    rtcp_decrypter: RtpDecrypter,
 }
 
 impl SrtpContext {
@@ -37,6 +47,10 @@ impl SrtpContext {
         let (rtp, rtcp) = Derived::from_key(&srtp_key);
 
         SrtpContext {
+            rtp_decrypter: RtpDecrypter::new(rtp.aes),
+            rtp_encrypter: RtpEncrypter::new(rtp.aes),
+            rtcp_decrypter: RtpDecrypter::new(rtcp.aes),
+            rtcp_encrypter: RtpEncrypter::new(rtcp.aes),
             rtp,
             rtcp,
             srtcp_index: 0,
@@ -71,7 +85,7 @@ impl SrtpContext {
     //  |                                                                   |
     //  +- Encrypted Portion*                      Authenticated Portion ---+
 
-    pub fn protect_rtp(
+    pub fn _protect_rtp(
         &mut self,
         buf: &[u8],
         header: &RtpHeader,
@@ -97,7 +111,67 @@ impl SrtpContext {
         output
     }
 
-    pub fn unprotect_rtp(
+    pub fn encrypt_rtp(
+        &mut self,
+        buf: &[u8],
+        header_len: usize,
+        ssrc: Ssrc,
+        srtp_index: u64, // same as ext_seq
+    ) -> Vec<u8> {
+        let iv = self.rtp.salt.rtp_iv(*ssrc, srtp_index);
+
+        let input = &buf[header_len..];
+        assert!(input.len() % SRTP_BLOCK_SIZE == 0);
+
+        let mut output = vec![0_u8; buf.len() + SRTP_HMAC_LEN];
+        self.rtp_encrypter
+            .encrypt(&iv, input, &mut output[header_len..]);
+
+        output[..header_len].copy_from_slice(&buf[..header_len]);
+
+        let hmac_start = buf.len();
+        self.rtp.hmac.rtp_hmac(&mut output, srtp_index, hmac_start);
+
+        output
+    }
+
+    pub fn decrypt_rtp(
+        &mut self,
+        buf: &[u8],
+        header_len: usize,
+        ssrc: Ssrc,
+        srtp_index: u64,
+    ) -> Option<Vec<u8>> {
+        if buf.len() < SRTP_HMAC_LEN {
+            todo!();
+        }
+
+        let hmac_start = buf.len() - SRTP_HMAC_LEN;
+
+        if !self
+            .rtp
+            .hmac
+            .rtp_verify(&buf[..hmac_start], srtp_index, &buf[hmac_start..])
+        {
+            trace!("unprotect_rtp hmac verify fail");
+            todo!();
+        }
+
+        let iv = self.rtp.salt.rtp_iv(*ssrc, srtp_index);
+
+        let input = &buf[header_len..hmac_start];
+
+        // Allocate enough to also hold a header, since this is used in rtp-mode.
+        let mut output = Vec::with_capacity(buf.len());
+        output.resize(input.len(), 0);
+
+        //self.rtp.aes.crypt(false, &iv, input, &mut output);
+        self.rtp_decrypter.decrypt(&iv, input, &mut output);
+
+        Some(output)
+    }
+
+    pub fn _unprotect_rtp(
         &mut self,
         buf: &[u8],
         header: &RtpHeader,
@@ -133,7 +207,41 @@ impl SrtpContext {
         Some(output)
     }
 
-    pub fn protect_rtcp(&mut self, buf: &[u8]) -> Vec<u8> {
+    pub fn encrypt_rtcp(&mut self, buf: &[u8]) -> Vec<u8> {
+        // https://tools.ietf.org/html/rfc3711#page-15
+        // The SRTCP index MUST be set to zero before the first SRTCP
+        // packet is sent, and MUST be incremented by one,
+        // modulo 2^31, after each SRTCP packet is sent.
+        self.srtcp_index = (self.srtcp_index + 1) % 2_u32.pow(31);
+
+        let srtcp_index = self.srtcp_index;
+        let ssrc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        if ssrc == 0 {
+            warn!("SSRC 0 does not make a good SRTCP IV");
+        }
+
+        let iv = self.rtcp.salt.rtp_iv(ssrc, srtcp_index as u64);
+
+        let mut output = vec![0_u8; buf.len() + SRTCP_INDEX_LEN + SRTP_HMAC_LEN];
+        output[0..8].copy_from_slice(&buf[0..8]);
+        let input = &buf[8..];
+        let encout = &mut output[8..(8 + input.len())];
+
+        self.rtcp_encrypter.encrypt(&iv, input, encout);
+
+        // e is always encrypted, rest is 31 byte index.
+        let e_and_si = 0x8000_0000 | srtcp_index;
+        let to = &mut output[buf.len()..];
+        to[0..4].copy_from_slice(&e_and_si.to_be_bytes());
+
+        let hmac_index = output.len() - SRTP_HMAC_LEN;
+        self.rtcp.hmac.rtcp_hmac(&mut output, hmac_index);
+
+        output
+    }
+
+    pub fn _protect_rtcp(&mut self, buf: &[u8]) -> Vec<u8> {
         // https://tools.ietf.org/html/rfc3711#page-15
         // The SRTCP index MUST be set to zero before the first SRTCP
         // packet is sent, and MUST be incremented by one,
@@ -176,7 +284,7 @@ impl SrtpContext {
     //                  |--------------------------------------|
     //                              encrypted (aes)
 
-    pub fn unprotect_rtcp(&mut self, buf: &[u8]) -> Option<Vec<u8>> {
+    pub fn _unprotect_rtcp(&mut self, buf: &[u8]) -> Option<Vec<u8>> {
         if buf.len() < SRTP_HMAC_LEN + SRTCP_INDEX_LEN {
             return None;
         }
@@ -226,6 +334,61 @@ impl SrtpContext {
         output[0..8].copy_from_slice(&buf[0..8]);
 
         self.rtcp.aes.crypt(false, &iv, input, &mut output[8..]);
+
+        Some(output)
+    }
+
+    pub fn decrypt_rtcp(&mut self, buf: &[u8]) -> Option<Vec<u8>> {
+        if buf.len() < SRTP_HMAC_LEN + SRTCP_INDEX_LEN {
+            return None;
+        }
+
+        let hmac_start = buf.len() - SRTP_HMAC_LEN;
+
+        if !self
+            .rtcp
+            .hmac
+            .rtcp_verify(&buf[..hmac_start], &buf[hmac_start..])
+        {
+            trace!("unprotect_rtcp hmac verify fail");
+            return None;
+        }
+
+        let idx_start = hmac_start - SRTCP_INDEX_LEN;
+
+        let srtcp_index_be = [
+            buf[idx_start],
+            buf[idx_start + 1],
+            buf[idx_start + 2],
+            buf[idx_start + 3],
+        ];
+
+        // E-flag and SRTCP index.
+        let e_and_si = u32::from_be_bytes(srtcp_index_be);
+
+        let is_encrypted = e_and_si & 0x8000_0000 > 0;
+
+        if !is_encrypted {
+            // Non-encrypted we can just return
+            return Some(buf[0..idx_start].to_vec());
+        }
+
+        // The SRTCP index is a 31-bit counter for the SRTCP packet.
+        let srtcp_index = e_and_si & 0x7fff_ffff;
+        let ssrc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        let iv = self.rtcp.salt.rtp_iv(ssrc, srtcp_index as u64);
+
+        // The Encrypted Portion of an SRTCP packet consists of the encryption
+        // of the RTCP payload of the equivalent compound RTCP packet, from the
+        // first RTCP packet, i.e., from the ninth (9) octet to the end of the
+        // compound packet.
+        let input = &buf[8..idx_start];
+        let mut output = vec![0_u8; input.len() + 8];
+        output[0..8].copy_from_slice(&buf[0..8]);
+
+        //self.rtcp.aes.crypt(false, &iv, input, &mut output[8..]);
+        self.rtcp_decrypter.decrypt(&iv, input, &mut output[8..]);
 
         Some(output)
     }
@@ -370,6 +533,56 @@ impl Derived {
         };
 
         (rtp, rtcp)
+    }
+}
+
+struct RtpEncrypter {
+    ctx: CipherCtx,
+}
+
+impl RtpEncrypter {
+    fn new(aes_key: AesKey) -> Self {
+        let t = cipher::Cipher::aes_128_ctr();
+        let mut ctx = CipherCtx::new().unwrap();
+        ctx.encrypt_init(Some(t), Some(&aes_key[..]), None).unwrap();
+        Self { ctx }
+    }
+
+    fn encrypt(&mut self, iv: &RtpIv, input: &[u8], output: &mut [u8]) {
+        self.ctx.encrypt_init(None, None, Some(iv)).unwrap();
+        let count = self.ctx.cipher_update(input, Some(output)).unwrap();
+        self.ctx.cipher_final(&mut output[count..]).unwrap();
+    }
+}
+
+impl fmt::Debug for RtpEncrypter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "",)
+    }
+}
+
+struct RtpDecrypter {
+    ctx: CipherCtx,
+}
+
+impl RtpDecrypter {
+    fn new(aes_key: AesKey) -> Self {
+        let t = cipher::Cipher::aes_128_ctr();
+        let mut ctx = CipherCtx::new().unwrap();
+        ctx.decrypt_init(Some(t), Some(&aes_key[..]), None).unwrap();
+        Self { ctx }
+    }
+
+    fn decrypt(&mut self, iv: &RtpIv, input: &[u8], output: &mut [u8]) {
+        self.ctx.decrypt_init(None, None, Some(iv)).unwrap();
+        let count = self.ctx.cipher_update(input, Some(output)).unwrap();
+        self.ctx.cipher_final(&mut output[count..]).unwrap();
+    }
+}
+
+impl fmt::Debug for RtpDecrypter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "",)
     }
 }
 
@@ -573,7 +786,7 @@ mod test {
         let key_rx = SrtpKey::new(&key_mat, true);
         let mut ctx_rx = SrtpContext::new(key_rx);
 
-        let decrypted = ctx_rx.unprotect_rtcp(SRTCP).unwrap();
+        let decrypted = ctx_rx._unprotect_rtcp(SRTCP).unwrap();
 
         // check srtcp_index will be 1
         assert_eq!(ctx_rx.srtcp_index, 0);
@@ -586,7 +799,7 @@ mod test {
         println!("{decrypted:02x?}");
 
         // Take us back to where we started.
-        let encrypted = ctx_rx.protect_rtcp(&decrypted);
+        let encrypted = ctx_rx._protect_rtcp(&decrypted);
         assert_eq!(encrypted, SRTCP);
     }
 }

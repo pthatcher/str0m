@@ -1,7 +1,11 @@
 [package]
 name = "str0m"
 version = "0.1.0"
-authors = ["Martin Algesten <martin@algesten.se>", "Hugo Tunius <h@tunius.se>", "Davide Bertola <dade@dadeb.it>"]
+authors = [
+    "Martin Algesten <martin@algesten.se>",
+    "Hugo Tunius <h@tunius.se>",
+    "Davide Bertola <dade@dadeb.it>",
+]
 description = "WebRTC library in Sans-IO style"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/algesten/str0m"
@@ -23,7 +27,7 @@ combine = "4.6.6"
 # Sadly no DTLS support in rustls.
 # If you want to use a system provided openssl you can set env variable 
 # OPENSSL_NO_VENDOR=1 to override the feature flag vendored
-openssl = { version = "0.10.45", features = ["vendored"] }
+openssl = { version = "0.10.54", features = ["vendored"] }
 openssl-sys = "0.9.80"
 # STUN
 hmac = "0.12.1"

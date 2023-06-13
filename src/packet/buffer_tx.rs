@@ -124,7 +124,6 @@ impl PacketizingBuffer {
 
             rtp_mode_header: Some(rtp_header),
         };
-
         self.queue.push_back(rtp);
 
         self.size_down_to_retained(now);

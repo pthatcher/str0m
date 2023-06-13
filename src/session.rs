@@ -412,13 +412,18 @@ impl Session {
 
         let is_rtx = source.is_rtx();
 
-        let mut data = match srtp.unprotect_rtp(buf, &header, *seq_no) {
+        let mut data = match srtp.decrypt_rtp(buf, header.header_len, ssrc, *seq_no) {
             Some(v) => v,
-            None => {
-                trace!("Failed to unprotect SRTP");
-                return;
-            }
+            None => todo!(),
         };
+
+        // let mut data = match srtp.unprotect_rtp(buf, &header, *seq_no) {
+        //     Some(v) => v,
+        //     None => {
+        //         trace!("Failed to unprotect SRTP");
+        //         return;
+        //     }
+        // };
 
         // For RTX we copy the header and modify the sequencer number to be that of the repaired stream.
         let mut header = header.clone();
@@ -534,7 +539,8 @@ impl Session {
 
     fn handle_rtcp(&mut self, now: Instant, buf: &[u8]) -> Option<()> {
         let srtp = self.srtp_rx.as_mut()?;
-        let unprotected = srtp.unprotect_rtcp(buf)?;
+        //let unprotected = srtp.unprotect_rtcp(buf)?;
+        let unprotected = srtp.decrypt_rtcp(buf)?;
 
         let feedback = Rtcp::read_packet(&unprotected);
 
@@ -702,7 +708,8 @@ impl Session {
         data.truncate(len);
 
         let srtp = self.srtp_tx.as_mut()?;
-        let protected = srtp.protect_rtcp(&data);
+        //let protected = srtp.protect_rtcp(&data);
+        let protected = srtp.encrypt_rtcp(&data);
 
         assert!(
             protected.len() < DATAGRAM_MTU,
@@ -748,7 +755,8 @@ impl Session {
             }
 
             self.pacer.register_send(now, payload_size.into(), mid);
-            let protected = srtp_tx.protect_rtp(buf, &header, *twcc_seq_no);
+            //let protected = srtp_tx.protect_rtp(buf, &header, *twcc_seq_no);
+            let protected = srtp_tx.encrypt_rtp(buf, header.header_len, header.ssrc, *twcc_seq_no);
 
             self.twcc_tx_register
                 .register_seq(twcc_seq.into(), now, payload_size);
