@@ -27,7 +27,7 @@ pub(crate) use id::Id;
 pub(crate) const DATAGRAM_MTU: usize = 1150;
 
 /// Warn if any packet we are about to send is above this size.
-pub(crate) const DATAGRAM_MTU_WARN: usize = 1200;
+pub(crate) const DATAGRAM_MTU_WARN: usize = 1250;
 
 /// Errors from parsing network data.
 #[derive(Debug, Error)]
