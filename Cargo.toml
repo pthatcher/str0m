@@ -1,7 +1,11 @@
 [package]
 name = "str0m"
 version = "0.1.0"
-authors = ["Martin Algesten <martin@algesten.se>", "Hugo Tunius <h@tunius.se>", "Davide Bertola <dade@dadeb.it>"]
+authors = [
+    "Martin Algesten <martin@algesten.se>",
+    "Hugo Tunius <h@tunius.se>",
+    "Davide Bertola <dade@dadeb.it>",
+]
 description = "WebRTC library in Sans-IO style"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/algesten/str0m"
@@ -39,6 +43,8 @@ rouille = { version = "3.5.0", features = ["ssl"] }
 serde_json = "1.0"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "std"] }
 systemstat = "0.2.2"
+quinn-proto = "0.10"                                                          # For examples/p2p_quic.rs
+rustls = "0.21"                                                               # For examples/p2p_quic.rs
 
 [target.'cfg(fuzzing)'.dev-dependencies]
 fuzzcheck = "0.12"
