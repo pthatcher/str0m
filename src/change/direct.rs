@@ -217,8 +217,12 @@ impl<'a> DirectApi<'a> {
         index: usize,
         exts: ExtensionMap,
         params: Vec<PayloadParams>,
+        enable_nack: bool,
     ) {
-        let media = MediaInner::new_from_remote(mid, kind, index, exts, dir, params);
+        let mut media = MediaInner::new_from_remote(mid, kind, index, exts, dir, params);
+        if enable_nack {
+            media.enable_nack();
+        }
         self.rtc.session.add_media(media);
         // TODO: not clear what's gonna happen here, my guess is that when it sees a rtp with Mid it will generate a open event
     }
