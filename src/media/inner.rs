@@ -1326,7 +1326,7 @@ impl MediaInner {
         // repairs, as those are RTX, and we ignore ourselves.
         self.sources_rx
             .iter()
-            .rfind(|r| r.rid() == repairs && r.ssrc() != rtx_ssrc && r.repairs().is_none())
+            .rfind(|r| r.rid() == repairs && r.ssrc() != rtx_ssrc && !r.is_rtx())
             .map(|r| r.ssrc())
     }
 
