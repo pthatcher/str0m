@@ -383,18 +383,6 @@ impl Session {
             }
         };
 
-        // For RTX, figure out the repair SSRC.
-        let ssrc_repairs = if is_rtx {
-            //Prefer the RID repair header, but fallback to the last RID values for the source.
-            let rid_repair = header
-                .ext_vals
-                .rid_repair
-                .or_else(|| media.get_or_create_source_rx(ssrc).rid());
-            media.ssrc_rx_for_rid(rid_repair, ssrc)
-        } else {
-            None
-        };
-
         let source = media.get_or_create_source_rx(ssrc);
 
         let mut media_need_check_source = false;
@@ -404,16 +392,24 @@ impl Session {
             }
         }
 
-        // Figure out which SSRC the repairs header points out. This is here because of borrow
-        // checker ordering.
-        if let Some(repairs) = ssrc_repairs {
-            if source.set_repairs(repairs) {
-                media_need_check_source = true;
+        // For RTX, we need to look for the associated repair ssrc
+        let source = if is_rtx {
+            //Prefer the RID repair header, but fallback to the last RID values for the source.
+            let rid_repair = header.ext_vals.rid_repair.or_else(|| source.rid());
+            let repairs = media.ssrc_rx_for_rid(rid_repair, ssrc);
+            let source = media.get_or_create_source_rx(ssrc);
+            if let Some(repairs) = repairs {
+                if source.set_repairs(repairs) {
+                    media_need_check_source = true;
+                }
+            } else if source.repairs().is_none() {
+                trace!("Ignoring RTX since we don't know what it's for");
+                return;
             }
-        } else if is_rtx && source.repairs().is_none() {
-            trace!("Ignoring RTX since we don't know what it's for");
-            return;
-        }
+            source
+        } else {
+            source
+        };
 
         // Gymnastics to appease the borrow checker.
         let source = if media_need_check_source {
