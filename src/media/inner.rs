@@ -1321,9 +1321,11 @@ impl MediaInner {
         self.simulcast = Some(s);
     }
 
+    // Finds the most recent non-rtx SSRC for the given RID and RTX SSRC. If RID is None, it will
+    // find the most recent non-rtx SSRC without an assigned RID.
     pub fn find_primary_ssrc_for_rid(&self, repairs: Option<Rid>, rtx_ssrc: Ssrc) -> Option<Ssrc> {
-        // Find the most recent matching ssrc, in case the ssrc has changed. We ignore sources with
-        // repairs, as those are RTX, and we ignore ourselves.
+        // Note: We still need to make sure we don't return the rtx_ssrc, because the associated
+        // source for rtx_ssrc may not have repairs set, and hence not be aware it is for RTX.
         self.sources_rx
             .iter()
             .rfind(|r| r.rid() == repairs && r.ssrc() != rtx_ssrc && !r.is_rtx())
