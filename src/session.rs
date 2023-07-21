@@ -445,9 +445,10 @@ impl Session {
 
             let n = RtpHeader::read_original_sequence_number(&data, &mut orig_seq_16);
             data.drain(0..n);
-            info!(
+            trace!(
                 "Repaired seq no {} -> {}",
-                header.sequence_number, orig_seq_16
+                header.sequence_number,
+                orig_seq_16
             );
             header.sequence_number = orig_seq_16;
             if let Some(repairs_rid) = header.ext_vals.rid_repair {
@@ -461,7 +462,7 @@ impl Session {
                     return;
                 }
             };
-            info!("Repaired {:?} -> {:?}", header.ssrc, repaired_ssrc);
+            trace!("Repaired {:?} -> {:?}", header.ssrc, repaired_ssrc);
             header.ssrc = repaired_ssrc;
 
             let repaired_source = media.get_or_create_source_rx(repaired_ssrc);
