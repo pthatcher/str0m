@@ -392,18 +392,21 @@ impl Session {
             }
         }
 
-        // For RTX, we need to look for the associated repair ssrc
+        // Gymnastics to appease the borrow checker.
         let source = if is_rtx {
-            //Prefer the RID repair header, but fallback to the last RID values for the source.
+            // For RTX, we will look for the associated repair ssrc using the RID, if we have one.
+            // Prefer the RID repair header, if supplied, but fallback to the last RID values for
+            // the source.
             let rid_repair = header.ext_vals.rid_repair.or_else(|| source.rid());
             let repairs = media.ssrc_rx_for_rid(rid_repair, ssrc);
+
             let source = media.get_or_create_source_rx(ssrc);
             if let Some(repairs) = repairs {
                 if source.set_repairs(repairs) {
                     media_need_check_source = true;
                 }
             } else if source.repairs().is_none() {
-                trace!("Ignoring RTX since we don't know what it's for");
+                trace!("Ignoring RTX since we could not find an associated SSRC");
                 return;
             }
             source
