@@ -375,8 +375,8 @@ impl Session {
                 return;
             }
         };
-        let clock_rate = match media.get_params(header.payload_type) {
-            Some(v) => v.spec().clock_rate,
+        let (clock_rate, is_rtx) = match media.get_params(header.payload_type) {
+            Some(v) => (v.spec().clock_rate, v.resend() == Some(header.payload_type)),
             None => {
                 trace!("No codec params for {:?}", header.payload_type);
                 return;
@@ -385,10 +385,8 @@ impl Session {
 
         // Figure out which SSRC the repairs header points out. This is here because of borrow
         // checker ordering.
-        let ssrc_repairs = header
-            .ext_vals
-            .rid_repair
-            .and_then(|repairs| media.ssrc_rx_for_rid(repairs));
+        let rid_repair = header.ext_vals.rid_repair;
+        let ssrc_repairs = media.ssrc_rx_for_rid(rid_repair, ssrc);
 
         let source = media.get_or_create_source_rx(ssrc);
 
@@ -398,9 +396,17 @@ impl Session {
                 media_need_check_source = true;
             }
         }
-        if let Some(repairs) = ssrc_repairs {
-            if source.set_repairs(repairs) {
-                media_need_check_source = true;
+
+        if is_rtx {
+            // Figure out which SSRC the repairs header points out. This is here because of borrow
+            // checker ordering.
+            if let Some(repairs) = ssrc_repairs {
+                if source.set_repairs(repairs) {
+                    media_need_check_source = true;
+                }
+            } else if source.repairs().is_none() {
+                trace!("Ignoring RTX since we don't know what it's for");
+                return;
             }
         }
 
@@ -527,6 +533,16 @@ impl Session {
             data.extend_from_slice(&buf[..meta.header.header_len]);
             // Rotate so header is before body.
             data.rotate_right(meta.header.header_len);
+
+            // Update the PT/SSRC/SeqNo if this was an RTX packet.
+            if is_rtx {
+                let ssrc = ssrc.to_be_bytes();
+                let seq_no = (*seq_no as u16).to_be_bytes();
+
+                data[1] = (data[1] & 0b1000_0000) | *pt;
+                data[2..4].copy_from_slice(&seq_no);
+                data[8..12].copy_from_slice(&ssrc);
+            }
         };
 
         buf_rx.push(meta, data);
