@@ -386,27 +386,38 @@ impl Session {
         let source = media.get_or_create_source_rx(ssrc);
 
         let mut media_need_check_source = false;
-        if let Some(rid) = header.ext_vals.rid {
+
+        // Obtain the rid supplied in the header, if any
+        let supplied_rid = if is_rtx {
+            header.ext_vals.rid_repair
+        } else {
+            header.ext_vals.rid
+        };
+
+        // Determine the source rid, and update if one was supplied
+        let rid = if let Some(rid) = supplied_rid {
             if source.set_rid(rid) {
                 media_need_check_source = true;
             }
-        }
+            supplied_rid
+        } else {
+            source.rid()
+        };
 
         // Gymnastics to appease the borrow checker.
         let source = if is_rtx {
-            // For RTX, we will look for the associated repair ssrc using the RID, if we have one.
-            // Prefer the RID repair header, if supplied, but fallback to the last RID values for
-            // the source.
-            let rid_repair = header.ext_vals.rid_repair.or_else(|| source.rid());
-            let repairs = media.ssrc_rx_for_rid(rid_repair, ssrc);
+            // For RTX, we will look for the associated repair ssrc using the last RID seen
+            // on our source.
+            let primary_ssrc = media.find_primary_ssrc_for_rid(rid, ssrc);
 
             let source = media.get_or_create_source_rx(ssrc);
-            if let Some(repairs) = repairs {
-                if source.set_repairs(repairs) {
+
+            if let Some(primary_ssrc) = primary_ssrc {
+                if source.set_repairs(primary_ssrc) {
                     media_need_check_source = true;
                 }
-            } else if source.repairs().is_none() {
-                trace!("Ignoring RTX since we could not find an associated SSRC");
+            } else {
+                trace!("Ignoring RTX packet because the we could not find an associated ssrc");
                 return;
             }
             source
@@ -422,7 +433,6 @@ impl Session {
             source
         };
 
-        let mut rid = source.rid();
         let seq_no = source.update(now, &header, clock_rate);
 
         let mut data = match srtp.unprotect_rtp(buf, &header, *seq_no) {
@@ -455,9 +465,6 @@ impl Session {
                 orig_seq_16
             );
             header.sequence_number = orig_seq_16;
-            if let Some(repairs_rid) = header.ext_vals.rid_repair {
-                rid = Some(repairs_rid);
-            }
 
             let repaired_ssrc = match source.repairs() {
                 Some(v) => v,
@@ -466,20 +473,25 @@ impl Session {
                     return;
                 }
             };
-            trace!("Repaired {:?} -> {:?}", header.ssrc, repaired_ssrc);
+            trace!("Repaired ssrc {:?} -> {:?}", header.ssrc, repaired_ssrc);
             header.ssrc = repaired_ssrc;
 
             let repaired_source = media.get_or_create_source_rx(repaired_ssrc);
-            if rid.is_none() && repaired_source.rid().is_some() {
-                rid = repaired_source.rid();
-            }
             let orig_seq_no = repaired_source.update(now, &header, clock_rate);
 
-            let params = media.get_params(header.payload_type).unwrap();
-            if Some(header.payload_type) == params.resend() {
-                // Update Payload type to match the original.
-                header.payload_type = params.pt;
-            }
+            let params = match media.get_params(header.payload_type) {
+                Some(v) => v,
+                None => {
+                    trace!("Can't find payload parameters for: {}", header.payload_type);
+                    return;
+                }
+            };
+            trace!(
+                "Repaired payload type {:?} -> {:?}",
+                header.payload_type,
+                params.pt
+            );
+            header.payload_type = params.pt;
 
             orig_seq_no
         } else {
