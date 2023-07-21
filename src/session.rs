@@ -421,8 +421,6 @@ impl Session {
         let mut rid = source.rid();
         let seq_no = source.update(now, &header, clock_rate);
 
-        let is_rtx = source.is_rtx();
-
         let mut data = match srtp.unprotect_rtp(buf, &header, *seq_no) {
             Some(v) => v,
             None => {
@@ -447,10 +445,9 @@ impl Session {
 
             let n = RtpHeader::read_original_sequence_number(&data, &mut orig_seq_16);
             data.drain(0..n);
-            trace!(
+            info!(
                 "Repaired seq no {} -> {}",
-                header.sequence_number,
-                orig_seq_16
+                header.sequence_number, orig_seq_16
             );
             header.sequence_number = orig_seq_16;
             if let Some(repairs_rid) = header.ext_vals.rid_repair {
@@ -464,7 +461,7 @@ impl Session {
                     return;
                 }
             };
-            trace!("Repaired {:?} -> {:?}", header.ssrc, repaired_ssrc);
+            info!("Repaired {:?} -> {:?}", header.ssrc, repaired_ssrc);
             header.ssrc = repaired_ssrc;
 
             let repaired_source = media.get_or_create_source_rx(repaired_ssrc);
@@ -474,8 +471,9 @@ impl Session {
             let orig_seq_no = repaired_source.update(now, &header, clock_rate);
 
             let params = media.get_params(header.payload_type).unwrap();
-            if let Some(pt) = params.resend() {
-                header.payload_type = pt;
+            if Some(header.payload_type) == params.resend() {
+                // Update Payload type to match the original.
+                header.payload_type = params.pt;
             }
 
             orig_seq_no
@@ -530,19 +528,17 @@ impl Session {
         if self.rtp_mode {
             // Write header after the body. This shouldn't allocate since
             // unprotect_rtp() call above should allocate enough space for the header.
-            data.extend_from_slice(&buf[..meta.header.header_len]);
+            if is_rtx {
+                // For RTX, we'll rebuild the header with the repaired values.
+                let payload_len = data.len();
+                data.resize(payload_len + meta.header.header_len, 0);
+                meta.header.write_to(&mut data[payload_len..], &self.exts);
+            } else {
+                // For non-RTX, we can just restore the original header.
+                data.extend_from_slice(&buf[..meta.header.header_len]);
+            }
             // Rotate so header is before body.
             data.rotate_right(meta.header.header_len);
-
-            // Update the PT/SSRC/SeqNo if this was an RTX packet.
-            if is_rtx {
-                let ssrc = ssrc.to_be_bytes();
-                let seq_no = (*seq_no as u16).to_be_bytes();
-
-                data[1] = (data[1] & 0b1000_0000) | *pt;
-                data[2..4].copy_from_slice(&seq_no);
-                data[8..12].copy_from_slice(&ssrc);
-            }
         };
 
         buf_rx.push(meta, data);
