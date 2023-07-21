@@ -398,11 +398,18 @@ impl Session {
             // Prefer the RID repair header, if supplied, but fallback to the last RID values for
             // the source.
             let rid_repair = header.ext_vals.rid_repair.or_else(|| source.rid());
-            let repairs = media.ssrc_rx_for_rid(rid_repair, ssrc);
+            let ssrc_repairs = media.find_primary_ssrc_for_rid(rid_repair, ssrc);
 
             let source = media.get_or_create_source_rx(ssrc);
-            if let Some(repairs) = repairs {
-                if source.set_repairs(repairs) {
+
+            // The rid_repair header may not be sent on every packet, so we need to remember the
+            // RID for this source in the future.
+            if let Some(rid) = rid_repair {
+                _ = source.set_rid(rid);
+            }
+
+            if let Some(ssrc_repairs) = ssrc_repairs {
+                if source.set_repairs(ssrc_repairs) {
                     media_need_check_source = true;
                 }
             } else if source.repairs().is_none() {

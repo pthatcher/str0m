@@ -1321,11 +1321,12 @@ impl MediaInner {
         self.simulcast = Some(s);
     }
 
-    pub fn ssrc_rx_for_rid(&self, repairs: Option<Rid>, ignore_ssrc: Ssrc) -> Option<Ssrc> {
-        // Find the most recent matching ssrc, in case the ssrc has changed.
+    pub fn find_primary_ssrc_for_rid(&self, repairs: Option<Rid>, rtx_ssrc: Ssrc) -> Option<Ssrc> {
+        // Find the most recent matching ssrc, in case the ssrc has changed. We ignore sources with
+        // repairs, as those are RTX, and we ignore ourselves.
         self.sources_rx
             .iter()
-            .rfind(|r| r.rid() == repairs && r.ssrc() != ignore_ssrc)
+            .rfind(|r| r.rid() == repairs && r.ssrc() != rtx_ssrc && r.repairs().is_none())
             .map(|r| r.ssrc())
     }
 
