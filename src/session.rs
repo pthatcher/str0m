@@ -383,9 +383,12 @@ impl Session {
             }
         };
 
-        // Figure out which SSRC the repairs header points out. This is here because of borrow
-        // checker ordering.
-        let rid_repair = header.ext_vals.rid_repair;
+        // Figure out the repair SSRC. Prefer the RID repair header, but fallback to the
+        // last RID values for the source.
+        let rid_repair = header
+            .ext_vals
+            .rid_repair
+            .or_else(|| media.get_or_create_source_rx(ssrc).rid());
         let ssrc_repairs = media.ssrc_rx_for_rid(rid_repair, ssrc);
 
         let source = media.get_or_create_source_rx(ssrc);
