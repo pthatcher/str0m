@@ -1321,7 +1321,7 @@ impl MediaInner {
         self.simulcast = Some(s);
     }
 
-    pub fn ssrc_rx_for_rid(&mut self, repairs: Option<Rid>, ignore_ssrc: Ssrc) -> Option<Ssrc> {
+    pub fn ssrc_rx_for_rid(&self, repairs: Option<Rid>, ignore_ssrc: Ssrc) -> Option<Ssrc> {
         // Find the most recent matching ssrc, in case the ssrc has changed.
         self.sources_rx
             .iter()
