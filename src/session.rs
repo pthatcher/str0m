@@ -466,7 +466,7 @@ impl Session {
                     return;
                 }
             };
-            trace!("Repaired {:?} -> {:?}", header.ssrc, repaired_ssrc);
+            trace!("Repaired ssrc {:?} -> {:?}", header.ssrc, repaired_ssrc);
             header.ssrc = repaired_ssrc;
 
             let repaired_source = media.get_or_create_source_rx(repaired_ssrc);
@@ -475,11 +475,19 @@ impl Session {
             }
             let orig_seq_no = repaired_source.update(now, &header, clock_rate);
 
-            let params = media.get_params(header.payload_type).unwrap();
-            if Some(header.payload_type) == params.resend() {
-                // Update Payload type to match the original.
-                header.payload_type = params.pt;
-            }
+            let params = match media.get_params(header.payload_type) {
+                Some(v) => v,
+                None => {
+                    trace!("Can't find payload parameters for: {}", header.payload_type);
+                    return;
+                }
+            };
+            trace!(
+                "Repaired payload type {:?} -> {:?}",
+                header.payload_type,
+                params.pt
+            );
+            header.payload_type = params.pt;
 
             orig_seq_no
         } else {
