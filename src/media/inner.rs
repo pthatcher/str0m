@@ -1246,7 +1246,6 @@ impl MediaInner {
                         mid: self.mid,
                         pt: *pt,
                         rid: *rid,
-                        ssrc: dep.meta.get(0).map(|meta| meta.header.ssrc),
                         params: codec,
                         time: dep.time,
                         network_time: dep.first_network_time(),

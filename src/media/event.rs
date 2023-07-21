@@ -1,7 +1,7 @@
 use std::ops::RangeInclusive;
 use std::time::Instant;
 
-use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, SeqNo, Ssrc};
+use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, SeqNo};
 use crate::sdp::Simulcast as SdpSimulcast;
 
 use super::PayloadParams;
@@ -97,9 +97,6 @@ pub struct MediaData {
     /// This is a newer standard that is sometimes used in WebRTC to identify
     /// a stream. Specifically when using Simulcast in Chrome.
     pub rid: Option<Rid>,
-
-    ///
-    pub ssrc: Option<Ssrc>,
 
     /// Parameters for the codec. This is used to match incoming PT to outgoing PT.
     pub params: PayloadParams,
