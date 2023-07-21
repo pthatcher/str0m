@@ -416,8 +416,8 @@ impl Session {
                 if source.set_repairs(primary_ssrc) {
                     media_need_check_source = true;
                 }
-            } else if source.repairs().is_none() {
-                trace!("Ignoring RTX since we could not find an associated SSRC");
+            } else {
+                trace!("Ignoring RTX packet because the we could not find an associated ssrc");
                 return;
             }
             source
