@@ -23,6 +23,8 @@ impl SendQueue {
     }
 
     pub fn push(&mut self, packet: RtpPacket) {
+        // , now: Instant) {
+        // self.total.increase(now, packet.payload.len());
         self.queue.push_back(packet);
     }
 
@@ -39,7 +41,12 @@ impl SendQueue {
     }
 
     pub fn peek(&mut self) -> Option<&mut RtpPacket> {
-        self.queue.front_mut()
+        let peeked = self.queue.front_mut()?;
+        if peeked.timestamp == not_happening() {
+            None
+        } else {
+            Some(peeked)
+        }
     }
 
     pub fn pop(&mut self, now: Instant) -> Option<RtpPacket> {

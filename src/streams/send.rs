@@ -233,6 +233,7 @@ impl StreamTx {
         ext_vals: ExtensionValues,
         nackable: bool,
         payload: Vec<u8>,
+        // now: Instant,
     ) -> Result<(), RtcError> {
         //
         // This 1 in clock frequency will be fixed in poll_output.
@@ -265,7 +266,7 @@ impl StreamTx {
             timestamp: not_happening(),
         };
 
-        self.send_queue.push(packet);
+        self.send_queue.push(packet); // , now);
 
         Ok(())
     }

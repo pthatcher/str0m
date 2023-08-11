@@ -129,7 +129,7 @@ impl StreamRx {
             check_paused_at: None,
             paused: true,
             need_paused_event: false,
-            pause_threshold: Duration::from_millis(1500),
+            pause_threshold: Duration::from_millis(150000),
         }
     }
 
@@ -341,6 +341,7 @@ impl StreamRx {
 
         header.ssrc = self.ssrc;
         header.payload_type = pt;
+        header.ext_vals.rid = header.ext_vals.rid_repair.take();
     }
 
     pub(crate) fn maybe_create_keyframe_request(

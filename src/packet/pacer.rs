@@ -478,7 +478,7 @@ impl LeakyBucketPacer {
                     .max(self.padding_debt / self.padding_bitrate);
                 if drain_debt_time.is_zero() {
                     // Give the main loop some time to doe something else e.g. queue media.
-                    drain_debt_time = Duration::from_micros(1);
+                    drain_debt_time = Duration::from_micros(1); // TODO: 100 micros
                 }
 
                 let padding_at = self
@@ -554,9 +554,14 @@ impl LeakyBucketPacer {
             .queue_states
             .iter()
             .all(|q| q.snapshot.packet_count == 0);
-        if !all_queues_empty {
-            return None;
-        }
+
+        // dbg! This is causing a hot loop because a packet gets stuck in the queue.
+        // if !all_queues_empty {
+        //     for queue in self.queue_states.iter() {
+        //         dbg!((queue.mid, queue.snapshot.packet_count));
+        //     }
+        //     return None;
+        // }
 
         // We must have sent some media.
         self.last_send_time?;
