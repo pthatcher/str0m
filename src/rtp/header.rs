@@ -208,9 +208,15 @@ impl RtpHeader {
                 return None;
             }
 
+            // each media has a specific extmap mapping.
             if ext_type == 0xbede {
-                // each media has a specific extmap mapping.
-                exts.parse(&buf[..ext_len], &mut ext);
+                // one byte header
+                exts.parse(&buf[..ext_len], false, &mut ext);
+            } else if (ext_type >> 4) == 0x100 {
+                // two byte header
+                exts.parse(&buf[..ext_len], true, &mut ext);
+            } else {
+                trace!("Ignoring unknown RTP header extension type: {:?}", ext_type);
             }
 
             &buf[ext_len..]

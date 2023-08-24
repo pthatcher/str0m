@@ -300,7 +300,12 @@ impl ExtensionMap {
     }
 
     // https://tools.ietf.org/html/rfc5285
-    pub(crate) fn parse(&self, mut buf: &[u8], ext_vals: &mut ExtensionValues) {
+    pub(crate) fn parse(
+        &self,
+        mut buf: &[u8],
+        two_byte_header: bool,
+        ext_vals: &mut ExtensionValues,
+    ) {
         loop {
             if buf.is_empty() {
                 return;
@@ -312,10 +317,17 @@ impl ExtensionMap {
                 continue;
             }
 
+            let (id, len) = if two_byte_header {
+                if buf.len() < 2 {
+                    return;
+                }
+                let id = buf[0];
+                let len = buf[1] as usize;
+                buf = &buf[2..];
+                (id, len)
+            } else {
             let id = buf[0] >> 4;
             let len = (buf[0] & 0xf) as usize + 1;
-            buf = &buf[1..];
-
             if id == 15 {
                 // If the ID value 15 is
                 // encountered, its length field should be ignored, processing of the
@@ -324,6 +336,9 @@ impl ExtensionMap {
                 // considered.
                 return;
             }
+                buf = &buf[1..];
+                (id, len)
+            };
 
             if buf.len() < len {
                 trace!("Not enough type ext len: {} < {}", buf.len(), len);
@@ -705,7 +720,7 @@ mod test {
         exts.write_to(&mut buf[..], &ev);
 
         let mut ev2 = ExtensionValues::default();
-        exts.parse(&buf, &mut ev2);
+        exts.parse(&buf, false, &mut ev2);
 
         assert_eq!(ev.abs_send_time, ev2.abs_send_time);
     }
@@ -724,7 +739,7 @@ mod test {
         exts.write_to(&mut buf[..], &ev);
 
         let mut ev2 = ExtensionValues::default();
-        exts.parse(&buf, &mut ev2);
+        exts.parse(&buf, false, &mut ev2);
 
         assert_eq!(ev.play_delay_min, ev2.play_delay_min);
         assert_eq!(ev.play_delay_max, ev2.play_delay_max);
