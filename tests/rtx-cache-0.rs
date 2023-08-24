@@ -99,7 +99,7 @@ pub fn rtx_cache_0() -> Result<(), RtcError> {
                         time,
                         wallclock,
                         false,
-                        exts,
+                        exts.clone(),
                         false,
                         packet.to_vec(),
                     )

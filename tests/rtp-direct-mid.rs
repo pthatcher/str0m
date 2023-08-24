@@ -95,7 +95,7 @@ pub fn rtp_direct_mid() -> Result<(), RtcError> {
                         time,
                         wallclock,
                         false,
-                        exts,
+                        exts.clone(),
                         false,
                         packet.to_vec(),
                     )

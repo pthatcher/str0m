@@ -86,7 +86,7 @@ pub fn repeated() -> Result<(), RtcError> {
                     time,
                     wallclock,
                     false,
-                    exts,
+                    exts.clone(),
                     false,
                     vec![0x01, 0x02, 0x03, 0x04],
                 )
