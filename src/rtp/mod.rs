@@ -11,7 +11,7 @@ mod id;
 pub use id::{Mid, Pt, Rid, SeqNo, SessionId, Ssrc};
 
 mod ext;
-pub use ext::{Extension, ExtensionMap, ExtensionValues, VideoOrientation};
+pub use ext::{Extension, ExtensionMap, ExtensionValues, VideoLayersAllocation, VideoOrientation};
 
 mod dir;
 pub use dir::Direction;

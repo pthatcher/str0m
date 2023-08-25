@@ -509,7 +509,8 @@ use rtp_::{Extension, ExtensionMap, InstantExt};
 /// Low level RTP access.
 pub mod rtp {
     pub use crate::rtp_::{
-        Extension, ExtensionMap, ExtensionValues, RtpHeader, SeqNo, Ssrc, VideoOrientation,
+        Extension, ExtensionMap, ExtensionValues, RtpHeader, SeqNo, Ssrc, VideoLayersAllocation,
+        VideoOrientation,
     };
     pub use crate::streams::{RtpPacket, StreamPaused, StreamRx, StreamTx};
 }
