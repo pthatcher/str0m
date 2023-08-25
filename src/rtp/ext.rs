@@ -7,6 +7,7 @@ use super::{Mid, Rid};
 
 /// RTP header extensions.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Extension {
     /// <http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time>
     AbsoluteSendTime,
@@ -195,7 +196,13 @@ impl Extension {
 
 /// Mapping between RTP extension id to what extension that is.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct ExtensionMap([Option<Extension>; 14]);
+pub struct ExtensionMap([Option<MapEntry>; 14]); // index 0 is extmap:1.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MapEntry {
+    ext: Extension,
+    locked: bool,
+}
 
 impl ExtensionMap {
     /// Create an empty map.
@@ -237,41 +244,10 @@ impl ExtensionMap {
             return;
         }
         let idx = id as usize - 1;
-        self.0[idx] = Some(ext);
-    }
 
-    pub(crate) fn keep_same(&mut self, other: &ExtensionMap) {
-        for i in 0..14 {
-            if self.0[i] != other.0[i] {
-                self.0[i] = None;
-            }
-        }
-    }
+        let m = MapEntry { ext, locked: false };
 
-    pub(crate) fn apply(&mut self, id: u8, ext: Extension) {
-        if id < 1 || id > 14 {
-            return;
-        }
-
-        // Mapping goes from 0 to 13.
-        let new_index = id as usize - 1;
-
-        let Some(old_index) = self
-            .0
-            .iter()
-            .enumerate()
-            .find(|(_, m)| **m == Some(ext))
-            .map(|(i, _)| i) else {
-                return;
-            };
-
-        if new_index == old_index {
-            return;
-        }
-
-        // swap them
-        self.0[old_index] = self.0[new_index].take();
-        self.0[new_index] = Some(ext);
+        self.0[idx] = Some(m);
     }
 
     /// Look up the extension for the id.
@@ -279,7 +255,7 @@ impl ExtensionMap {
     /// The id must be 1-14 inclusive (1-indexed).
     pub fn lookup(&self, id: u8) -> Option<Extension> {
         if id >= 1 && id <= 14 {
-            self.0[id as usize - 1]
+            self.0[id as usize - 1].map(|m| m.ext)
         } else {
             debug!("Lookup RTP extension out of range 1-14: {}", id);
             None
@@ -292,20 +268,34 @@ impl ExtensionMap {
     pub fn id_of(&self, e: Extension) -> Option<u8> {
         self.0
             .iter()
-            .position(|x| *x == Some(e))
+            .position(|x| x.map(|e| e.ext) == Some(e))
             .map(|p| p as u8 + 1)
     }
 
     /// Returns an iterator over the elements of the extension map
-    ///  
+    ///
     /// Filtering them based on the provided `audio` flag
     pub fn iter(&self, audio: bool) -> impl Iterator<Item = (u8, Extension)> + '_ {
         self.0
             .iter()
             .enumerate()
             .filter_map(|(i, e)| e.as_ref().map(|e| (i, e)))
-            .filter(move |(_, e)| if audio { e.is_audio() } else { e.is_video() })
-            .map(|(i, e)| ((i + 1) as u8, *e))
+            .filter(move |(_, e)| {
+                if audio {
+                    e.ext.is_audio()
+                } else {
+                    e.ext.is_video()
+                }
+            })
+            .map(|(i, e)| ((i + 1) as u8, e.ext))
+    }
+
+    pub(crate) fn cloned_with_type(&self, audio: bool) -> Self {
+        let mut x = ExtensionMap::empty();
+        for (id, ext) in self.iter(audio) {
+            x.set(id, ext);
+        }
+        x
     }
 
     // https://tools.ietf.org/html/rfc5285
@@ -369,7 +359,7 @@ impl ExtensionMap {
 
         for (idx, x) in self.0.iter().enumerate() {
             if let Some(v) = x {
-                if let Some(n) = v.write_to(&mut b[1..], ev) {
+                if let Some(n) = v.ext.write_to(&mut b[1..], ev) {
                     assert!(n <= 16);
                     assert!(n > 0);
                     b[0] = (idx as u8 + 1) << 4 | (n as u8 - 1);
@@ -379,6 +369,55 @@ impl ExtensionMap {
         }
 
         orig_len - b.len()
+    }
+
+    pub(crate) fn remap(&mut self, remote_exts: &[(u8, Extension)]) {
+        // Match remote numbers and lock down those we see for the first time.
+        for (id, ext) in remote_exts {
+            self.swap(*id, *ext);
+        }
+    }
+
+    fn swap(&mut self, id: u8, ext: Extension) {
+        if id < 1 || id > 14 {
+            return;
+        }
+
+        // Mapping goes from 0 to 13.
+        let new_index = id as usize - 1;
+
+        let Some(old_index) = self
+            .0
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.map(|m| m.ext) == Some(ext))
+            .map(|(i, _)| i)
+        else {
+            return;
+        };
+
+        // Unwrap OK because index is checking just above.
+        let old = self.0[old_index].as_mut().unwrap();
+
+        let is_change = new_index != old_index;
+
+        // If either audio or video is locked, we got a previous extmap negotiation.
+        if is_change && old.locked {
+            warn!(
+                "Extmap locked by previous negotiation. Ignore change: {} -> {}",
+                old_index, new_index
+            );
+            return;
+        }
+
+        // Locking must be done regardless of whether there was an actual change.
+        old.locked = true;
+
+        if !is_change {
+            return;
+        }
+
+        self.0.swap(old_index, new_index);
     }
 }
 
@@ -722,49 +761,6 @@ impl fmt::Display for Extension {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn abs_send_time() {
-        let mut exts = ExtensionMap::empty();
-        exts.0[3] = Some(Extension::AbsoluteSendTime);
-        let ev = ExtensionValues {
-            abs_send_time: Some(MediaTime::new(1, FIXED_POINT_6_18)),
-            ..Default::default()
-        };
-
-        let mut buf = vec![0_u8; 8];
-        exts.write_to(&mut buf[..], &ev);
-
-        let mut ev2 = ExtensionValues::default();
-        exts.parse(&buf, false, &mut ev2);
-
-        assert_eq!(ev.abs_send_time, ev2.abs_send_time);
-    }
-
-    #[test]
-    fn playout_delay() {
-        let mut exts = ExtensionMap::empty();
-        exts.0[1] = Some(Extension::PlayoutDelay);
-        let ev = ExtensionValues {
-            play_delay_min: Some(MediaTime::new(100, 100)),
-            play_delay_max: Some(MediaTime::new(200, 100)),
-            ..Default::default()
-        };
-
-        let mut buf = vec![0_u8; 8];
-        exts.write_to(&mut buf[..], &ev);
-
-        let mut ev2 = ExtensionValues::default();
-        exts.parse(&buf, false, &mut ev2);
-
-        assert_eq!(ev.play_delay_min, ev2.play_delay_min);
-        assert_eq!(ev.play_delay_max, ev2.play_delay_max);
-    }
-}
-
 impl fmt::Debug for ExtensionMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Extensions(")?;
@@ -773,7 +769,7 @@ impl fmt::Debug for ExtensionMap {
             .iter()
             .enumerate()
             .filter_map(|(i, v)| v.map(|v| (i + 1, v)))
-            .map(|(i, v)| format!("{i}={v}"))
+            .map(|(i, v)| format!("{}={}", i, v.ext))
             .collect::<Vec<_>>()
             .join(", ");
         write!(f, "{joined}")?;
@@ -1042,8 +1038,168 @@ fn read_bits(bits: u8, range: std::ops::Range<u8>) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
+
+    #[test]
+    fn abs_send_time() {
+        let mut exts = ExtensionMap::empty();
+        exts.set(4, Extension::AbsoluteSendTime);
+        let ev = ExtensionValues {
+            abs_send_time: Some(MediaTime::new(1, FIXED_POINT_6_18)),
+            ..Default::default()
+        };
+
+        let mut buf = vec![0_u8; 8];
+        exts.write_to(&mut buf[..], &ev);
+
+        let mut ev2 = ExtensionValues::default();
+        exts.parse(&buf, false, &mut ev2);
+
+        assert_eq!(ev.abs_send_time, ev2.abs_send_time);
+    }
+
+    #[test]
+    fn playout_delay() {
+        let mut exts = ExtensionMap::empty();
+        exts.set(2, Extension::PlayoutDelay);
+        let ev = ExtensionValues {
+            play_delay_min: Some(MediaTime::new(100, 100)),
+            play_delay_max: Some(MediaTime::new(200, 100)),
+            ..Default::default()
+        };
+
+        let mut buf = vec![0_u8; 8];
+        exts.write_to(&mut buf[..], &ev);
+
+        let mut ev2 = ExtensionValues::default();
+        exts.parse(&buf, false, &mut ev2);
+
+        assert_eq!(ev.play_delay_min, ev2.play_delay_min);
+        assert_eq!(ev.play_delay_max, ev2.play_delay_max);
+    }
+
+    #[test]
+    fn remap_exts_audio() {
+        use Extension::*;
+
+        let mut e1 = ExtensionMap::standard();
+        let mut e2 = ExtensionMap::empty();
+        e2.set(14, TransportSequenceNumber);
+
+        println!("{:?}", e1.iter(false).collect::<Vec<_>>());
+
+        e1.remap(&e2.iter(true).collect::<Vec<_>>());
+
+        // e1 should have adjusted the TransportSequenceNumber for audio
+        assert_eq!(
+            e1.iter(true).collect::<Vec<_>>(),
+            vec![
+                (1, AudioLevel),
+                (2, AbsoluteSendTime),
+                (4, RtpMid),
+                (10, RtpStreamId),
+                (11, RepairedRtpStreamId),
+                (14, TransportSequenceNumber)
+            ]
+        );
+
+        // e1 should have adjusted the TransportSequenceNumber for vudeo
+        assert_eq!(
+            e1.iter(false).collect::<Vec<_>>(),
+            vec![
+                (2, AbsoluteSendTime),
+                (4, RtpMid),
+                (6, VideoLayersAllocation),
+                (10, RtpStreamId),
+                (11, RepairedRtpStreamId),
+                (13, VideoOrientation),
+                (14, TransportSequenceNumber),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_exts_video() {
+        use Extension::*;
+
+        let mut e1 = ExtensionMap::empty();
+        e1.set(3, TransportSequenceNumber);
+        e1.set(4, VideoOrientation);
+        e1.set(5, VideoContentType);
+        let mut e2 = ExtensionMap::empty();
+        e2.set(14, TransportSequenceNumber);
+        e2.set(12, VideoOrientation);
+
+        e1.remap(&e2.iter(false).collect::<Vec<_>>());
+
+        // e1 should have adjusted to e2.
+        assert_eq!(
+            e1.iter(false).collect::<Vec<_>>(),
+            vec![
+                (5, VideoContentType),
+                (12, VideoOrientation),
+                (14, TransportSequenceNumber)
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_exts_swaparoo() {
+        use Extension::*;
+
+        let mut e1 = ExtensionMap::empty();
+        e1.set(12, TransportSequenceNumber);
+        e1.set(14, VideoOrientation);
+        let mut e2 = ExtensionMap::empty();
+        e2.set(14, TransportSequenceNumber);
+        e2.set(12, VideoOrientation);
+
+        e1.remap(&e2.iter(false).collect::<Vec<_>>());
+
+        // just make sure the logic isn't wrong for 12-14 -> 14-12
+        assert_eq!(
+            e1.iter(false).collect::<Vec<_>>(),
+            vec![(12, VideoOrientation), (14, TransportSequenceNumber)]
+        );
+    }
+
+    #[test]
+    fn remap_exts_illegal() {
+        use Extension::*;
+
+        let mut e1 = ExtensionMap::empty();
+        e1.set(12, TransportSequenceNumber);
+        e1.set(14, VideoOrientation);
+
+        let mut e2 = ExtensionMap::empty();
+        e2.set(14, TransportSequenceNumber);
+        e2.set(12, VideoOrientation);
+
+        let mut e3 = ExtensionMap::empty();
+        // Illegal change of already negotiated/locked number
+        e3.set(1, TransportSequenceNumber);
+        e3.set(12, AudioLevel); // change of type for existing.
+
+        // First apply e2
+        e1.remap(&e2.iter(false).collect::<Vec<_>>());
+
+        println!("{:#?}", e1.0);
+        assert_eq!(
+            e1.iter(false).collect::<Vec<_>>(),
+            vec![(12, VideoOrientation), (14, TransportSequenceNumber)]
+        );
+
+        // Now attempt e3
+        e1.remap(&e3.iter(true).collect::<Vec<_>>());
+
+        println!("{:#?}", e1.0);
+        // At this point we should have not allowed the change, but remain as it was in first apply.
+        assert_eq!(
+            e1.iter(false).collect::<Vec<_>>(),
+            vec![(12, VideoOrientation), (14, TransportSequenceNumber)]
+        );
+    }
 
     #[test]
     fn test_read_bits() {
@@ -1058,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_leb128_unsigned() {
+    fn test_parse_leb_u64() {
         let (value, rest) = parse_leb_u64(&[0b0000_0000, 5]);
         assert_eq!(0, value);
         assert_eq!(&[5], rest);

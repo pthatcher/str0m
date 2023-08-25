@@ -1,16 +1,23 @@
 //! Media formats and parameters
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::ops::RangeInclusive;
 
-use crate::packet::MediaKind;
+use crate::packet::{H264ProfileLevel, MediaKind};
+use crate::rtp_::Direction;
 use crate::rtp_::Pt;
 use crate::sdp::FormatParam;
-use crate::sdp::MediaLine;
 
 // These really don't belong anywhere, but I guess they're kind of related
 // to codecs etc.
 pub use crate::packet::{CodecExtra, Vp8CodecExtra};
+
+/// Session config for all codecs.
+#[derive(Debug, Clone, Default)]
+pub struct CodecConfig {
+    params: Vec<PayloadParams>,
+}
 
 /// Group of parameters for a payload type (PT).
 ///
@@ -25,7 +32,7 @@ pub use crate::packet::{CodecExtra, Vp8CodecExtra};
 /// a=rtcp-fb:96 nack pli
 /// a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PayloadParams {
     /// The payload type that groups these parameters.
     pub(crate) pt: Pt,
@@ -49,13 +56,31 @@ pub struct PayloadParams {
     /// Whether the payload uses the FIR (Full Intra Request) mechanic.
     pub(crate) fb_fir: bool,
 
-    /// Internal field whether the payload is matched to the remote. This is used in SDP
-    /// negotiation.
-    pub(crate) pt_matched_to_remote: bool,
+    /// Whether the payload is locked by negotiation or can still be debated.
+    ///
+    /// If we make an OFFER or ANSWER and the direction is sendrecv/recvonly, the parameters are locked
+    /// can't be further changed. If we make an OFFER for a sendonly, the parameters are only proposed
+    /// and don't lock.
+    pub(crate) locked: bool,
 }
 
+// we don't want to compare "locked"
+impl PartialEq for PayloadParams {
+    fn eq(&self, other: &Self) -> bool {
+        self.pt == other.pt
+            && self.resend == other.resend
+            && self.spec == other.spec
+            && self.fb_transport_cc == other.fb_transport_cc
+            && self.fb_nack == other.fb_nack
+            && self.fb_pli == other.fb_pli
+            && self.fb_fir == other.fb_fir
+    }
+}
+
+impl Eq for PayloadParams {}
+
 /// Codec specification
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodecSpec {
     /// The codec identifier.
     pub codec: Codec,
@@ -72,7 +97,7 @@ pub struct CodecSpec {
 }
 
 /// Known codecs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum Codec {
@@ -98,7 +123,7 @@ pub enum Codec {
 }
 
 /// Codec specific format parameters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FormatParams {
     /// Opus specific parameter.
     ///
@@ -132,12 +157,6 @@ pub struct FormatParams {
     pub profile_id: Option<u32>,
 }
 
-/// Session config for all codecs.
-#[derive(Debug, Clone, Default)]
-pub struct CodecConfig {
-    params: Vec<PayloadParams>,
-}
-
 impl PayloadParams {
     /// Creates new payload params.
     ///
@@ -161,7 +180,7 @@ impl PayloadParams {
             fb_nack: is_video,
             fb_pli: is_video,
 
-            pt_matched_to_remote: false,
+            locked: false,
         }
     }
 
@@ -251,6 +270,10 @@ impl PayloadParams {
             return Some(Self::match_opus_score(c0, c1));
         }
 
+        if c0.codec == Codec::H264 {
+            return Self::match_h264_score(c0, c1);
+        }
+
         // TODO: Fuzzy matching for any other audio codecs
         // TODO: Fuzzy matching for video
 
@@ -279,36 +302,91 @@ impl PayloadParams {
         score
     }
 
-    fn update_pt(&mut self, media_pts: &[PayloadParams]) -> Option<(Pt, Pt)> {
-        let (first, _) = media_pts
+    fn match_h264_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
+        // Default packetization mode is 0. https://www.rfc-editor.org/rfc/rfc6184#section-6.2
+        let c0_packetization_mode = c0.format.packetization_mode.unwrap_or(0);
+        let c1_packetization_mode = c1.format.packetization_mode.unwrap_or(0);
+
+        if c0_packetization_mode != c1_packetization_mode {
+            return None;
+        }
+
+        let c0_profile_level = c0
+            .format
+            .profile_level_id
+            .map(|l| l.try_into().ok())
+            .unwrap_or(Some(H264ProfileLevel::FALLBACK))?;
+        let c1_profile_level = c1
+            .format
+            .profile_level_id
+            .map(|l| l.try_into().ok())
+            .unwrap_or(Some(H264ProfileLevel::FALLBACK))?;
+
+        if c0_profile_level != c1_profile_level {
+            return None;
+        }
+
+        Some(100)
+    }
+
+    fn update_param(
+        &mut self,
+        remote_pts: &[PayloadParams],
+        claimed: &mut [bool; 128],
+        warn_on_locked: bool,
+    ) {
+        let Some((first, _)) = remote_pts
             .iter()
             .filter_map(|p| self.match_score(p).map(|s| (p, s)))
-            .max_by_key(|(_, s)| *s)?;
+            .max_by_key(|(_, s)| *s)
+        else {
+            return;
+        };
 
         let remote_pt = first.pt;
+        let remote_rtx = first.resend;
 
-        if self.pt_matched_to_remote {
-            // just verify it's still the same.
+        if self.locked {
+            // This can happen if the incoming PTs are suggestions (send-direction) rather than demanded
+            // (receive-direction). We only want to warn if we get receive direction changes.
+            if !warn_on_locked {
+                return;
+            }
+            // Just verify it's still the same. We should validate this in apply_offer/answer instead
+            // of ever seeing this error message.
             if self.pt != remote_pt {
-                warn!("Remote PT changed {} => {}", self.pt, remote_pt);
+                warn!("Ignore remote PT change {} => {}", self.pt, remote_pt);
             }
 
-            None
+            if self.resend != remote_rtx {
+                warn!(
+                    "Ignore remote PT RTX change {:?} => {:?}",
+                    self.resend, remote_rtx
+                );
+            }
         } else {
-            let replaced = self.pt;
-
             // Lock down the PT
             self.pt = remote_pt;
-            self.pt_matched_to_remote = true;
+            self.resend = remote_rtx;
+            self.locked = true;
 
-            Some((remote_pt, replaced))
+            claimed.assert_claim_once(remote_pt);
+            if let Some(rtx) = remote_rtx {
+                claimed.assert_claim_once(rtx);
+            }
         }
+    }
+
+    /// Exposed for integration tests.
+    #[doc(hidden)]
+    pub fn is_locked(&self) -> bool {
+        self.locked
     }
 }
 
 impl CodecConfig {
     /// Creates a new empty config.
-    pub fn new() -> Self {
+    pub fn empty() -> Self {
         CodecConfig::default()
     }
 
@@ -321,7 +399,7 @@ impl CodecConfig {
 
     /// Creates a new config with all default configurations enabled.
     pub fn new_with_defaults() -> Self {
-        let mut c = Self::new();
+        let mut c = Self::empty();
         c.enable_opus(true);
 
         c.enable_vp8(true);
@@ -332,18 +410,14 @@ impl CodecConfig {
         c
     }
 
-    /// Returns a reference to the vector of payload configurations.
-    pub fn params(&self) -> &Vec<PayloadParams> {
+    /// Returns a reference to the payload parameters.
+    pub fn params(&self) -> &[PayloadParams] {
         &self.params
     }
 
     /// Clear all configured configs.
     pub fn clear(&mut self) {
         self.params.clear();
-    }
-
-    pub(crate) fn matches(&self, c: &PayloadParams) -> bool {
-        self.params.iter().any(|x| x.match_score(c).is_some())
     }
 
     /// Manually configure a payload type.
@@ -375,7 +449,7 @@ impl CodecConfig {
             fb_fir,
             fb_nack,
             fb_pli,
-            pt_matched_to_remote: false,
+            locked: false,
         };
 
         self.params.push(p);
@@ -505,6 +579,44 @@ impl CodecConfig {
         );
     }
 
+    /// Match the given parameters to the configured parameters.
+    ///
+    /// In a server scenario, a certain codec configuration might not have the same
+    /// payload type (PT) for two different peers. We will have incoming data with one
+    /// PT and need to match that against the PT of the outgoing.
+    ///
+    /// This call performs matching and if a match is found, returns the _local_ PT
+    /// that can be used for sending media.
+    pub fn match_params(&self, params: PayloadParams) -> Option<&PayloadParams> {
+        let c = self.params.iter().max_by_key(|p| p.match_score(&params))?;
+        c.match_score(&params)?; // avoid None, which isn't a match.
+        Some(c)
+    }
+
+    /// When we get remote payload parameters, we need to match differently depending on direction.
+    pub(crate) fn sdp_match_remote(
+        &self,
+        remote_params: PayloadParams,
+        remote_dir: Direction,
+    ) -> Option<Pt> {
+        // If we have no matching parameters locally, we can't accept the remote in any way.
+        let our_params = self.match_params(remote_params)?;
+
+        if remote_dir.sdp_is_receiving() {
+            // The remote is talking about its own receive requirements. The PTs are not suggestions.
+            Some(remote_params.pt())
+        } else {
+            // We can override the remote with our local config. We would have adjusted to
+            // the remote earlier if we can.
+            Some(our_params.pt())
+        }
+    }
+
+    /// Find a payload parameter using a finder function.
+    pub fn find(&self, mut f: impl FnMut(&PayloadParams) -> bool) -> Option<&PayloadParams> {
+        self.params.iter().find(move |p| f(p))
+    }
+
     pub(crate) fn all_for_kind(&self, kind: MediaKind) -> impl Iterator<Item = &PayloadParams> {
         self.params.iter().filter(move |params| {
             if kind == MediaKind::Video {
@@ -515,30 +627,117 @@ impl CodecConfig {
         })
     }
 
-    pub(crate) fn update_pts(&mut self, m: &MediaLine) {
-        let pts = m.rtp_params();
-        let mut replaceds = Vec::with_capacity(pts.len());
-        let mut assigneds = HashMap::with_capacity(pts.len());
+    pub(crate) fn update_params(&mut self, remote_params: &[PayloadParams], remote_dir: Direction) {
+        // 0-128 of "claimed" PTs. I.e. PTs that we already allocated to something.
+        let mut claimed: [bool; 128] = [false; 128];
 
-        for (i, p) in self.params.iter_mut().enumerate() {
-            if let Some((assigned, replaced)) = p.update_pt(&pts[..]) {
-                replaceds.push(replaced);
-                assigneds.insert(assigned, i);
+        // Make a pass with all that are definitely confirmed by the remote, since these can't change.
+        for p in self.params.iter() {
+            if !p.locked {
+                continue;
+            }
+
+            claimed.assert_claim_once(p.pt);
+
+            if let Some(rtx) = p.resend {
+                claimed.assert_claim_once(rtx);
             }
         }
 
-        // Need to adjust potentially clashes introduced by assigning pts from the medias.
-        for (i, p) in self.params.iter_mut().enumerate() {
-            if let Some(index) = assigneds.get(&p.pt) {
-                if i != *index {
-                    // This PT has been reassigned. This unwrap is ok
-                    // because we can't have replaced something without
-                    // also get the old PT out.
-                    let r = replaceds.pop().unwrap();
-                    p.pt = r;
+        // Now lock potential new parameters to remote.
+        //
+        // If the remote is doing `SendOnly`, the PTs are suggestions, and we are allowed to
+        // ANSWER with our own allocations as overrides. If SendRecv or RecvOnly, the remote
+        // is talking about its own receiving capapbilities and we are not allowed to change it
+        // in the ANSWER.
+        let warn_on_locked = remote_dir.sdp_is_receiving();
+
+        for p in self.params.iter_mut() {
+            p.update_param(remote_params, &mut claimed, warn_on_locked);
+        }
+
+        const PREFERED_RANGES: &[RangeInclusive<usize>] = &[
+            // Payload identifiers 96–127 are used for payloads defined dynamically during a session.
+            96..=127,
+            // "unassigned" ranged. note that RTCP packet type 207 (XR, Extended Reports) would be
+            // indistinguishable from RTP payload types 79 with the marker bit set
+            80..=95,
+            77..=78,
+            // reserved because RTCP packet types 200–204 would otherwise be indistinguishable from RTP payload types 72–76
+            // 72..77,
+            // lol range.
+            35..=71,
+        ];
+
+        // Make a pass to reassign unconfirmed payloads that have PT which are now claimed.
+        for p in self.params.iter_mut() {
+            if p.locked {
+                continue;
+            }
+
+            if claimed.is_claimed(p.pt) {
+                let Some(pt) = claimed.find_unclaimed(PREFERED_RANGES) else {
+                    // TODO: handle this gracefully.
+                    panic!("Exhausted all PT ranges, inconsistent PayloadParam state");
+                };
+
+                info!("Reassigned PT {} => {}", p.pt, pt);
+                p.pt = pt;
+
+                claimed.assert_claim_once(pt);
+            }
+
+            let Some(rtx) = p.resend else {
+                continue;
+            };
+
+            if claimed.is_claimed(rtx) {
+                let Some(rtx) = claimed.find_unclaimed(PREFERED_RANGES) else {
+                    // TODO: handle this gracefully.
+                    panic!("Exhausted all PT ranges, inconsistent PayloadParam state");
+                };
+
+                info!("Reassigned RTX PT {:?} => {:?}", p.resend, rtx);
+                p.resend = Some(rtx);
+
+                claimed.assert_claim_once(rtx);
+            }
+        }
+    }
+
+    pub(crate) fn has_pt(&self, pt: Pt) -> bool {
+        self.params.iter().any(|p| p.pt() == pt)
+    }
+}
+
+trait Claimed {
+    fn assert_claim_once(&mut self, pt: Pt);
+    fn is_claimed(&self, pt: Pt) -> bool;
+    fn find_unclaimed(&self, ranges: &[RangeInclusive<usize>]) -> Option<Pt>;
+}
+
+impl Claimed for [bool; 128] {
+    fn assert_claim_once(&mut self, pt: Pt) {
+        let idx = *pt as usize;
+        assert!(!self[idx], "Pt locked multiple times: {}", pt);
+        self[idx] = true;
+    }
+    fn is_claimed(&self, pt: Pt) -> bool {
+        let idx = *pt as usize;
+        self[idx]
+    }
+    fn find_unclaimed(&self, ranges: &[RangeInclusive<usize>]) -> Option<Pt> {
+        for range in ranges {
+            for i in range.clone() {
+                if !self[i] {
+                    let pt: Pt = (i as u8).into();
+                    return Some(pt);
                 }
             }
         }
+
+        // Failed to find unclaimed PT.
+        None
     }
 }
 
@@ -630,6 +829,15 @@ impl Codec {
         use Codec::*;
         matches!(self, H264 | Vp8 | Vp9 | Av1)
     }
+
+    /// Audio/Video.
+    pub fn kind(&self) -> MediaKind {
+        if self.is_audio() {
+            MediaKind::Audio
+        } else {
+            MediaKind::Video
+        }
+    }
 }
 
 impl<'a> From<&'a str> for Codec {
@@ -660,6 +868,86 @@ impl fmt::Display for Codec {
             Codec::Rtx => write!(f, "rtx"),
             Codec::Null => write!(f, "null"),
             Codec::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::ops::Deref for CodecConfig {
+    type Target = [PayloadParams];
+
+    fn deref(&self) -> &Self::Target {
+        &self.params
+    }
+}
+
+impl std::ops::DerefMut for CodecConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.params
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn h264_codec_spec(
+        level_asymmetry_allowed: Option<bool>,
+        packetization_mode: Option<u8>,
+        profile_level_id: Option<u32>,
+    ) -> CodecSpec {
+        CodecSpec {
+            codec: Codec::H264,
+            clock_rate: 90000,
+            channels: None,
+            format: FormatParams {
+                min_p_time: None,
+                use_inband_fec: None,
+                level_asymmetry_allowed,
+                packetization_mode,
+                profile_level_id,
+                profile_id: None, // VP8
+            },
+        }
+    }
+
+    #[test]
+    fn test_h264_profile_matching() {
+        struct Case {
+            c0: CodecSpec,
+            c1: CodecSpec,
+            must_match: bool,
+            msg: &'static str,
+        }
+
+        let cases = [Case {
+            c0: h264_codec_spec(None, None, Some(0x42E01F)),
+            c1: h264_codec_spec(None, None, Some(0x4DA01F)),
+            must_match: true,
+            msg:
+                "0x42A01F and 0x4DF01F should match, they are both constrained baseline subprofile",
+        }, Case {
+            c0: h264_codec_spec(None, None, Some(0x42E01F)),
+            c1: h264_codec_spec(None, Some(1), Some(0x4DA01F)),
+            must_match: false,
+            msg:
+                "0x42A01F and 0x4DF01F with differing packetization modes should not match",
+        },  Case {
+            c0: h264_codec_spec(None, Some(0), Some(0x422000)),
+            c1: h264_codec_spec(None, None, Some(0x42B00A)),
+            must_match: true,
+            msg:
+                "0x424000 and 0x42B00A should match because they are both the baseline subprofile and the level idc of 0x42F01F will be adjusted to Level1B because the constraint set 3 flag is set"
+        }];
+
+        for Case {
+            c0,
+            c1,
+            must_match,
+            msg,
+        } in cases.into_iter()
+        {
+            let matched = PayloadParams::match_h264_score(c0, c1).is_some();
+            assert_eq!(matched, must_match, "{msg}\nc0: {c0:#?}\nc1: {c1:#?}");
         }
     }
 }

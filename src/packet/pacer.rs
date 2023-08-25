@@ -99,7 +99,7 @@ pub trait Pacer {
     fn register_send(&mut self, now: Instant, packet_size: DataSize, from: Mid);
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueSnapshot {
     /// Time this snapshot was made
     pub created_at: Instant,
@@ -264,7 +264,7 @@ pub struct LeakyBucketPacer {
     /// The last time we refreshed media debt and potentially adjusted the bitrate.
     last_handle_time: Option<Instant>,
     /// The last time we indicated that a packet should be sent.
-    last_send_time: Option<Instant>,
+    last_emitted: Option<Instant>,
     /// The next time we should send a queued packet.
     next_poll_time: Option<Instant>,
     /// The current media debt.
@@ -358,7 +358,7 @@ impl Pacer for LeakyBucketPacer {
     }
 
     fn register_send(&mut self, now: Instant, packet_size: DataSize, _from: Mid) {
-        self.last_send_time = Some(now);
+        self.last_emitted = Some(now);
 
         self.media_debt += packet_size;
         self.media_debt = self
@@ -378,7 +378,7 @@ impl LeakyBucketPacer {
             adjusted_bitrate: Bitrate::ZERO,
             padding_bitrate: Bitrate::ZERO,
             last_handle_time: None,
-            last_send_time: None,
+            last_emitted: None,
             next_poll_time: None,
             media_debt: DataSize::ZERO,
             padding_debt: DataSize::ZERO,
@@ -414,7 +414,7 @@ impl LeakyBucketPacer {
 
     fn next_poll(&self, now: Instant) -> Option<(Instant, Option<&QueueState>)> {
         // If we have never sent before, do so immediately on an arbitrary non-empty queue.
-        if self.last_send_time.is_none() {
+        if self.last_emitted.is_none() {
             let mut queues = self
                 .queue_states
                 .iter()
@@ -468,33 +468,30 @@ impl LeakyBucketPacer {
             }
         }
 
-        if self.padding_bitrate > Bitrate::ZERO && self.last_send_time.is_some() {
-            let padding_possible = self.queue_states.iter().any(|q| q.use_for_padding);
+        let any_queue_for_padding = self.queue_states.iter().any(|q| q.use_for_padding);
+        let padding_possible = self.padding_bitrate > Bitrate::ZERO && any_queue_for_padding;
 
-            if padding_possible {
-                // If all queues are empty, we have sent something, and we have a padding rate wait until we have drained
-                // both the media debt and padding debt to send some padding.
-                let mut drain_debt_time = (self.media_debt / self.adjusted_bitrate)
-                    .max(self.padding_debt / self.padding_bitrate);
-                if drain_debt_time.is_zero() {
-                    // Give the main loop some time to doe something else e.g. queue media.
-                    drain_debt_time = Duration::from_micros(1); // TODO: 100 micros
-                }
-
-                let padding_at = self
-                    .last_handle_time
-                    .map(|h| h + drain_debt_time)
-                    .unwrap_or(now);
-
-                // We explicitly don't return a queue to poll here. We need another call to
-                // handle_timeout to request the padding before we can poll the selected queue.
-                return Some((padding_at, None));
-            }
+        if !padding_possible {
+            return None;
         }
 
-        // No queues to send on, no poll for now. `poll_timeout` will return a timeout based on
-        // PACING.
-        None
+        // If all queues are empty and we have a padding rate, wait until we have drained
+        // both the media debt and padding debt to send some padding.
+        let mut drain_debt_time =
+            (self.media_debt / self.adjusted_bitrate).max(self.padding_debt / self.padding_bitrate);
+        if drain_debt_time.is_zero() {
+            // Give the main loop some time to do something else e.g. queue media.
+            drain_debt_time = Duration::from_micros(1);
+        }
+
+        let padding_at = self
+            .last_handle_time
+            .map(|h| h + drain_debt_time)
+            .unwrap_or(now);
+
+        // We explicitly don't return a queue to poll here. We need another call to
+        // handle_timeout to request the padding before we can poll the selected queue.
+        Some((padding_at, None))
     }
 
     fn maybe_update_adjusted_bitrate(&mut self, now: Instant) {
@@ -554,17 +551,9 @@ impl LeakyBucketPacer {
             .queue_states
             .iter()
             .all(|q| q.snapshot.packet_count == 0);
-
-        // dbg! This is causing a hot loop because a packet gets stuck in the queue.
-        // if !all_queues_empty {
-        //     for queue in self.queue_states.iter() {
-        //         dbg!((queue.mid, queue.snapshot.packet_count));
-        //     }
-        //     return None;
-        // }
-
-        // We must have sent some media.
-        self.last_send_time?;
+        if !all_queues_empty {
+            return None;
+        }
 
         // We must have a padding bitrate.
         if self.padding_bitrate == Bitrate::ZERO {
@@ -576,11 +565,10 @@ impl LeakyBucketPacer {
             .queue_states
             .iter()
             .filter(|q| q.use_for_padding)
-            .max_by_key(|q| q.snapshot.last_emitted) else {
-                debug!("Wanted to generate padding, but no queue supports it.");
-
-                return None;
-            };
+            .max_by_key(|q| q.snapshot.last_emitted)
+        else {
+            return None;
+        };
 
         // We can generate padding
         let padding = (self.padding_bitrate * PADDING_BURST_INTERVAL).as_bytes_usize();
@@ -1349,11 +1337,11 @@ mod test {
 
             pub(super) fn register_send(&mut self, mid: Mid, now: Instant) {
                 if self.video_queue.mid == mid {
-                    self.video_queue.last_send_time = Some(now);
+                    self.video_queue.last_emitted = Some(now);
                 } else if self.audio_queue.mid == mid {
-                    self.audio_queue.last_send_time = Some(now);
+                    self.audio_queue.last_emitted = Some(now);
                 } else if self.padding_queue.mid == mid {
-                    self.padding_queue.last_send_time = Some(now);
+                    self.padding_queue.last_emitted = Some(now);
                 } else {
                     panic!("Attempted to register send on unknown queue with id {mid:?}");
                 }
@@ -1410,7 +1398,7 @@ mod test {
 
         struct Inner {
             mid: Mid,
-            last_send_time: Option<Instant>,
+            last_emitted: Option<Instant>,
             queue: VecDeque<QueuedPacket>,
             packet_count: u32,
             total_time_spent_queued: Duration,
@@ -1423,7 +1411,7 @@ mod test {
             fn new(mid: Mid, is_audio: bool, priority: QueuePriority) -> Self {
                 Self {
                     mid,
-                    last_send_time: None,
+                    last_emitted: None,
                     queue: VecDeque::default(),
                     packet_count: 0,
                     total_time_spent_queued: Duration::ZERO,
@@ -1460,7 +1448,7 @@ mod test {
             }
 
             fn update_average_queue_time(&mut self, now: Instant) {
-                let Some(last_update) =  self.last_update else {
+                let Some(last_update) = self.last_update else {
                     self.last_update = Some(now);
                     return;
                 };
@@ -1474,13 +1462,13 @@ mod test {
                 QueueState {
                     mid: self.mid,
                     unpaced: self.is_audio,
-                    use_for_padding: !self.is_audio && self.last_send_time.is_some(),
+                    use_for_padding: !self.is_audio && self.last_emitted.is_some(),
                     snapshot: QueueSnapshot {
                         created_at: now,
                         size: self.queue.iter().map(QueuedPacket::size).sum(),
                         packet_count: self.packet_count,
                         total_queue_time_origin: self.total_time_spent_queued,
-                        last_emitted: self.last_send_time,
+                        last_emitted: self.last_emitted,
                         first_unsent: self.queue.iter().next().map(|p| p.queued_at),
                         priority: self.priority,
                     },

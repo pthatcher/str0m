@@ -22,7 +22,8 @@ use crate::Rtc;
 use crate::RtcError;
 
 pub use crate::sdp::{SdpAnswer, SdpOffer};
-use crate::streams::{Streams, DEFAULT_RTX_CACHE_DURATION};
+use crate::streams::Streams;
+use crate::streams::DEFAULT_RTX_CACHE_DURATION;
 
 /// Changes to the Rtc via SDP Offer/Answer dance.
 pub struct SdpApi<'a> {
@@ -63,6 +64,8 @@ impl<'a> SdpApi<'a> {
     /// let json_answer = serde_json::to_vec(&answer).unwrap();
     /// ```
     pub fn accept_offer(self, offer: SdpOffer) -> Result<SdpAnswer, RtcError> {
+        debug!("Accept offer");
+
         // Invalidate any outstanding PendingOffer.
         self.rtc.next_change_id();
 
@@ -101,6 +104,7 @@ impl<'a> SdpApi<'a> {
         let params = AsSdpParams::new(self.rtc, None);
         let sdp = as_sdp(&self.rtc.session, params);
 
+        debug!("Create answer");
         Ok(sdp.into())
     }
 
@@ -130,6 +134,8 @@ impl<'a> SdpApi<'a> {
         mut pending: SdpPendingOffer,
         answer: SdpAnswer,
     ) -> Result<(), RtcError> {
+        debug!("Accept answer");
+
         // Ensure we don't use the wrong changes below. We must use that of pending.
         drop(self.changes);
 
@@ -261,7 +267,8 @@ impl<'a> SdpApi<'a> {
             ssrcs,
 
             // Added later
-            params: vec![],
+            pts: vec![],
+            exts: ExtensionMap::empty(),
             index: 0,
         };
 
@@ -350,6 +357,10 @@ impl<'a> SdpApi<'a> {
     /// assert!(changes.apply().is_none());
     /// ```
     pub fn apply(self) -> Option<(SdpOffer, SdpPendingOffer)> {
+        if self.changes.is_empty() {
+            return None;
+        }
+
         let change_id = self.rtc.next_change_id();
 
         let requires_negotiation = self.changes.0.iter().any(requires_negotiation);
@@ -360,8 +371,10 @@ impl<'a> SdpApi<'a> {
                 change_id,
                 changes: self.changes,
             };
+            debug!("Create offer");
             Some((offer, pending))
         } else {
+            debug!("Apply direct changes");
             apply_direct_changes(self.rtc, self.changes);
             None
         }
@@ -414,8 +427,11 @@ pub(crate) struct AddMedia {
     pub dir: Direction,
     pub ssrcs: Vec<(Ssrc, Option<Ssrc>)>,
 
-    // These are filled in when creating a Media from AddMedia
-    pub params: Vec<PayloadParams>,
+    // pts and index are filled in when creating the SDP OFFER.
+    // The default PT order is set by the Session (BUNDLE).
+    // TODO: We can make this configurable here too.
+    pub pts: Vec<Pt>,
+    pub exts: ExtensionMap,
     pub index: usize,
 }
 
@@ -508,9 +524,8 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
 
         // If there are additions in the pending changes, prepend them now.
         if let Some(pending) = params.pending {
-            let exts = session.exts();
             new_lines = pending
-                .as_new_medias(new_index_start, session.codec_config(), exts)
+                .as_new_medias(new_index_start, &session.codec_config, &session.exts)
                 .collect();
         }
 
@@ -534,7 +549,13 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
                     ssrcs.extend(pending.ssrcs_for_mid(m.mid()))
                 }
 
-                m.as_media_line(attrs, &ssrcs)
+                let params: Vec<_> = session
+                    .codec_config
+                    .all_for_kind(m.kind())
+                    .cloned()
+                    .collect();
+
+                m.as_media_line(attrs, &ssrcs, &session.exts, &params)
             })
             .collect::<Vec<_>>();
 
@@ -649,7 +670,7 @@ fn ensure_stream_tx(session: &mut Session) {
 
         // If any payload param has RTX, we need to prepare for RTX. This is because we always
         // communicate a=ssrc lines, which need to be complete with main and RTX SSRC.
-        let has_rtx = media.payload_params().iter().any(|p| p.resend().is_some());
+        let has_rtx = session.codec_config.iter().any(|p| p.resend().is_some());
 
         for rid in rids {
             // If we already have the stream, we don't make any new one.
@@ -729,9 +750,6 @@ fn add_pending_changes(session: &mut Session, pending: Changes) {
 fn sync_medias<'a>(session: &mut Session, sdp: &'a Sdp) -> Result<Vec<&'a MediaLine>, String> {
     let mut new_lines = Vec::with_capacity(sdp.media_lines.len());
 
-    let config = session.codec_config().clone();
-    let session_exts = *session.exts();
-
     for (idx, m) in sdp.media_lines.iter().enumerate() {
         // First, match existing m-lines.
         match m.typ {
@@ -749,7 +767,13 @@ fn sync_medias<'a>(session: &mut Session, sdp: &'a Sdp) -> Result<Vec<&'a MediaL
                         return index_err(m.mid());
                     }
 
-                    update_media(media, m, &config, &session_exts, &mut session.streams);
+                    update_media(
+                        media,
+                        m,
+                        &mut session.codec_config,
+                        &session.exts,
+                        &mut session.streams,
+                    );
 
                     continue;
                 }
@@ -774,24 +798,27 @@ fn sync_medias<'a>(session: &mut Session, sdp: &'a Sdp) -> Result<Vec<&'a MediaL
 fn add_new_lines(
     session: &mut Session,
     new_lines: &[&MediaLine],
-    need_open_event: bool,
+    is_offer: bool,
 ) -> Result<(), String> {
     for m in new_lines {
         let idx = session.line_count();
 
         if m.typ.is_media() {
-            let mut exts = *session.exts();
-            exts.keep_same(&session.exts);
+            let mut media = Media::from_remote_media_line(m, idx, is_offer);
+            media.need_open_event = is_offer;
 
-            // Update the PTs to match that of the remote.
-            session.codec_config.update_pts(m);
+            // Match/remap remote params.
+            session
+                .codec_config
+                .update_params(&m.rtp_params(), m.direction());
 
-            let mut media = Media::from_remote_media_line(m, idx, exts);
-            media.need_open_event = need_open_event;
+            // Remap the extension to that of the answer.
+            session.exts.remap(&m.extmaps());
+
             update_media(
                 &mut media,
                 m,
-                &session.codec_config,
+                &mut session.codec_config,
                 &session.exts,
                 &mut session.streams,
             );
@@ -815,14 +842,8 @@ fn add_new_lines(
 fn update_session(session: &mut Session, sdp: &Sdp) {
     let old = session.exts;
 
-    let extmaps = sdp.media_lines.iter().flat_map(|m| m.extmaps());
-
-    for (id, ext) in extmaps {
-        session.exts.apply(id, ext);
-    }
-
     if old != session.exts {
-        info!("Updated session extensions: {:?}", session.exts);
+        debug!("Updated session extensions: {:?}", session.exts);
     }
 
     // Does any m-line contain a a=rtcp-fb:xx transport-cc?
@@ -860,8 +881,8 @@ fn as_media_lines(session: &Session) -> Vec<&dyn AsSdpMediaLine> {
 fn update_media(
     media: &mut Media,
     m: &MediaLine,
-    config: &CodecConfig,
-    session_exts: &ExtensionMap,
+    config: &mut CodecConfig,
+    exts: &ExtensionMap,
     streams: &mut Streams,
 ) {
     // Direction changes
@@ -870,28 +891,43 @@ fn update_media(
     // or a ANSWER from our OFFER. Either way, the direction is inverted to
     // how we have it locally.
     let new_dir = m.direction().invert();
-    media.set_direction(new_dir);
+    //
+    let change_direction_disallowed = !media.remote_created()
+        && media.direction() == Direction::Inactive
+        && new_dir == Direction::SendOnly;
+
+    if change_direction_disallowed {
+        info!(
+            "Ignore attempt to change inactive to recvonly by remote peer for locally created mid: {}",
+            media.mid()
+        );
+    } else {
+        media.set_direction(new_dir);
+    }
 
     for rid in m.rids().iter() {
-        media.expect_rid_rx(*rid);
+        media.expect_rid(*rid);
     }
 
-    // Narrowing of PT
-    let params: Vec<Pt> = m
+    // Narrowing/ordering of of PT
+    let pts: Vec<Pt> = m
         .rtp_params()
         .into_iter()
-        .filter(|p| config.matches(p))
-        .map(|p| p.pt())
+        .filter_map(|p| config.sdp_match_remote(p, m.direction()))
         .collect();
-    media.retain_pts(&params);
+    media.set_remote_pts(pts);
 
-    // Narrowing of Rtp header extension mappings.
-    let mut exts = ExtensionMap::empty();
-    for (id, ext) in m.extmaps() {
-        exts.set(id, ext);
+    let mut remote_extmap = ExtensionMap::empty();
+    for (id, ext) in m.extmaps().into_iter() {
+        // The remapping of extensions should already have happened, which
+        // means the ID are matching in the session to the remote.
+        if exts.lookup(id) != Some(ext) {
+            // Don't set any extensions that aren't enabled in Session.
+            continue;
+        }
+        remote_extmap.set(id, ext);
     }
-    exts.keep_same(session_exts);
-    media.set_exts(exts);
+    media.set_remote_extmap(remote_extmap);
 
     // SSRC changes
     // This will always be for ReceiverSource since any incoming a=ssrc line will be
@@ -900,14 +936,21 @@ fn update_media(
 
     let main = infos.iter().filter(|i| i.repairs.is_none());
 
-    for i in main {
-        // TODO: If the remote is communicating _BOTH_ rid and a=ssrc this will fail.
-        info!("Adding SSRC: {:?}", i);
-        let repair_ssrc = infos
-            .iter()
-            .find(|r| r.repairs == Some(i.ssrc))
-            .map(|r| r.ssrc);
-        streams.expect_stream_rx(i.ssrc, repair_ssrc, media.mid(), None);
+    if m.simulcast().is_none() {
+        // Only use pre-communicated SSRC if we are running without simulcast.
+        // We found a bug in FF where the order of the simulcast lines does not
+        // correspond to the order of the simulcast declarations. In this case
+        // it's better to fall back on mid/rid dynamic mapping.
+
+        for i in main {
+            // TODO: If the remote is communicating _BOTH_ rid and a=ssrc this will fail.
+            info!("Adding pre-communicated SSRC: {:?}", i);
+            let repair_ssrc = infos
+                .iter()
+                .find(|r| r.repairs == Some(i.ssrc))
+                .map(|r| r.ssrc);
+            streams.expect_stream_rx(i.ssrc, repair_ssrc, media.mid(), None);
+        }
     }
 
     // Simulcast configuration
@@ -925,10 +968,13 @@ trait AsSdpMediaLine {
     fn mid(&self) -> Mid;
     fn msid(&self) -> Option<&Msid>;
     fn index(&self) -> usize;
+    fn kind(&self) -> MediaKind;
     fn as_media_line(
         &self,
         attrs: Vec<MediaAttribute>,
         ssrcs_tx: &[(Ssrc, Option<Ssrc>)],
+        exts: &ExtensionMap,
+        params: &[PayloadParams],
     ) -> MediaLine;
 }
 
@@ -942,10 +988,15 @@ impl AsSdpMediaLine for (Mid, usize) {
     fn index(&self) -> usize {
         self.1
     }
+    fn kind(&self) -> MediaKind {
+        MediaKind::Audio // doesn't matter for App
+    }
     fn as_media_line(
         &self,
         mut attrs: Vec<MediaAttribute>,
         _ssrcs_tx: &[(Ssrc, Option<Ssrc>)],
+        _exts: &ExtensionMap,
+        _params: &[PayloadParams],
     ) -> MediaLine {
         attrs.push(MediaAttribute::Mid(self.0));
         attrs.push(MediaAttribute::SctpPort(5000));
@@ -953,6 +1004,7 @@ impl AsSdpMediaLine for (Mid, usize) {
 
         MediaLine {
             typ: sdp::MediaType::Application,
+            disabled: false,
             proto: Proto::Sctp,
             pts: vec![],
             bw: None,
@@ -971,20 +1023,25 @@ impl AsSdpMediaLine for Media {
     fn index(&self) -> usize {
         Media::index(self)
     }
+    fn kind(&self) -> MediaKind {
+        Media::kind(self)
+    }
     fn as_media_line(
         &self,
         mut attrs: Vec<MediaAttribute>,
         ssrcs_tx: &[(Ssrc, Option<Ssrc>)],
+        exts: &ExtensionMap,
+        params: &[PayloadParams],
     ) -> MediaLine {
         if self.app_tmp {
             let app = (self.mid(), self.index());
-            return app.as_media_line(attrs, ssrcs_tx);
+            return app.as_media_line(attrs, ssrcs_tx, exts, params);
         }
 
         attrs.push(MediaAttribute::Mid(self.mid()));
 
         let audio = self.kind() == MediaKind::Audio;
-        for (id, ext) in self.exts().iter(audio) {
+        for (id, ext) in self.remote_extmap().iter(audio) {
             attrs.push(MediaAttribute::ExtMap { id, ext });
         }
 
@@ -992,17 +1049,22 @@ impl AsSdpMediaLine for Media {
         attrs.push(MediaAttribute::Msid(self.msid().clone()));
         attrs.push(MediaAttribute::RtcpMux);
 
-        for p in self.payload_params() {
-            p.as_media_attrs(&mut attrs);
-        }
+        // The effective params start from the Session::codec_config to retain the
+        // user's configured prefered order, however they are narrowed only include
+        // those the remote peer wants.
+        let effective_params = params.iter().filter(|p| self.remote_pts().contains(&p.pt));
 
-        // The advertised payload types.
-        let pts = self
-            .payload_params()
-            .iter()
-            .flat_map(|c| [Some(c.pt()), c.resend].into_iter())
-            .flatten()
-            .collect();
+        let mut pts = vec![];
+
+        for p in effective_params {
+            p.as_media_attrs(&mut attrs);
+
+            // The pts that will be advertised in the SDP
+            pts.push(p.pt());
+            if let Some(rtx) = p.resend() {
+                pts.push(rtx);
+            }
+        }
 
         if let Some(s) = self.simulcast() {
             fn to_rids<'a>(
@@ -1070,6 +1132,7 @@ impl AsSdpMediaLine for Media {
 
         MediaLine {
             typ: self.kind().into(),
+            disabled: false,
             proto: Proto::Srtp,
             pts,
             bw: None,
@@ -1274,10 +1337,11 @@ impl Change {
             AddMedia(v) => {
                 // TODO can we avoid all this cloning?
                 let mut add = v.clone();
-                add.params = config.all_for_kind(v.kind).copied().collect();
+                add.pts = config.all_for_kind(v.kind).map(|p| p.pt()).collect();
+                add.exts = exts.cloned_with_type(v.kind.is_audio());
                 add.index = index;
 
-                Some(Media::from_add_media(add, *exts))
+                Some(Media::from_add_media(add))
             }
             AddApp(mid) => Some(Media::from_app_tmp(*mid, index)),
             _ => None,
@@ -1354,8 +1418,8 @@ mod test {
         let first_pt = resolve_pt(first_mline, first_mline.pts[0]);
 
         assert_eq!(
-            first_pt.codec, Codec::H264,
-            "The first PT returned should be the highest priority PT from the offer that is supported."
+            first_pt.codec, Codec::Vp8,
+            "The first PT returned should be the highest priority PT from the answer that is supported."
         );
 
         let vp9_unsupported = first_mline
