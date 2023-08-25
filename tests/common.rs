@@ -1,8 +1,12 @@
 #![allow(unused)]
 use std::net::Ipv4Addr;
 use std::ops::{Deref, DerefMut};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use str0m::change::SdpApi;
+use str0m::format::Codec;
+use str0m::format::PayloadParams;
 use str0m::net::Receive;
 use str0m::Candidate;
 use str0m::{Event, Input, Output, Rtc, RtcError};
@@ -35,6 +39,22 @@ impl TestRtc {
 
     pub fn duration(&self) -> Duration {
         self.last - self.start
+    }
+
+    pub fn params_opus(&self) -> PayloadParams {
+        self.rtc
+            .codec_config()
+            .find(|p| p.spec().codec == Codec::Opus)
+            .cloned()
+            .unwrap()
+    }
+
+    pub fn params_vp8(&self) -> PayloadParams {
+        self.rtc
+            .codec_config()
+            .find(|p| p.spec().codec == Codec::Vp8)
+            .cloned()
+            .unwrap()
     }
 }
 
@@ -72,6 +92,35 @@ pub fn progress(l: &mut TestRtc, r: &mut TestRtc) -> Result<(), RtcError> {
     Ok(())
 }
 
+/// Perform a change to the session via an offer and answer.
+///
+/// The closure is passed the [`SdpApi`] for the offer side to make any changes, these are then
+/// applied locally and the offer is negotiated with the answerer.
+pub fn negotiate<F>(offerer: &mut TestRtc, answerer: &mut TestRtc, mut do_change: F)
+where
+    F: FnMut(&mut SdpApi),
+{
+    let (offer, pending) = offerer.span.in_scope(|| {
+        let mut change = offerer.rtc.sdp_api();
+
+        do_change(&mut change);
+
+        change.apply().unwrap()
+    });
+
+    let answer = answerer
+        .span
+        .in_scope(|| answerer.rtc.sdp_api().accept_offer(offer).unwrap());
+
+    offerer.span.in_scope(|| {
+        offerer
+            .rtc
+            .sdp_api()
+            .accept_answer(pending, answer)
+            .unwrap();
+    });
+}
+
 impl Deref for TestRtc {
     type Target = Rtc;
 
@@ -94,10 +143,14 @@ pub fn init_log() {
         env::set_var("RUST_LOG", "debug");
     }
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
+    static START: Once = Once::new();
+
+    START.call_once(|| {
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(EnvFilter::from_default_env())
+            .init();
+    });
 }
 
 pub fn connect_l_r() -> (TestRtc, TestRtc) {

@@ -2,17 +2,22 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::format::CodecConfig;
 use crate::format::PayloadParams;
+use crate::io::DATAGRAM_MAX_PACKET_SIZE;
 use crate::io::DATAGRAM_MTU_WARN;
 use crate::io::MAX_RTP_OVERHEAD;
 use crate::media::KeyframeRequestKind;
+use crate::media::Media;
+use crate::media::MediaKind;
 use crate::packet::QueuePriority;
 use crate::packet::QueueSnapshot;
 use crate::packet::QueueState;
-use crate::rtp_::{extend_u16, InstantExt, ReportList, Rtcp, MAX_BLANK_PADDING_PAYLOAD_SIZE};
+use crate::rtp_::{extend_u16, Descriptions, InstantExt, ReportList, Rtcp};
 use crate::rtp_::{ExtensionMap, ReceptionReport, RtpHeader};
 use crate::rtp_::{ExtensionValues, MediaTime, Mid, NackEntry};
 use crate::rtp_::{Pt, Rid, RtcpFb, SenderInfo, SenderReport, Ssrc};
+use crate::rtp_::{Sdes, SdesType, MAX_BLANK_PADDING_PAYLOAD_SIZE};
 use crate::rtp_::{SeqNo, SRTP_BLOCK_SIZE};
 use crate::session::PacketReceipt;
 use crate::stats::MediaEgressStats;
@@ -23,7 +28,6 @@ use crate::RtcError;
 
 use super::rtx_cache::RtxCache;
 use super::send_queue::SendQueue;
-use super::BLANK_PACKET_DEFAULT_PT;
 use super::{rr_interval, RtpPacket};
 
 /// The smallest size of padding for which we attempt to use a spurious resend. For padding
@@ -33,6 +37,10 @@ const MIN_SPURIOUS_PADDING_SIZE: usize = 50;
 pub const DEFAULT_RTX_CACHE_DURATION: Duration = Duration::from_secs(3);
 
 /// Outgoing encoded stream.
+///
+/// A stream is a primary SSRC + optional RTX SSRC.
+///
+/// This is RTP level API. For sample level API see [`Rtc::writer`][crate::Rtc::writer].
 #[derive(Debug)]
 pub struct StreamTx {
     /// Unique identifier of the remote encoded stream.
@@ -46,6 +54,12 @@ pub struct StreamTx {
 
     /// The rid that might be used for this stream.
     rid: Option<Rid>,
+
+    /// Set on first handle_timeout.
+    kind: Option<MediaKind>,
+
+    /// Set on first handle_timeout.
+    cname: Option<String>,
 
     /// The last main payload clock rate that was sent.
     clock_rate: Option<i64>,
@@ -139,6 +153,8 @@ impl StreamTx {
             rtx,
             mid,
             rid,
+            kind: None,
+            cname: None,
             clock_rate: None,
             seq_no,
             seq_no_rtx,
@@ -149,7 +165,7 @@ impl StreamTx {
             resends: VecDeque::new(),
             padding: 0,
             blank_packet: RtpPacket::blank(),
-            rtx_cache: RtxCache::new(1024, DEFAULT_RTX_CACHE_DURATION, false),
+            rtx_cache: RtxCache::new(1024, DEFAULT_RTX_CACHE_DURATION),
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             stats: StreamTxStats::default(),
@@ -187,7 +203,7 @@ impl StreamTx {
     /// The default is 1024 packets over 3 seconds.
     pub fn set_rtx_cache(&mut self, max_packets: usize, max_age: Duration) {
         // Dump old cache to avoid having to deal with resizing logic inside the cache impl.
-        self.rtx_cache = RtxCache::new(max_packets, max_age, false);
+        self.rtx_cache = RtxCache::new(max_packets, max_age);
     }
 
     /// Set whether this stream is unpaced or not.
@@ -233,7 +249,6 @@ impl StreamTx {
         ext_vals: ExtensionValues,
         nackable: bool,
         payload: Vec<u8>,
-        // now: Instant,
     ) -> Result<(), RtcError> {
         //
         // This 1 in clock frequency will be fixed in poll_output.
@@ -266,7 +281,7 @@ impl StreamTx {
             timestamp: not_happening(),
         };
 
-        self.send_queue.push(packet); // , now);
+        self.send_queue.push(packet);
 
         Ok(())
     }
@@ -321,7 +336,6 @@ impl StreamTx {
             return None;
         };
 
-        let is_audio = param.spec().codec.is_audio();
         let mut set_pt = None;
         let mut set_cr = None;
 
@@ -369,7 +383,7 @@ impl StreamTx {
         header.ext_vals.transport_cc = Some(*twcc as u16);
         *twcc += 1;
 
-        buf.resize(2000, 0);
+        buf.resize(DATAGRAM_MAX_PACKET_SIZE, 0);
 
         let header_len = header.write_to(buf, exts);
         assert!(header_len % 4 == 0, "RTP header must be multiple of 4");
@@ -444,12 +458,6 @@ impl StreamTx {
                 .pop(now)
                 .expect("head of send_queue to be there");
             self.rtx_cache.cache_sent_packet(pkt, now);
-        }
-
-        // Set on first send, if not set already by configuration.
-        if self.unpaced.is_none() {
-            // Default audio to be unpaced.
-            self.unpaced = Some(is_audio);
         }
 
         // This is set here due to borrow checker.
@@ -597,8 +605,11 @@ impl StreamTx {
     }
 
     pub(crate) fn sender_report_at(&self) -> Instant {
-        let is_audio = self.rtx.is_none(); // this is maybe not correct, but it's all we got.
-        self.last_sender_report + rr_interval(is_audio)
+        let Some(kind) = self.kind else {
+            // First handle_timeout sets the kind. No sender report until then.
+            return not_happening();
+        };
+        self.last_sender_report + rr_interval(kind.is_audio())
     }
 
     pub(crate) fn poll_keyframe_request(&mut self) -> Option<KeyframeRequestKind> {
@@ -655,27 +666,22 @@ impl StreamTx {
         Some(())
     }
 
-    pub(crate) fn maybe_create_sr(
-        &mut self,
-        now: Instant,
-        // cname: &str,
-        feedback: &mut VecDeque<Rtcp>,
-    ) -> Option<()> {
-        if now < self.sender_report_at() {
-            return None;
-        }
+    pub(crate) fn need_sr(&self, now: Instant) -> bool {
+        now >= self.sender_report_at()
+    }
 
+    pub(crate) fn create_sr_and_update(&mut self, now: Instant, feedback: &mut VecDeque<Rtcp>) {
         let sr = self.create_sender_report(now);
-        // let ds = self.create_sdes(cname);
 
         debug!("Created feedback SR: {:?}", sr);
         feedback.push_back(Rtcp::SenderReport(sr));
-        // feedback.push_back(Rtcp::SourceDescription(ds));
+
+        if let Some(ds) = self.create_sdes() {
+            feedback.push_back(Rtcp::SourceDescription(ds));
+        }
 
         // Update timestamp to move time when next is created.
         self.last_sender_report = now;
-
-        Some(())
     }
 
     fn create_sender_report(&self, now: Instant) -> SenderReport {
@@ -685,20 +691,22 @@ impl StreamTx {
         }
     }
 
-    // fn create_sdes(&self, cname: &str) -> Descriptions {
-    //     let mut s = Sdes {
-    //         ssrc: self.ssrc,
-    //         values: ReportList::new(),
-    //     };
-    //     s.values.push((SdesType::CNAME, cname.to_string()));
+    fn create_sdes(&self) -> Option<Descriptions> {
+        // CNAME is set on first handle_timeout. No SDES before that.
+        let cname = self.cname.as_ref()?;
+        let mut s = Sdes {
+            ssrc: self.ssrc,
+            values: ReportList::new(),
+        };
+        s.values.push((SdesType::CNAME, cname.to_string()));
 
-    //     let mut d = Descriptions {
-    //         reports: ReportList::new(),
-    //     };
-    //     d.reports.push(s);
+        let mut d = Descriptions {
+            reports: ReportList::new(),
+        };
+        d.reports.push(s);
 
-    //     d
-    // }
+        Some(d)
+    }
 
     fn sender_info(&self, now: Instant) -> SenderInfo {
         let rtp_time = self.current_rtp_time(now).map(|t| t.numer()).unwrap_or(0);
@@ -723,7 +731,8 @@ impl StreamTx {
 
         // Wallclock needs to be in the past.
         if w > now {
-            warn!("write_rtp wallclock is in the future");
+            let delta = w - now;
+            debug!("write_rtp wallclock is in the future: {:?}", delta);
             return None;
         }
         let offset = now - w;
@@ -751,15 +760,14 @@ impl StreamTx {
     }
 
     pub(crate) fn queue_state(&mut self, now: Instant) -> QueueState {
-        // The unpaced flag is set to a default value on first ever write. The
+        // The unpaced flag is set to a default value on first handle_timeout. The
         // default is to not pace audio. We unwrap default to "true" here to not
         // apply any pacing until we know what kind of content we are sending.
         let unpaced = self.unpaced.unwrap_or(true);
 
         // It's only possible to use this sender for padding if RTX is enabled and
         // we know the previous main PT.
-        let is_pt_set = self.blank_packet.header.payload_type != BLANK_PACKET_DEFAULT_PT;
-        let use_for_padding = self.rtx_enabled() && is_pt_set;
+        let use_for_padding = self.rtx_enabled() && self.blank_packet.is_pt_set();
 
         let mut snapshot = self.send_queue.snapshot(now);
 
@@ -835,8 +843,48 @@ impl StreamTx {
         self.padding += padding;
     }
 
-    pub(crate) fn handle_timeout(&mut self, now: Instant) {
+    pub(crate) fn need_timeout(&self) -> bool {
+        self.send_queue.need_timeout()
+    }
+
+    pub(crate) fn handle_timeout<'a>(
+        &mut self,
+        now: Instant,
+        get_media: impl FnOnce() -> (&'a Media, &'a CodecConfig),
+    ) {
+        // If kind is None, this is the first time we ever get a handle_timeout.
+        if self.kind.is_none() {
+            let (media, config) = get_media();
+            self.on_first_timeout(media, config);
+        }
+
         self.send_queue.handle_timeout(now);
+    }
+
+    fn on_first_timeout(&mut self, media: &Media, config: &CodecConfig) {
+        // Always set on first timeout.
+        self.kind = Some(media.kind());
+        self.cname = Some(media.cname().to_string());
+
+        // Set on first timeout, if not set already by configuration.
+        if self.unpaced.is_none() {
+            // Default audio to be unpaced.
+            self.unpaced = Some(media.kind().is_audio());
+        }
+
+        // To allow for sending padding on a newly created StreamTx, before any regular
+        // packet has been sent, we need an PT that has RTX for any main PT. This is
+        // later be overwritten when we send the first regular packet.
+        if self.rtx_enabled() && !self.blank_packet.is_pt_set() {
+            if let Some(pt) = media.first_pt_with_rtx(config) {
+                trace!(
+                    "StreamTx Mid {} blank packet PT {} before first regular packet",
+                    self.mid,
+                    pt
+                );
+                self.blank_packet.header.payload_type = pt;
+            }
+        }
     }
 
     pub(crate) fn reset_buffers(&mut self) {

@@ -2,6 +2,7 @@
 #![allow(unused)]
 
 use std::fmt;
+use std::panic::UnwindSafe;
 use thiserror::Error;
 
 use crate::format::Codec;
@@ -12,6 +13,9 @@ use g7xx::{G711Packetizer, G722Packetizer};
 
 mod h264;
 use h264::{H264Depacketizer, H264Packetizer};
+
+mod h264_profile;
+pub(crate) use h264_profile::H264ProfileLevel;
 
 mod h265;
 use h265::H265Depacketizer;
@@ -176,7 +180,7 @@ pub(crate) enum CodecPacketizer {
     Vp8(Vp8Packetizer),
     Vp9(Vp9Packetizer),
     Null(NullPacketizer),
-    Boxed(Box<dyn Packetizer + Send + Sync>),
+    Boxed(Box<dyn Packetizer + Send + Sync + UnwindSafe>),
 }
 
 #[derive(Debug)]
@@ -187,7 +191,7 @@ pub(crate) enum CodecDepacketizer {
     Vp8(Vp8Depacketizer),
     Vp9(Vp9Depacketizer),
     Null(NullDepacketizer),
-    Boxed(Box<dyn Depacketizer + Send + Sync>),
+    Boxed(Box<dyn Depacketizer + Send + Sync + UnwindSafe>),
 }
 
 impl From<Codec> for CodecPacketizer {

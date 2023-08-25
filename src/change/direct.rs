@@ -1,9 +1,8 @@
 use crate::channel::ChannelId;
 use crate::dtls::Fingerprint;
-use crate::format::PayloadParams;
 use crate::ice::IceCreds;
-use crate::media::Media;
-use crate::rtp_::{Direction, ExtensionMap, Mid, Rid, Ssrc};
+use crate::media::{Media, MediaKind};
+use crate::rtp_::{Mid, Rid, Ssrc};
 use crate::sctp::ChannelConfig;
 use crate::streams::{StreamRx, StreamTx, DEFAULT_RTX_CACHE_DURATION};
 use crate::Rtc;
@@ -12,6 +11,14 @@ use crate::RtcError;
 /// Direct change strategy.
 ///
 /// Makes immediate changes to the Rtc session without any Sdp OFFER/ANSWER.
+///
+/// <div class="warning"><b>This is a low level API.</b>
+///
+///  str0m normally guarantees that user input cannot cause panics.
+///  However as an exception, the Direct API does allow the user to configure the
+///  session in a way that is internally inconsistent. Such situations can
+///  result in panics.
+/// </div>
 pub struct DirectApi<'a> {
     rtc: &'a mut Rtc,
 }
@@ -115,13 +122,7 @@ impl<'a> DirectApi<'a> {
     ///
     /// All streams belong to a media identified by a `mid`. This creates the media without
     /// doing any SDP dance.
-    pub fn declare_media(
-        &mut self,
-        mid: Mid,
-        dir: Direction,
-        exts: ExtensionMap,
-        params: &[PayloadParams],
-    ) -> &mut Media {
+    pub fn declare_media(&mut self, mid: Mid, kind: MediaKind) -> &mut Media {
         let max_index = self.rtc.session.medias.iter().map(|m| m.index()).max();
 
         let next_index = if let Some(max_index) = max_index {
@@ -130,22 +131,8 @@ impl<'a> DirectApi<'a> {
             0
         };
 
-        if params.is_empty() {
-            panic!("declare_media requires at least one payload parameter");
-        }
-
-        let is_audio = params[0].spec().codec.is_audio();
-
-        if params.iter().any(|p| p.spec().codec.is_audio() != is_audio) {
-            panic!("declare_media detected mix of audio/video parameters");
-        }
-
-        // Update session with the extension (these should be per BUNDLE, and we only have one).
-        for (id, ext) in exts.iter(is_audio) {
-            self.rtc.session.exts.apply(id, ext);
-        }
-
-        let m = Media::from_direct_api(mid, next_index, dir, exts, params, is_audio);
+        let exts = self.rtc.session.exts.cloned_with_type(kind.is_audio());
+        let m = Media::from_direct_api(mid, next_index, kind, exts);
 
         self.rtc.session.medias.push(m);
         self.rtc.session.medias.last_mut().unwrap()
@@ -176,6 +163,8 @@ impl<'a> DirectApi<'a> {
     }
 
     /// Obtain a receive stream.
+    ///
+    /// In RTP mode, the receive stream is used to signal keyframe requests.
     ///
     /// The stream must first be declared usig [`DirectApi::expect_stream_rx`].
     pub fn stream_rx(&mut self, ssrc: &Ssrc) -> Option<&mut StreamRx> {
@@ -231,7 +220,7 @@ impl<'a> DirectApi<'a> {
         self.rtc.session.streams.remove_stream_tx(ssrc)
     }
 
-    /// Obtain a send stream.
+    /// Obtain a send stream to write RTP data directly.
     ///
     /// The stream must first be declared usig [`DirectApi::declare_stream_tx`].
     pub fn stream_tx(&mut self, ssrc: &Ssrc) -> Option<&mut StreamTx> {

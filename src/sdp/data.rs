@@ -79,6 +79,11 @@ impl Sdp {
     }
 
     fn do_assert_consistency(&self) -> Option<String> {
+        // TODO: SDP assertions we need to make:
+        // 1. Ensure that every m-line has the same PT configuration for a codec. I.e. if FIR is enabled
+        //    for PT 96 in one m-line it must be in all m-lines.
+        // 2. Compare with previous m-lines that remote isn't narrowing/expanding PT and/or extmaps.
+
         let group = self
             .session
             .attrs
@@ -222,6 +227,7 @@ fn is_dir(a: &MediaAttribute) -> bool {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MediaLine {
     pub typ: MediaType,
+    pub disabled: bool,
     pub proto: Proto,
     pub pts: Vec<Pt>, // payload types 96 97 125 107 from the m= line
     pub bw: Option<Bandwidth>,
@@ -1548,6 +1554,7 @@ mod test {
             },
             media_lines: vec![MediaLine {
                 typ: MediaType::Audio,
+                disabled: false,
                 proto: Proto::Srtp,
                 pts: vec![
                     111.into(),

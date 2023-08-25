@@ -87,6 +87,47 @@ impl std::str::FromStr for Fingerprint {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrtpProfile {
+    Aes128CmSha1_80,
+    AeadAes128Gcm,
+}
+
+impl SrtpProfile {
+    // All the profiles we support, ordered from most preferred to least.
+    pub(crate) const ALL: &[SrtpProfile] =
+        &[SrtpProfile::AeadAes128Gcm, SrtpProfile::Aes128CmSha1_80];
+
+    /// The length of keying material to extract from the DTLS session in bytes.
+    #[rustfmt::skip]
+    pub(crate) fn keying_material_len(&self) -> usize {
+        match self {
+             // MASTER_KEY_LEN * 2 + MASTER_SALT * 2
+             // TODO: This is a duplication of info that is held in srtp.rs, because we
+             // don't want a dependenct in that direction.
+            SrtpProfile::Aes128CmSha1_80 => 16 * 2 + 14 * 2,
+            SrtpProfile::AeadAes128Gcm   => 16 * 2 + 12 * 2,
+        }
+    }
+
+    /// What this profile is called in OpenSSL parlance.
+    pub(crate) fn openssl_name(&self) -> &'static str {
+        match self {
+            SrtpProfile::Aes128CmSha1_80 => "SRTP_AES128_CM_SHA1_80",
+            SrtpProfile::AeadAes128Gcm => "SRTP_AEAD_AES_128_GCM",
+        }
+    }
+}
+
+impl fmt::Display for SrtpProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SrtpProfile::Aes128CmSha1_80 => write!(f, "SRTP_AES128_CM_SHA1_80"),
+            SrtpProfile::AeadAes128Gcm => write!(f, "SRTP_AEAD_AES_128_GCM"),
+        }
+    }
+}
+
 /// Encapsulation of DTLS.
 pub struct Dtls {
     /// Certificate for the DTLS session.
@@ -113,8 +154,8 @@ pub enum DtlsEvent {
     /// When the DTLS has finished handshaking.
     Connected,
 
-    /// Keying material for SRTP encryption master key.
-    SrtpKeyingMaterial(KeyingMaterial),
+    /// Keying material for SRTP encryption master key and the selected SRTP profile.
+    SrtpKeyingMaterial(KeyingMaterial, SrtpProfile),
 
     /// The fingerprint of the remote peer.
     ///
@@ -238,7 +279,7 @@ impl Dtls {
         } else if self.tls.complete_handshake_until_block()? {
             self.events.push_back(DtlsEvent::Connected);
 
-            let (keying_material, fingerprint) = self
+            let (keying_material, srtp_profile, fingerprint) = self
                 .tls
                 .take_srtp_keying_material()
                 .expect("Exported keying material");
@@ -247,7 +288,7 @@ impl Dtls {
                 .push_back(DtlsEvent::RemoteFingerprint(fingerprint));
 
             self.events
-                .push_back(DtlsEvent::SrtpKeyingMaterial(keying_material));
+                .push_back(DtlsEvent::SrtpKeyingMaterial(keying_material, srtp_profile));
             Ok(false)
         } else {
             Ok(true)
@@ -320,9 +361,11 @@ impl fmt::Debug for DtlsEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connected => write!(f, "Connected"),
-            Self::SrtpKeyingMaterial(arg0) => {
-                f.debug_tuple("SrtpKeyingMaterial").field(arg0).finish()
-            }
+            Self::SrtpKeyingMaterial(keying_mat, srtp_profile) => f
+                .debug_tuple("SrtpKeyingMaterial")
+                .field(keying_mat)
+                .field(srtp_profile)
+                .finish(),
             Self::RemoteFingerprint(arg0) => {
                 f.debug_tuple("RemoteFingerprint").field(arg0).finish()
             }

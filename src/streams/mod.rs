@@ -3,7 +3,8 @@ use std::fmt;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::media::KeyframeRequest;
+use crate::format::CodecConfig;
+use crate::media::{KeyframeRequest, Media};
 use crate::rtp_::MediaTime;
 use crate::rtp_::Pt;
 use crate::rtp_::Ssrc;
@@ -89,7 +90,8 @@ pub struct StreamPaused {
     pub paused: bool,
 }
 
-pub const BLANK_PACKET_DEFAULT_PT: Pt = Pt::new_with_value(0);
+/// 255 is out of range for a real PT, which is 7 bit.
+const BLANK_PACKET_DEFAULT_PT: Pt = Pt::new_with_value(255);
 
 impl RtpPacket {
     fn blank() -> RtpPacket {
@@ -104,6 +106,10 @@ impl RtpPacket {
             nackable: false,
             timestamp: already_happened(),
         }
+    }
+
+    pub(crate) fn is_pt_set(&self) -> bool {
+        self.header.payload_type != BLANK_PACKET_DEFAULT_PT
     }
 }
 
@@ -122,6 +128,10 @@ pub(crate) struct Streams {
     /// Local SSRC used before we got any StreamTx. This is used for RTCP if we don't
     /// have any reasonable value to use.
     default_ssrc_tx: Ssrc,
+
+    /// We need to report all RR/SR for a Mid together in one RTCP. This is a dynamic
+    /// list that we don't want to allocate on every handle_timeout.
+    mids_to_report: Vec<Mid>,
 }
 
 impl Default for Streams {
@@ -130,6 +140,7 @@ impl Default for Streams {
             streams_rx: Default::default(),
             streams_tx: Default::default(),
             default_ssrc_tx: 0.into(), // this will be changed
+            mids_to_report: Vec::with_capacity(10),
         }
     }
 }
@@ -194,6 +205,14 @@ impl Streams {
         self.streams_rx.values().find_map(|s| s.paused_at())
     }
 
+    pub(crate) fn timestamp_writes_at(&self) -> Option<Instant> {
+        if self.streams_tx.values().any(|s| s.need_timeout()) {
+            Some(already_happened())
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn is_receiving(&self) -> bool {
         !self.streams_rx.is_empty()
     }
@@ -203,20 +222,53 @@ impl Streams {
         now: Instant,
         sender_ssrc: Ssrc,
         do_nack: bool,
+        medias: &[Media],
+        config: &CodecConfig,
         feedback: &mut VecDeque<Rtcp>,
     ) {
+        self.mids_to_report.clear(); // Clear for checking StreamRx.
+        for stream in self.streams_rx.values() {
+            if stream.need_rr(now) {
+                self.mids_to_report.push(stream.mid());
+            }
+        }
+
         for stream in self.streams_rx.values_mut() {
             stream.maybe_create_keyframe_request(sender_ssrc, feedback);
-            stream.maybe_create_rr(now, sender_ssrc, feedback);
+
+            // All StreamRx belonging to the same Mid are reported together.
+            if self.mids_to_report.contains(&stream.mid()) {
+                stream.create_rr_and_update(now, sender_ssrc, feedback);
+            }
+
             if do_nack {
                 stream.maybe_create_nack(sender_ssrc, feedback);
             }
+
             stream.handle_timeout(now);
         }
 
+        self.mids_to_report.clear(); // start over for StreamTx.
+        for stream in self.streams_tx.values() {
+            if stream.need_sr(now) {
+                self.mids_to_report.push(stream.mid());
+            }
+        }
+
         for stream in self.streams_tx.values_mut() {
-            stream.handle_timeout(now);
-            stream.maybe_create_sr(now, feedback);
+            let mid = stream.mid();
+
+            // All StreamTx belongin to the same Mid are reported together.
+            if self.mids_to_report.contains(&mid) {
+                stream.create_sr_and_update(now, feedback);
+            }
+
+            // Finding the first (main) PT that also has RTX for the Media is expensive,
+            // this closure is run only when needed.
+            // The unwrap is okay because we cannot have StreamTx with a Mid without the corresponding Media.
+            let get_media = move || (medias.iter().find(|m| m.mid() == mid).unwrap(), config);
+
+            stream.handle_timeout(now, get_media);
         }
     }
 

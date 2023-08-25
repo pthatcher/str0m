@@ -17,6 +17,8 @@ use super::{rr_interval, RtpPacket};
 /// Incoming encoded stream.
 ///
 /// A stream is a primary SSRC + optional RTX SSRC.
+///
+/// This is RTP level API. For sample level API see [`Rtc::writer`][crate::Rtc::writer].
 #[derive(Debug)]
 pub struct StreamRx {
     /// Unique idenfier of the remote stream.
@@ -32,6 +34,9 @@ pub struct StreamRx {
 
     /// The rid that might be used for this stream.
     rid: Option<Rid>,
+
+    /// Incoming CNAME in Sdes reports.
+    cname: Option<String>,
 
     /// Whether we explicitly want to supress NACK sending. This is normally done by not
     /// setting an RTX, however this can be toggled off manually despite RTX being there.
@@ -116,6 +121,7 @@ impl StreamRx {
             rtx: None,
             mid,
             rid,
+            cname: None,
             suppress_nack: false,
             last_used: already_happened(),
             sender_info: None,
@@ -129,7 +135,7 @@ impl StreamRx {
             check_paused_at: None,
             paused: true,
             need_paused_event: false,
-            pause_threshold: Duration::from_millis(150000),
+            pause_threshold: Duration::from_millis(1500),
         }
     }
 
@@ -155,6 +161,13 @@ impl StreamRx {
     /// This is used to separate streams with the same [`Mid`] when using simulcast.
     pub fn rid(&self) -> Option<Rid> {
         self.rid
+    }
+
+    /// CNAME as sent by remote peer in a Sdes.
+    ///
+    /// The value is None until we receive a first report with the value set.
+    pub fn cname(&self) -> Option<&str> {
+        self.cname.as_deref()
     }
 
     /// Set threshold duration for emitting the paused event.
@@ -203,7 +216,8 @@ impl StreamRx {
                         }
 
                         // Here we _could_ check CNAME here matches something. But
-                        // CNAMEs are a bit unfashionable with the WebRTC spec people.
+                        // CNAMEs are a bit unfashionable.
+                        self.cname = Some(st);
                         return;
                     }
                 }
@@ -376,20 +390,20 @@ impl StreamRx {
 
     fn next_fir_seq_no(&mut self) -> u8 {
         let x = self.fir_seq_no;
-        self.fir_seq_no += 1;
+        self.fir_seq_no = self.fir_seq_no.wrapping_add(1);
         x
     }
 
-    pub(crate) fn maybe_create_rr(
+    pub(crate) fn need_rr(&self, now: Instant) -> bool {
+        now >= self.receiver_report_at()
+    }
+
+    pub(crate) fn create_rr_and_update(
         &mut self,
         now: Instant,
         sender_ssrc: Ssrc,
         feedback: &mut VecDeque<Rtcp>,
     ) {
-        if now < self.receiver_report_at() {
-            return;
-        }
-
         let mut rr = self.create_receiver_report(now);
         rr.sender_ssrc = sender_ssrc;
 

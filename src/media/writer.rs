@@ -10,6 +10,9 @@ use super::{ExtensionValues, KeyframeRequestKind, Media, MediaTime, Mid, Pt, Rid
 /// Writer of sample level data.
 ///
 /// Obtained via [`Rtc::writer`][crate::Rtc::writer].
+///
+/// This is the Sample Level API. For RTP level see
+/// [`DirectApi::stream_tx`][crate::change::DirectApi::stream_tx].
 pub struct Writer<'a> {
     session: &'a mut Session,
     mid: Mid,
@@ -31,7 +34,7 @@ impl<'a> Writer<'a> {
     ///
     /// For the [`Writer::write()`] call, the `pt` must be set correctly.
     pub fn payload_params(&self) -> &[PayloadParams] {
-        media_by_mid(&self.session.medias, self.mid).payload_params()
+        &self.session.codec_config
     }
 
     /// Match the given parameters to the configured parameters for this [`Media`].
@@ -43,7 +46,10 @@ impl<'a> Writer<'a> {
     /// This call performs matching and if a match is found, returns the _local_ PT
     /// that can be used for sending media.
     pub fn match_params(&self, params: PayloadParams) -> Option<Pt> {
-        media_by_mid(&self.session.medias, self.mid).match_params(params)
+        self.session
+            .codec_config
+            .match_params(params)
+            .map(|p| p.pt())
     }
 
     /// Add on an Rtp Stream Id. This is typically used to separate simulcast layers.
@@ -71,6 +77,9 @@ impl<'a> Writer<'a> {
 
     /// Write media.
     ///
+    /// This operation fails if the PT doesn't match a negotiated codec, or the RID (`None` or a value)
+    /// does not match anything negotiated.
+    ///
     /// Regarding `wallclock` and `rtp_time`, the wallclock is the real world time that corresponds to
     /// the `MediaTime`. For an SFU, this can be hard to know, since RTP packets typically only
     /// contain the media time (RTP time). In the simplest SFU setup, the wallclock could simply
@@ -90,8 +99,14 @@ impl<'a> Writer<'a> {
     ) -> Result<(), RtcError> {
         let media = media_by_mid_mut(&mut self.session.medias, self.mid);
 
-        if !media.has_pt(pt) {
+        if !self.session.codec_config.has_pt(pt) {
             return Err(RtcError::UnknownPt(pt));
+        }
+
+        if let Some(rid) = self.rid {
+            if !media.rids_rx().expects(rid) && media.rids_rx().is_specific() {
+                return Err(RtcError::UnknownRid(rid));
+            }
         }
 
         let to_payload = ToPayload {
@@ -120,7 +135,7 @@ impl<'a> Writer<'a> {
     /// a=rtcp-fb:96 nack pli
     /// ```
     pub fn is_request_keyframe_possible(&self, kind: KeyframeRequestKind) -> bool {
-        media_by_mid(&self.session.medias, self.mid).is_request_keyframe_possible(kind)
+        self.session.is_request_keyframe_possible(kind)
     }
 
     /// Request a keyframe from a remote peer sending media data.
@@ -164,10 +179,6 @@ impl<'a> Writer<'a> {
 
         Ok(())
     }
-}
-
-fn media_by_mid(medias: &[Media], mid: Mid) -> &Media {
-    medias.iter().find(|m| m.mid() == mid).unwrap()
 }
 
 fn media_by_mid_mut(medias: &mut [Media], mid: Mid) -> &mut Media {
