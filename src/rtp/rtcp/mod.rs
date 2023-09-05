@@ -60,22 +60,34 @@ pub trait RtcpPacket {
     fn write_to(&self, buf: &mut [u8]) -> usize;
 }
 
+/// RTCP reports handled by str0m.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rtcp {
+    /// Sender report. Also known as SR.
     SenderReport(SenderReport),
+    /// Receiver report. Also known as RR.
     ReceiverReport(ReceiverReport),
+    /// Extended  receiver report. Sometimes called XR.
+    ///
+    /// Always sent together with a receiver report.
     ExtendedReport(ExtendedReport),
+    /// Description of Synchronization Sources (senders).
     SourceDescription(Descriptions),
+    /// BYE. When a stream is over.
     Goodbye(Goodbye),
+    /// Reports missing packets.
     Nack(Nack),
+    /// Picture Loss Indiciation. When decoding a picture is not possible.
     Pli(Pli),
+    /// Full Intra Request. Complete restart of a video decoder.
     Fir(Fir),
+    /// Transport Wide Congestion Control. Feedback for every received RTP packet.
     Twcc(Twcc),
 }
 
 impl Rtcp {
-    pub fn read_packet(buf: &[u8], feedback: &mut VecDeque<Rtcp>) {
+    pub(crate) fn read_packet(buf: &[u8], feedback: &mut VecDeque<Rtcp>) {
         let mut buf = buf;
         loop {
             if buf.is_empty() {
@@ -117,7 +129,11 @@ impl Rtcp {
         }
     }
 
-    pub fn write_packet(feedback: &mut VecDeque<Rtcp>, buf: &mut [u8]) -> usize {
+    pub(crate) fn write_packet(
+        feedback: &mut VecDeque<Rtcp>,
+        buf: &mut [u8],
+        mut output: impl FnMut(Rtcp),
+    ) -> usize {
         if feedback.is_empty() {
             return 0;
         }
@@ -150,6 +166,9 @@ impl Rtcp {
                 written, item_len,
                 "length_words equals write_to length: {fb:?}"
             );
+
+            // When debugging we can pass an output to get the serialized packets.
+            output(fb);
 
             // Move offsets for the amount written.
             offset += item_len;
@@ -461,7 +480,7 @@ mod test {
         twcc.delta.push_back(Delta::Small(0x84));
         queue.push_back(Rtcp::Twcc(twcc));
         let mut buf = vec![0; 1500];
-        let n = Rtcp::write_packet(&mut queue, &mut buf);
+        let n = Rtcp::write_packet(&mut queue, &mut buf, |_| {});
         buf.truncate(n);
         println!("{buf:02x?}");
         assert_eq!(
@@ -545,7 +564,7 @@ mod test {
         feedback.push_back(rr(5));
 
         let mut buf = vec![0_u8; 1360];
-        let n = Rtcp::write_packet(&mut feedback, &mut buf);
+        let n = Rtcp::write_packet(&mut feedback, &mut buf, |_| {});
         buf.truncate(n);
 
         let mut parsed = VecDeque::new();

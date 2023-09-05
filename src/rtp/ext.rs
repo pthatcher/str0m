@@ -1,12 +1,19 @@
-use std::collections::VecDeque;
+use std::any::Any;
+use std::any::TypeId;
+use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Debug;
+use std::hash::BuildHasherDefault;
+use std::hash::Hasher;
+use std::panic::UnwindSafe;
 use std::str::from_utf8;
+use std::sync::Arc;
 
 use super::mtime::MediaTime;
 use super::{Mid, Rid};
 
 /// RTP header extensions.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Extension {
     /// <http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time>
@@ -45,10 +52,50 @@ pub enum Extension {
     FrameMarking,
     /// <http://www.webrtc.org/experiments/rtp-hdrext/color-space>
     ColorSpace,
-    /// <http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00>
-    VideoLayersAllocation,
-    /// Not recognized URI
-    UnknownUri,
+
+    /// Not recognized URI, but it could still be user parseable.
+    #[doc(hidden)]
+    UnknownUri(String, Arc<dyn ExtensionSerializer>),
+}
+
+// TODO: think this through. Is it unwind safe?
+impl UnwindSafe for Extension {}
+
+/// Trait for parsing/writing user RTP header extensions.
+pub trait ExtensionSerializer: Debug + Send + Sync + 'static {
+    /// Write the extension to the buffer of bytes. Must return the number
+    /// of bytes written. This can be 0 if the extension could not be serialized.
+    fn write_to(&self, buf: &mut [u8], ev: &ExtensionValues) -> usize;
+
+    /// Parse a value and put it in the [`ExtensionValues::user_values`] field.
+    fn parse_value(&self, buf: &[u8], ev: &mut ExtensionValues) -> bool;
+
+    /// Tell if this extension should be used for video media.
+    fn is_video(&self) -> bool;
+
+    /// Tell if this extension should be used for audio media.
+    fn is_audio(&self) -> bool;
+}
+
+/// This is a placeholder value for when the Extension URI are parsed in an SDP OFFER/ANSWER.
+/// The trait write_to() and parse_value() should never be called (that would be a bug).
+#[derive(Debug)]
+struct SdpUnknownUri;
+
+impl ExtensionSerializer for SdpUnknownUri {
+    // If an unreachable happens, it's a bug.
+    fn write_to(&self, _buf: &mut [u8], _ev: &ExtensionValues) -> usize {
+        unreachable!("Incorrect ExtensionSerializer::write_to")
+    }
+    fn parse_value(&self, _buf: &[u8], _ev: &mut ExtensionValues) -> bool {
+        unreachable!("Incorrect ExtensionSerializer::parse_value")
+    }
+    fn is_video(&self) -> bool {
+        unreachable!("Incorrect ExtensionSerializer::is_video")
+    }
+    fn is_audio(&self) -> bool {
+        unreachable!("Incorrect ExtensionSerializer::is_audio")
+    }
 }
 
 /// Mapping of extension URI to our enum
@@ -105,42 +152,67 @@ const EXT_URI: &[(Extension, &str)] = &[
         Extension::ColorSpace,
         "http://www.webrtc.org/experiments/rtp-hdrext/color-space",
     ),
-    (
-        Extension::VideoLayersAllocation,
-        "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00",
-    ),
 ];
 
 impl Extension {
-    /// Parses an extension from a URI.
-    pub fn from_uri(uri: &str) -> Self {
+    /// Parses an extension from a URI. This only happens for incoming SDP OFFER/ANSWER
+    /// while the corresponding Extension with a potential ExtensionSerializer is
+    /// in Rtc::session.
+    pub(crate) fn from_sdp_uri(uri: &str) -> Self {
         for (t, spec) in EXT_URI.iter() {
             if *spec == uri {
-                return *t;
+                return t.clone();
             }
         }
 
-        trace!("Unknown a=extmap uri: {}", uri);
+        Extension::UnknownUri(uri.to_string(), Arc::new(SdpUnknownUri))
+    }
 
-        Extension::UnknownUri
+    /// Extension for a uri not handled by str0m itself.
+    pub fn with_serializer(uri: &str, s: impl ExtensionSerializer) -> Self {
+        Extension::UnknownUri(uri.to_string(), Arc::new(s))
     }
 
     /// Represents the extension as an URI.
-    pub fn as_uri(&self) -> &'static str {
+    pub fn as_uri(&self) -> &str {
         for (t, spec) in EXT_URI.iter() {
             if t == self {
                 return spec;
             }
         }
+
+        if let Extension::UnknownUri(uri, _) = self {
+            return uri;
+        }
+
         "unknown"
     }
 
     pub(crate) fn is_serialized(&self) -> bool {
-        *self != Extension::UnknownUri
+        if let Self::UnknownUri(_, s) = self {
+            // Check if this Arc contains the SdpUnknownUri.
+            let is_sdp = (s as &(dyn Any + 'static))
+                .downcast_ref::<SdpUnknownUri>()
+                .is_some();
+
+            // If it is the SdpUnknownUri, we are not serializing. If this happens,
+            // it's probably a bug. The only way to construct SdpUnknownUri is via SDP,
+            // but those values are only for Eq-comparison vs the values in Session.
+            // The SdpUnknownUri should not even try to be serialized.
+            if is_sdp {
+                panic!("is_serialized on SdpUnkownUri, this is a bug");
+            }
+        }
+        true
     }
 
     fn is_audio(&self) -> bool {
         use Extension::*;
+
+        if let UnknownUri(_, serializer) = self {
+            return serializer.is_audio();
+        }
+
         matches!(
             self,
             RtpStreamId
@@ -156,6 +228,11 @@ impl Extension {
 
     fn is_video(&self) -> bool {
         use Extension::*;
+
+        if let UnknownUri(_, serializer) = self {
+            return serializer.is_video();
+        }
+
         matches!(
             self,
             RtpStreamId
@@ -170,7 +247,6 @@ impl Extension {
                 | VideoTiming
                 | FrameMarking
                 | ColorSpace
-                | VideoLayersAllocation
         )
     }
 }
@@ -195,10 +271,10 @@ impl Extension {
 // "a=extmap:14 urn:ietf:params:rtp-hdrext:toffset"
 
 /// Mapping between RTP extension id to what extension that is.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExtensionMap([Option<MapEntry>; 14]); // index 0 is extmap:1.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MapEntry {
     ext: Extension,
     locked: bool,
@@ -207,7 +283,7 @@ struct MapEntry {
 impl ExtensionMap {
     /// Create an empty map.
     pub fn empty() -> Self {
-        ExtensionMap([None; 14])
+        ExtensionMap(std::array::from_fn(|_| None))
     }
 
     /// Creates a map with the "standard" mappings.
@@ -220,7 +296,6 @@ impl ExtensionMap {
         exts.set(2, Extension::AbsoluteSendTime);
         exts.set(3, Extension::TransportSequenceNumber);
         exts.set(4, Extension::RtpMid);
-        exts.set(6, Extension::VideoLayersAllocation);
         // exts.set_mapping(&ExtMap::new(8, Extension::ColorSpace));
         exts.set(10, Extension::RtpStreamId);
         exts.set(11, Extension::RepairedRtpStreamId);
@@ -253,9 +328,9 @@ impl ExtensionMap {
     /// Look up the extension for the id.
     ///
     /// The id must be 1-14 inclusive (1-indexed).
-    pub fn lookup(&self, id: u8) -> Option<Extension> {
+    pub fn lookup(&self, id: u8) -> Option<&Extension> {
         if id >= 1 && id <= 14 {
-            self.0[id as usize - 1].map(|m| m.ext)
+            self.0[id as usize - 1].as_ref().map(|m| &m.ext)
         } else {
             debug!("Lookup RTP extension out of range 1-14: {}", id);
             None
@@ -268,14 +343,14 @@ impl ExtensionMap {
     pub fn id_of(&self, e: Extension) -> Option<u8> {
         self.0
             .iter()
-            .position(|x| x.map(|e| e.ext) == Some(e))
+            .position(|x| x.as_ref().map(|e| &e.ext) == Some(&e))
             .map(|p| p as u8 + 1)
     }
 
     /// Returns an iterator over the elements of the extension map
     ///
     /// Filtering them based on the provided `audio` flag
-    pub fn iter(&self, audio: bool) -> impl Iterator<Item = (u8, Extension)> + '_ {
+    pub fn iter(&self, audio: bool) -> impl Iterator<Item = (u8, &Extension)> + '_ {
         self.0
             .iter()
             .enumerate()
@@ -287,13 +362,13 @@ impl ExtensionMap {
                     e.ext.is_video()
                 }
             })
-            .map(|(i, e)| ((i + 1) as u8, e.ext))
+            .map(|(i, e)| ((i + 1) as u8, &e.ext))
     }
 
     pub(crate) fn cloned_with_type(&self, audio: bool) -> Self {
         let mut x = ExtensionMap::empty();
         for (id, ext) in self.iter(audio) {
-            x.set(id, ext);
+            x.set(id, ext.clone());
         }
         x
     }
@@ -371,14 +446,14 @@ impl ExtensionMap {
         orig_len - b.len()
     }
 
-    pub(crate) fn remap(&mut self, remote_exts: &[(u8, Extension)]) {
+    pub(crate) fn remap(&mut self, remote_exts: &[(u8, &Extension)]) {
         // Match remote numbers and lock down those we see for the first time.
         for (id, ext) in remote_exts {
-            self.swap(*id, *ext);
+            self.swap(*id, ext);
         }
     }
 
-    fn swap(&mut self, id: u8, ext: Extension) {
+    fn swap(&mut self, id: u8, ext: &Extension) {
         if id < 1 || id > 14 {
             return;
         }
@@ -390,7 +465,7 @@ impl ExtensionMap {
             .0
             .iter()
             .enumerate()
-            .find(|(_, m)| m.map(|m| m.ext) == Some(ext))
+            .find(|(_, m)| m.as_ref().map(|m| &m.ext) == Some(ext))
             .map(|(i, _)| i)
         else {
             return;
@@ -508,20 +583,21 @@ impl Extension {
             }
             ColorSpace => {
                 // TODO HDR color space
-                todo!()
-            }
-            VideoLayersAllocation => {
-                // TODO VLA
                 None
             }
-            UnknownUri => {
-                // do nothing
-                todo!()
+            UnknownUri(_, serializer) => {
+                let n = serializer.write_to(buf, ev);
+
+                if n == 0 {
+                    None
+                } else {
+                    Some(n)
+                }
             }
         }
     }
 
-    pub(crate) fn parse_value(&self, buf: &[u8], v: &mut ExtensionValues) -> Option<()> {
+    pub(crate) fn parse_value(&self, buf: &[u8], ev: &mut ExtensionValues) -> Option<()> {
         use Extension::*;
         match self {
             // 3
@@ -531,36 +607,36 @@ impl Extension {
                     return None;
                 }
                 let time_24 = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]);
-                v.abs_send_time = Some(MediaTime::new(time_24 as i64, FIXED_POINT_6_18));
+                ev.abs_send_time = Some(MediaTime::new(time_24 as i64, FIXED_POINT_6_18));
             }
             // 1
             AudioLevel => {
                 if buf.is_empty() {
                     return None;
                 }
-                v.audio_level = Some(-(0x7f & buf[0] as i8));
-                v.voice_activity = Some(buf[0] & 0x80 > 0);
+                ev.audio_level = Some(-(0x7f & buf[0] as i8));
+                ev.voice_activity = Some(buf[0] & 0x80 > 0);
             }
             // 3
             TransmissionTimeOffset => {
                 if buf.len() < 4 {
                     return None;
                 }
-                v.tx_time_offs = Some(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]));
+                ev.tx_time_offs = Some(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]));
             }
             // 1
             VideoOrientation => {
                 if buf.is_empty() {
                     return None;
                 }
-                v.video_orientation = Some(super::ext::VideoOrientation::from(buf[0] & 3));
+                ev.video_orientation = Some(super::ext::VideoOrientation::from(buf[0] & 3));
             }
             // 2
             TransportSequenceNumber => {
                 if buf.len() < 2 {
                     return None;
                 }
-                v.transport_cc = Some(u16::from_be_bytes([buf[0], buf[1]]));
+                ev.transport_cc = Some(u16::from_be_bytes([buf[0], buf[1]]));
             }
             // 3
             PlayoutDelay => {
@@ -569,22 +645,22 @@ impl Extension {
                 }
                 let min = (buf[0] as u32) << 4 | (buf[1] as u32) >> 4;
                 let max = ((buf[1] & 0xf) as u32) << 8 | buf[2] as u32;
-                v.play_delay_min = Some(MediaTime::new(min as i64, 100));
-                v.play_delay_max = Some(MediaTime::new(max as i64, 100));
+                ev.play_delay_min = Some(MediaTime::new(min as i64, 100));
+                ev.play_delay_max = Some(MediaTime::new(max as i64, 100));
             }
             // 1
             VideoContentType => {
                 if buf.is_empty() {
                     return None;
                 }
-                v.video_content_type = Some(buf[0]);
+                ev.video_content_type = Some(buf[0]);
             }
             // 13
             VideoTiming => {
                 if buf.len() < 9 {
                     return None;
                 }
-                v.video_timing = Some(self::VideoTiming {
+                ev.video_timing = Some(self::VideoTiming {
                     flags: buf[0],
                     encode_start: u16::from_be_bytes([buf[1], buf[2]]),
                     encode_finish: u16::from_be_bytes([buf[3], buf[4]]),
@@ -596,30 +672,30 @@ impl Extension {
             }
             RtpStreamId => {
                 let s = from_utf8(buf).ok()?;
-                v.rid = Some(s.into());
+                ev.rid = Some(s.into());
             }
             RepairedRtpStreamId => {
                 let s = from_utf8(buf).ok()?;
-                v.rid_repair = Some(s.into());
+                ev.rid_repair = Some(s.into());
             }
             RtpMid => {
                 let s = from_utf8(buf).ok()?;
-                v.mid = Some(s.into());
+                ev.mid = Some(s.into());
             }
             FrameMarking => {
                 if buf.len() < 4 {
                     return None;
                 }
-                v.frame_mark = Some(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]));
+                ev.frame_mark = Some(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]));
             }
             ColorSpace => {
                 // TODO HDR color space
             }
-            VideoLayersAllocation => {
-                v.video_layers_allocation = self::VideoLayersAllocation::parse(buf);
-            }
-            UnknownUri => {
-                // ignore
+            UnknownUri(_, serializer) => {
+                let success = serializer.parse_value(buf, ev);
+                if !success {
+                    return None;
+                }
             }
         }
 
@@ -667,9 +743,111 @@ pub struct ExtensionValues {
     pub mid: Option<Mid>,
     #[doc(hidden)]
     pub frame_mark: Option<u32>,
-    #[doc(hidden)]
-    pub video_layers_allocation: Option<VideoLayersAllocation>,
+
+    /// User values for [`ExtensionSerializer`] to parse into and write from.
+    pub user_values: UserExtensionValues,
 }
+
+/// Space for storing user extension values via [`ExtensionSerializer`].
+#[derive(Clone, Default)]
+pub struct UserExtensionValues {
+    map: Option<AnyMap>,
+}
+
+// The "AnyMap" idea is borrowed from the http crate but replacing Box for Any.
+type AnyMap = HashMap<TypeId, Arc<dyn Any + Send + Sync>, BuildHasherDefault<IdHasher>>;
+
+// No point in hashing the TypeId, since it is already unique.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("TypeId calls write_u64");
+    }
+
+    #[inline]
+    fn write_u64(&mut self, id: u64) {
+        self.0 = id;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+// TODO: I don't see a good way of comparing this. Is there one?
+impl PartialEq for UserExtensionValues {
+    fn eq(&self, other: &Self) -> bool {
+        let (Some(m1), Some(m2)) = (&self.map, &other.map) else {
+            return self.map.is_none() == other.map.is_none();
+        };
+
+        for k1 in m1.keys() {
+            if !m2.contains_key(k1) {
+                return false;
+            }
+        }
+
+        for k2 in m2.keys() {
+            if !m1.contains_key(k2) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl Eq for UserExtensionValues {}
+
+impl UserExtensionValues {
+    /// Set a user extension value.
+    ///
+    /// This uses the type of the value as "key", i.e. it can only hold a single
+    /// per type. The user should make a wrapper type for the extension they want
+    /// to parse/write.
+    ///
+    /// ```
+    /// # use str0m::rtp::ExtensionValues;
+    /// let mut exts = ExtensionValues::default();
+    ///
+    /// #[derive(Debug, PartialEq, Eq)]
+    /// struct MySpecialType(u8);
+    ///
+    /// exts.user_values.set(MySpecialType(42));
+    /// ```
+    pub fn set<T: Send + Sync + 'static>(&mut self, val: T) {
+        self.map
+            .get_or_insert_with(HashMap::default)
+            .insert(TypeId::of::<T>(), Arc::new(val));
+    }
+
+    /// Get a user extension value (by type).
+    /// ```
+    /// # use str0m::rtp::ExtensionValues;
+    /// let mut exts = ExtensionValues::default();
+    ///
+    /// #[derive(Debug, PartialEq, Eq)]
+    /// struct MySpecialType(u8);
+    ///
+    /// exts.user_values.set(MySpecialType(42));
+    ///
+    /// let v = exts.user_values.get::<MySpecialType>();
+    ///
+    /// assert_eq!(v, Some(&MySpecialType(42)));
+    /// ```
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.map
+            .as_ref()
+            .and_then(|map| map.get(&TypeId::of::<T>()))
+            // unwrap here is OK because TypeId::of::<T> is guaranteed to be unique
+            .map(|boxed| (&**boxed as &(dyn Any + 'static)).downcast_ref().unwrap())
+    }
+}
+
+impl UnwindSafe for UserExtensionValues {}
 
 impl fmt::Debug for ExtensionValues {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -754,8 +932,7 @@ impl fmt::Display for Extension {
                 RtpMid => "mid",
                 FrameMarking => "frame-marking07",
                 ColorSpace => "color-space",
-                VideoLayersAllocation => "video-layers-allocation",
-                UnknownUri => "unknown-uri",
+                UnknownUri(uri, _) => uri,
             }
         )
     }
@@ -768,7 +945,7 @@ impl fmt::Debug for ExtensionMap {
             .0
             .iter()
             .enumerate()
-            .filter_map(|(i, v)| v.map(|v| (i + 1, v)))
+            .filter_map(|(i, v)| v.as_ref().map(|v| (i + 1, v)))
             .map(|(i, v)| format!("{}={}", i, v.ext))
             .collect::<Vec<_>>()
             .join(", ");
@@ -802,240 +979,29 @@ impl From<u8> for VideoOrientation {
     }
 }
 
-/// Video Layers Allocation RTP Header Extension
-/// See https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/video-layers-allocation00
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct VideoLayersAllocation {
-    /// Erroneously called "RID" in the spec.
-    /// AKA RTP stream index
-    /// Set to 0 when everything is inactive (the special case of the header extension being just 0).
-    pub current_simulcast_stream_index: u8,
-
-    /// AKA RTP streams
-    pub simulcast_streams: Vec<SimulcastStreamAllocation>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SimulcastStreamAllocation {
-    pub spatial_layers: Vec<SpatialLayerAllocation>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SpatialLayerAllocation {
-    /// If empty, the spatial layer is not active.
-    pub temporal_layers: Vec<TemporalLayerAllocation>,
-    pub resolution_and_framerate: Option<ResolutionAndFramerate>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct TemporalLayerAllocation {
-    // Cumulative across the temporal layers within a spatial layer
-    pub cumulative_kbps: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ResolutionAndFramerate {
-    pub width: u16,
-    pub height: u16,
-    pub framerate: u8,
-}
-
-impl VideoLayersAllocation {
-    #[allow(dead_code)]
-    fn parse(buf: &[u8]) -> Option<Self> {
-        // First byte
-        let (&b0, after_b0) = buf.split_first()?;
-        if b0 == 0u8 && after_b0.is_empty() {
-            // Special case when everything is inactive.
-            return Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 0,
-                simulcast_streams: vec![],
-            });
-        }
-        let current_simulcast_stream_index = read_bits(b0, 0..2);
-        let simulcast_stream_count = read_bits(b0, 2..4) + 1;
-        let shared_spatial_layer_bitmask = read_bits(b0, 4..8);
-
-        // Spatial layer bitmasks
-        let (spatial_layer_actives, after_spatial_layer_bitmasks) =
-            if shared_spatial_layer_bitmask > 0 {
-                let shared_spatial_layer_actives =
-                    truncated_bools_from_lower_4bits(shared_spatial_layer_bitmask);
-                let spatial_layer_actives =
-                    vec![shared_spatial_layer_actives; simulcast_stream_count as usize];
-                let after_spatial_layer_bitmasks = after_b0;
-                (spatial_layer_actives, after_spatial_layer_bitmasks)
-            } else {
-                // 4 bits per simulcast stream
-                let (spatial_layer_bitmasks, after_spatial_layer_bitmasks) =
-                    split_at(after_b0, div_round_up(simulcast_stream_count as usize, 2))?;
-                let spatial_layer_actives = spatial_layer_bitmasks
-                    .iter()
-                    .flat_map(|&byte| split_byte_in2(byte))
-                    .take(simulcast_stream_count as usize)
-                    .map(truncated_bools_from_lower_4bits)
-                    .collect();
-                (spatial_layer_actives, after_spatial_layer_bitmasks)
-            };
-        let total_active_spatial_layer_count = spatial_layer_actives
-            .iter()
-            .flatten()
-            .filter(|&&active| active)
-            .count();
-
-        // Temporal layer counts
-        // 2 bits per temporal layer
-        let (temporal_layer_counts, after_temporal_layer_counts) = split_at(
-            after_spatial_layer_bitmasks,
-            div_round_up(total_active_spatial_layer_count, 4),
-        )?;
-        let mut temporal_layer_counts: VecDeque<u8> = temporal_layer_counts
-            .iter()
-            .flat_map(|&byte| split_byte_in4(byte))
-            .map(|count_minus_1| count_minus_1 + 1)
-            .take(total_active_spatial_layer_count)
-            .collect();
-        let total_temporal_layer_count = temporal_layer_counts.iter().sum();
-
-        // Temporal layer bitrates
-        let mut next_temporal_layer_bitrate = after_temporal_layer_counts;
-        let mut temporal_layer_bitrates: VecDeque<u64> = (0..total_temporal_layer_count)
-            .map(|_temporal_layer_index| {
-                let (bitrate, after_temporal_layer_bitrate) =
-                    parse_leb_u64(next_temporal_layer_bitrate);
-                next_temporal_layer_bitrate = after_temporal_layer_bitrate;
-                bitrate
-            })
-            .collect();
-
-        // (Optional) resolutions and framerates
-        let mut next_resolution_and_framerate = next_temporal_layer_bitrate;
-        let mut resolutions_and_framerates: VecDeque<ResolutionAndFramerate> = (0
-            ..total_active_spatial_layer_count)
-            .filter_map(|_| {
-                let (resolution_and_framerate, after_resolution_and_framerate) =
-                    split_at(next_resolution_and_framerate, 5)?;
-                next_resolution_and_framerate = after_resolution_and_framerate;
-                Some(ResolutionAndFramerate {
-                    width: u16::from_be_bytes(resolution_and_framerate[0..2].try_into().unwrap())
-                        + 1,
-                    height: u16::from_be_bytes(resolution_and_framerate[2..4].try_into().unwrap())
-                        + 1,
-                    framerate: resolution_and_framerate[4],
-                })
-            })
-            .collect();
-
-        let simulcast_streams = spatial_layer_actives
-            .into_iter()
-            .map(|spatial_layer_actives| {
-                let spatial_layers = spatial_layer_actives
-                    .into_iter()
-                    .filter_map(|spatial_layer_active| {
-                        let (temporal_layers, resolution_and_framerate) = if spatial_layer_active {
-                            let temporal_layer_count = temporal_layer_counts.pop_front()?;
-                            let temporal_layers = (0..temporal_layer_count)
-                                .filter_map(|_temporal_layer_index| {
-                                    Some(TemporalLayerAllocation {
-                                        cumulative_kbps: temporal_layer_bitrates.pop_front()?,
-                                    })
-                                })
-                                .collect();
-                            let resolution_and_framerate = resolutions_and_framerates.pop_front();
-                            (temporal_layers, resolution_and_framerate)
-                        } else {
-                            (vec![], None)
-                        };
-                        Some(SpatialLayerAllocation {
-                            temporal_layers,
-                            resolution_and_framerate,
-                        })
-                    })
-                    .collect();
-                SimulcastStreamAllocation { spatial_layers }
-            })
-            .collect();
-        Some(VideoLayersAllocation {
-            current_simulcast_stream_index,
-            simulcast_streams,
-        })
-    }
-}
-
-// returns (value, rest)
-#[allow(dead_code)]
-fn parse_leb_u64(bytes: &[u8]) -> (u64, &[u8]) {
-    let mut result = 0;
-    for (index, &byte) in bytes.iter().enumerate() {
-        let is_last = !read_bit(byte, 0);
-        let chunk = read_bits(byte, 1..8);
-        result |= (chunk as u64) << (7 * index);
-        if is_last {
-            return (result, &bytes[(index + 1)..]);
+impl PartialEq for Extension {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Extension::AbsoluteSendTime, Extension::AbsoluteSendTime) => true,
+            (Extension::AudioLevel, Extension::AudioLevel) => true,
+            (Extension::TransmissionTimeOffset, Extension::TransmissionTimeOffset) => true,
+            (Extension::VideoOrientation, Extension::VideoOrientation) => true,
+            (Extension::TransportSequenceNumber, Extension::TransportSequenceNumber) => true,
+            (Extension::PlayoutDelay, Extension::PlayoutDelay) => true,
+            (Extension::VideoContentType, Extension::VideoContentType) => true,
+            (Extension::VideoTiming, Extension::VideoTiming) => true,
+            (Extension::RtpStreamId, Extension::RtpStreamId) => true,
+            (Extension::RepairedRtpStreamId, Extension::RepairedRtpStreamId) => true,
+            (Extension::RtpMid, Extension::RtpMid) => true,
+            (Extension::FrameMarking, Extension::FrameMarking) => true,
+            (Extension::ColorSpace, Extension::ColorSpace) => true,
+            (Extension::UnknownUri(uri1, _), Extension::UnknownUri(uri2, _)) => uri1 == uri2,
+            _ => false,
         }
     }
-    (0, bytes)
 }
 
-// If successful, the size of the left will be mid,
-// and the size of the right while be buf.len()-mid.
-#[allow(dead_code)]
-fn split_at(buf: &[u8], mid: usize) -> Option<(&[u8], &[u8])> {
-    if mid > buf.len() {
-        return None;
-    }
-    Some(buf.split_at(mid))
-}
-
-#[allow(dead_code)]
-fn div_round_up(top: usize, bottom: usize) -> usize {
-    if top == 0 {
-        0
-    } else {
-        ((top - 1) / bottom) + 1
-    }
-}
-
-#[allow(dead_code)]
-fn split_byte_in2(byte: u8) -> [u8; 2] {
-    [read_bits(byte, 0..4), read_bits(byte, 4..8)]
-}
-
-#[allow(dead_code)]
-fn split_byte_in4(byte: u8) -> [u8; 4] {
-    [
-        read_bits(byte, 0..2),
-        read_bits(byte, 2..4),
-        read_bits(byte, 4..6),
-        read_bits(byte, 6..8),
-    ]
-}
-
-fn truncated_bools_from_lower_4bits(bits: u8) -> Vec<bool> {
-    let mut count = 0;
-    let mut bools: Vec<bool> = (0..=3u8)
-        .map(|index| {
-            let high = read_bit(bits, 7 - index);
-            if high {
-                count = index + 1;
-            }
-            high
-        })
-        .collect();
-    bools.truncate(count as usize);
-    bools
-}
-
-#[allow(dead_code)]
-fn read_bit(bits: u8, index: u8) -> bool {
-    read_bits(bits, index..(index + 1)) > 0
-}
-
-#[allow(dead_code)]
-fn read_bits(bits: u8, range: std::ops::Range<u8>) -> u8 {
-    assert!(range.end <= 8);
-    (bits >> (8 - range.end)) & (0b1111_1111 >> (8 - range.len()))
-}
+impl Eq for Extension {}
 
 #[cfg(test)]
 mod test {
@@ -1095,12 +1061,12 @@ mod test {
         assert_eq!(
             e1.iter(true).collect::<Vec<_>>(),
             vec![
-                (1, AudioLevel),
-                (2, AbsoluteSendTime),
-                (4, RtpMid),
-                (10, RtpStreamId),
-                (11, RepairedRtpStreamId),
-                (14, TransportSequenceNumber)
+                (1, &AudioLevel),
+                (2, &AbsoluteSendTime),
+                (4, &RtpMid),
+                (10, &RtpStreamId),
+                (11, &RepairedRtpStreamId),
+                (14, &TransportSequenceNumber)
             ]
         );
 
@@ -1108,13 +1074,12 @@ mod test {
         assert_eq!(
             e1.iter(false).collect::<Vec<_>>(),
             vec![
-                (2, AbsoluteSendTime),
-                (4, RtpMid),
-                (6, VideoLayersAllocation),
-                (10, RtpStreamId),
-                (11, RepairedRtpStreamId),
-                (13, VideoOrientation),
-                (14, TransportSequenceNumber),
+                (2, &AbsoluteSendTime),
+                (4, &RtpMid),
+                (10, &RtpStreamId),
+                (11, &RepairedRtpStreamId),
+                (13, &VideoOrientation),
+                (14, &TransportSequenceNumber),
             ]
         );
     }
@@ -1137,9 +1102,9 @@ mod test {
         assert_eq!(
             e1.iter(false).collect::<Vec<_>>(),
             vec![
-                (5, VideoContentType),
-                (12, VideoOrientation),
-                (14, TransportSequenceNumber)
+                (5, &VideoContentType),
+                (12, &VideoOrientation),
+                (14, &TransportSequenceNumber)
             ]
         );
     }
@@ -1160,7 +1125,7 @@ mod test {
         // just make sure the logic isn't wrong for 12-14 -> 14-12
         assert_eq!(
             e1.iter(false).collect::<Vec<_>>(),
-            vec![(12, VideoOrientation), (14, TransportSequenceNumber)]
+            vec![(12, &VideoOrientation), (14, &TransportSequenceNumber)]
         );
     }
 
@@ -1187,7 +1152,7 @@ mod test {
         println!("{:#?}", e1.0);
         assert_eq!(
             e1.iter(false).collect::<Vec<_>>(),
-            vec![(12, VideoOrientation), (14, TransportSequenceNumber)]
+            vec![(12, &VideoOrientation), (14, &TransportSequenceNumber)]
         );
 
         // Now attempt e3
@@ -1197,426 +1162,7 @@ mod test {
         // At this point we should have not allowed the change, but remain as it was in first apply.
         assert_eq!(
             e1.iter(false).collect::<Vec<_>>(),
-            vec![(12, VideoOrientation), (14, TransportSequenceNumber)]
-        );
-    }
-
-    #[test]
-    fn test_read_bits() {
-        assert_eq!(read_bits(0b1100_0000, 0..2), 0b0000_0011);
-        assert_eq!(read_bits(0b1001_0101, 0..2), 0b0000_0010);
-        assert_eq!(read_bits(0b0110_1010, 0..2), 0b0000_0001);
-        assert_eq!(read_bits(0b0011_1111, 0..2), 0b0000_0000);
-        assert_eq!(read_bits(0b0011_0000, 2..4), 0b0000_0011);
-        assert_eq!(read_bits(0b0110_0101, 2..4), 0b0000_0010);
-        assert_eq!(read_bits(0b1001_1010, 2..4), 0b0000_0001);
-        assert_eq!(read_bits(0b1100_1111, 2..4), 0b0000_0000);
-    }
-
-    #[test]
-    fn test_parse_leb_u64() {
-        let (value, rest) = parse_leb_u64(&[0b0000_0000, 5]);
-        assert_eq!(0, value);
-        assert_eq!(&[5], rest);
-
-        let (value, rest) = parse_leb_u64(&[0b0000_0001, 5]);
-        assert_eq!(1, value);
-        assert_eq!(&[5], rest);
-
-        let (value, rest) = parse_leb_u64(&[0b1000_0000, 0b0000_0001, 5]);
-        assert_eq!(128, value);
-        assert_eq!(&[5], rest);
-
-        let (value, rest) = parse_leb_u64(&[0b1000_0000, 0b1000_0000, 0b0000_0001, 5]);
-        assert_eq!(16384, value);
-        assert_eq!(&[5], rest);
-
-        let (value, rest) = parse_leb_u64(&[0b1000_0000, 0b1000_0000, 0b1000_0000, 0b0000_0001, 5]);
-        assert_eq!(2097152, value);
-        assert_eq!(&[5], rest);
-    }
-
-    #[test]
-    fn test_parse_vla_empty_buffer() {
-        assert_eq!(VideoLayersAllocation::parse(&[]), None);
-    }
-
-    #[test]
-    fn test_parse_vla_empty() {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[0b0000_0000]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 0,
-                simulcast_streams: vec![],
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_vla_missing_spatial_layer_bitmasks() {
-        assert_eq!(VideoLayersAllocation::parse(&[0b0110_0000]), None);
-    }
-
-    #[test]
-    fn test_parse_vla_1_simulcast_stream_with_no_active_layers() {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[
-                0b0100_0000,
-                // 1 bitmask
-                0b0000_0000,
-            ]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 1,
-                simulcast_streams: vec![SimulcastStreamAllocation {
-                    spatial_layers: vec![],
-                }],
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_vla_3_simulcast_streams_with_no_active_layers() {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[
-                0b0110_0000,
-                // 3 active spatial layer bitmasks, 4 bits each
-                0b0000_0000,
-                0b0000_1111,
-            ]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 1,
-                simulcast_streams: vec![
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![],
-                    }
-                ],
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_vla_3_simulcast_streams_with_1_active_spatial_layers_and_2_temporal_layers() {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[
-                0b0110_0001,
-                // 3 temporal layer counts (minus 1), 2 bits each
-                0b0101_0100,
-                // 6 temporal layer bitrates
-                0b0000_0001,
-                0b0000_0010,
-                0b0000_0100,
-                0b0000_1000,
-                0b0001_0000,
-                0b0010_0000,
-            ]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 1,
-                simulcast_streams: vec![
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation { cumulative_kbps: 1 },
-                                TemporalLayerAllocation { cumulative_kbps: 2 }
-                            ],
-                            resolution_and_framerate: None,
-                        }],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation { cumulative_kbps: 4 },
-                                TemporalLayerAllocation { cumulative_kbps: 8 }
-                            ],
-                            resolution_and_framerate: None,
-                        }],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 16
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 32
-                                }
-                            ],
-                            resolution_and_framerate: None,
-                        }],
-                    }
-                ],
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_vla_3_simulcast_streams_with_1_active_spatial_layers_and_2_temporal_layers_with_resolutions(
-    ) {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[
-                0b0110_0001,
-                // 3 temporal layer counts (minus 1), 2 bits each
-                0b0101_0100,
-                // 6 temporal layer bitrates
-                100,
-                101,
-                110,
-                111,
-                120,
-                121,
-                // 3 resolutions + framerates (5 bytes each)
-                // 320x180x15
-                1,
-                63,
-                0,
-                179,
-                15,
-                // 640x360x30
-                2,
-                127,
-                1,
-                103,
-                30,
-                // 1280x720x60
-                4,
-                255,
-                2,
-                207,
-                60,
-            ]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 1,
-                simulcast_streams: vec![
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 100
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 101
-                                }
-                            ],
-                            resolution_and_framerate: Some(ResolutionAndFramerate {
-                                width: 320,
-                                height: 180,
-                                framerate: 15,
-                            }),
-                        }],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 110
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 111
-                                }
-                            ],
-                            resolution_and_framerate: Some(ResolutionAndFramerate {
-                                width: 640,
-                                height: 360,
-                                framerate: 30,
-                            }),
-                        }],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 120
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 121
-                                }
-                            ],
-                            resolution_and_framerate: Some(ResolutionAndFramerate {
-                                width: 1280,
-                                height: 720,
-                                framerate: 60,
-                            }),
-                        }],
-                    }
-                ],
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_vla_3_simulcast_streams_with_differing_active_spatial_layers_with_resolutions() {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[
-                0b0010_0000,
-                // 3 active spatial layer bitmasks, 4 bits each; only the base layer is active
-                0b0001_0000,
-                0b0000_1111,
-                // 1 temporal layer counts (minus 1), 2 bits each
-                0b0100_0000,
-                // 2 temporal layer bitrates
-                100,
-                101,
-                // 1 resolutions + framerates (5 bytes)
-                // 320x180x15
-                1,
-                63,
-                0,
-                179,
-                15,
-            ]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 0,
-                simulcast_streams: vec![
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 100
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 101
-                                }
-                            ],
-                            resolution_and_framerate: Some(ResolutionAndFramerate {
-                                width: 320,
-                                height: 180,
-                                framerate: 15,
-                            }),
-                        }],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![],
-                    },
-                    SimulcastStreamAllocation {
-                        spatial_layers: vec![],
-                    }
-                ],
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_vla_1_simulcast_streams_with_3_spatial_layers() {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[
-                0b0000_0111,
-                // 3 temporal layer counts (minus 1), 2 bits each
-                0b0101_0100,
-                // 6 temporal layer bitrates
-                100,
-                101,
-                110,
-                111,
-                120,
-                121,
-            ]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 0,
-                simulcast_streams: vec![SimulcastStreamAllocation {
-                    spatial_layers: vec![
-                        SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 100
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 101
-                                }
-                            ],
-                            resolution_and_framerate: None,
-                        },
-                        SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 110
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 111
-                                }
-                            ],
-                            resolution_and_framerate: None,
-                        },
-                        SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 120
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 121
-                                }
-                            ],
-                            resolution_and_framerate: None,
-                        }
-                    ],
-                },],
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_vla_1_simulcast_streams_with_4_spatial_layers_1_inactive() {
-        assert_eq!(
-            VideoLayersAllocation::parse(&[
-                0b0000_1011,
-                // 3 temporal layer counts (minus 1), 2 bits each
-                0b0101_0100,
-                // 6 temporal layer bitrates
-                100,
-                101,
-                110,
-                111,
-                120,
-                121,
-            ]),
-            Some(VideoLayersAllocation {
-                current_simulcast_stream_index: 0,
-                simulcast_streams: vec![SimulcastStreamAllocation {
-                    spatial_layers: vec![
-                        SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 100
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 101
-                                }
-                            ],
-                            resolution_and_framerate: None,
-                        },
-                        SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 110
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 111
-                                }
-                            ],
-                            resolution_and_framerate: None,
-                        },
-                        SpatialLayerAllocation {
-                            temporal_layers: vec![],
-                            resolution_and_framerate: None,
-                        },
-                        SpatialLayerAllocation {
-                            temporal_layers: vec![
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 120
-                                },
-                                TemporalLayerAllocation {
-                                    cumulative_kbps: 121
-                                }
-                            ],
-                            resolution_and_framerate: None,
-                        }
-                    ],
-                },],
-            })
+            vec![(12, &VideoOrientation), (14, &TransportSequenceNumber)]
         );
     }
 }

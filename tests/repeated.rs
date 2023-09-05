@@ -37,8 +37,6 @@ pub fn repeated() -> Result<(), RtcError> {
     assert_eq!(params.spec().codec, Codec::Opus);
     let pt = params.pt();
 
-    let mut exts = ExtensionValues::default();
-
     let mut write_at = l.last + Duration::from_millis(300);
 
     // Repeat the 3 a bunch of times.
@@ -56,8 +54,11 @@ pub fn repeated() -> Result<(), RtcError> {
             let time = (count * 1000 + 47_000_000) as u32;
             let seq_no = (47_000 + count).into();
 
-            exts.audio_level = Some(-42 - count as i8);
-            exts.voice_activity = Some(false);
+            let exts = ExtensionValues {
+                audio_level: Some(-42 - count as i8),
+                voice_activity: Some(false),
+                ..Default::default()
+            };
 
             stream
                 .write_rtp(
@@ -83,7 +84,7 @@ pub fn repeated() -> Result<(), RtcError> {
     let packets: Vec<_> = r
         .events
         .iter()
-        .filter_map(|e| {
+        .filter_map(|(_, e)| {
             let Event::RtpPacket(v) = e else {
                 return None;
             };

@@ -4,19 +4,25 @@ use super::list::private::WordSized;
 use super::{pad_bytes_to_word, ReportList, RtcpHeader, RtcpPacket};
 use super::{FeedbackMessageType, RtcpType, Ssrc};
 
+/// Multiple source descriptions (SDES).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Descriptions {
+    /// The descriptions.
     pub reports: ReportList<Sdes>,
 }
 
+/// A single source description (SDES).
+#[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sdes {
     pub ssrc: Ssrc,
     pub values: ReportList<(SdesType, String)>,
 }
 
+/// Types of SDES values.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub enum SdesType {
     /// End of SDES list
     END = 0,
@@ -161,7 +167,9 @@ impl<'a> TryFrom<&'a [u8]> for Descriptions {
             if reports.len() == 31 {
                 break;
             }
-            if buf.is_empty() {
+            // For some reason FF sends us a full SDES and then [0,0,0,0] at the end.
+            // This can't be interpreted as SDES, so we just ignore it.
+            if buf.len() < 8 {
                 break;
             }
             let report: Sdes = buf.try_into()?;

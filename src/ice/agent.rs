@@ -77,7 +77,7 @@ pub struct IceAgent {
     /// to dedupe [`IceAgentEvent::DiscoveredRecv`].
     discovered_recv: HashSet<SocketAddr>,
 
-    /// Currently nominated pair for sending. This is used to evalulate
+    /// Currently nominated pair for sending. This is used to evaluate
     /// if we get a better candidate for [`IceAgentEvent::NominatedSend`].
     nominated_send: Option<PairId>,
 
@@ -269,7 +269,17 @@ impl IceAgent {
         &self.local_credentials
     }
 
+    /// Sets the local ice credentials.
+    pub fn set_local_credentials(&mut self, r: IceCreds) {
+        if self.local_credentials != r {
+            info!("Set local credentials: {:?}", r);
+            self.local_credentials = r;
+        }
+    }
+
     /// Local ice candidates.
+    ///
+    /// The candidates have their ufrag filled out to the local credentials.
     pub fn local_candidates(&self) -> &[Candidate] {
         &self.local_candidates
     }
@@ -365,6 +375,9 @@ impl IceAgent {
             }
         }
 
+        // "Adopt" any incoming candidate by setting our current ufrag.
+        c.set_ufrag(&self.local_credentials.ufrag);
+
         // https://datatracker.ietf.org/doc/html/rfc8445#section-5.1.2.1
         // The local preference MUST be an integer from 0 (lowest preference) to
         // 65535 (highest preference) inclusive.  When there is only a single IP
@@ -428,7 +441,7 @@ impl IceAgent {
         // of another candidate.  The agent SHOULD eliminate the redundant
         // candidate with the lower priority.
         //
-        // NB this must be done _after_ set_local_prefrence(), since the prio() used in the
+        // NB this must be done _after_ set_local_preference(), since the prio() used in the
         // elimination is calculated from that preference.
         if let Some((idx, other)) = self
             .local_candidates
@@ -484,12 +497,12 @@ impl IceAgent {
         true
     }
 
-    /// Adds a local candidate.
+    /// Adds a remote candidate.
     ///
     /// Returns `false` if the candidate was not added because it is redundant.
     /// Adding loopback addresses or multicast/broadcast addresses causes
     /// an error.
-    pub fn add_remote_candidate(&mut self, c: Candidate) {
+    pub fn add_remote_candidate(&mut self, mut c: Candidate) {
         info!("Add remote candidate: {:?}", c);
 
         // This is a a:rtcp-mux-only implementation. The only component
@@ -510,6 +523,10 @@ impl IceAgent {
                 }
             }
         }
+
+        // After we accepted the ufrag, don't keep this around since it will look
+        // confusing inspecting the state.
+        c.clear_ufrag();
 
         let existing_prflx = self
             .remote_candidates
@@ -590,8 +607,15 @@ impl IceAgent {
                                 "Replace redundant pair, current: {:?} replaced with: {:?}",
                                 check, pair
                             );
+
                             let was_nominated = self.candidate_pairs[check_idx].is_nominated();
                             pair.nominate(was_nominated);
+
+                            if self.ice_lite {
+                                debug!("Retain incoming binding requests for pair");
+                                pair.copy_remote_binding_requests(&self.candidate_pairs[check_idx]);
+                            }
+
                             self.candidate_pairs[check_idx] = pair;
                         }
 
@@ -661,21 +685,33 @@ impl IceAgent {
     /// should continue sending data over the 4G until we redone the ICE gathering
     /// process.
     #[allow(unused)]
-    pub fn ice_restart(&mut self) {
+    pub fn ice_restart(&mut self, local_credentials: IceCreds, keep_local_candidates: bool) {
+        info!("ICE restart");
         // An ICE agent MAY restart ICE for existing data streams.  An ICE
         // restart causes all previous states of the data streams, excluding the
         // roles of the agents, to be flushed.  The only difference between an
         // ICE restart and a brand new data session is that during the restart,
         // data can continue to be sent using existing data sessions, and a new
         // data session always requires the roles to be determined.
-        self.local_credentials = IceCreds::new();
+
         self.remote_credentials = None;
-        self.local_candidates.clear();
         self.remote_candidates.clear();
         self.candidate_pairs.clear();
         self.transmit.clear();
         self.events.clear();
         self.discovered_recv.clear();
+
+        if keep_local_candidates {
+            // If we're keeping the candidates, we must update the ufrag to the new credentials.
+            // This is so anyone inspecting `.local_candidates()` will get the correct ufrag.
+            for c in &mut self.local_candidates {
+                c.set_ufrag(&local_credentials.ufrag)
+            }
+        } else {
+            self.local_candidates.clear();
+        }
+
+        self.local_credentials = local_credentials;
 
         self.emit_event(IceAgentEvent::IceRestart(self.local_credentials.clone()));
         self.set_connection_state(IceConnectionState::Checking, "ice restart");
@@ -1454,12 +1490,17 @@ impl IceAgent {
             }
         }
     }
+
+    pub(crate) fn remote_credentials(&self) -> Option<&IceCreds> {
+        self.remote_credentials.as_ref()
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use std::net::SocketAddr;
+    use std::sync::Once;
 
     impl IceAgent {
         fn pair_indexes(&self) -> Vec<(usize, usize)> {
@@ -1597,6 +1638,57 @@ mod test {
         agent.add_local_candidate(Candidate::host(ipv4_1()).unwrap());
 
         assert_eq!(agent.pair_indexes(), [(1, 0)]);
+    }
+
+    #[test]
+    fn form_pairs_replace_remote_redundant() {
+        use std::env;
+        use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+        if env::var("RUST_LOG").is_err() {
+            env::set_var("RUST_LOG", "debug");
+        }
+
+        static START: Once = Once::new();
+
+        START.call_once(|| {
+            tracing_subscriber::registry()
+                .with(fmt::layer())
+                .with(EnvFilter::from_default_env())
+                .init();
+        });
+
+        let mut agent = IceAgent::new();
+        agent.set_ice_lite(true);
+
+        // This is just prepping the test, this would have been discovered in a STUN packet.
+        let c = Candidate::peer_reflexive(
+            ipv4_3(),
+            ipv4_3(),
+            123,
+            Some(REMOTE_PEER_REFLEXIVE_TEMP_FOUNDATION.into()),
+            "".to_string(),
+        );
+
+        agent.add_remote_candidate(c);
+        agent.add_local_candidate(Candidate::host(ipv4_1()).unwrap());
+
+        assert_eq!(agent.pair_indexes(), [(0, 0)]);
+
+        let now = Instant::now();
+        agent.candidate_pairs[0].nominate(true);
+        agent.candidate_pairs[0].increase_remote_binding_requests(now);
+
+        // this remote should replace the "discovered" peer reflexive added above.
+        agent.add_remote_candidate(Candidate::host(ipv4_3()).unwrap());
+
+        // The index should not have changed, since we replaced the peer reflexive remote candidate.
+        assert_eq!(agent.pair_indexes(), [(0, 0)]);
+
+        let pair = &agent.candidate_pairs[0];
+        assert!(pair.is_nominated());
+        assert_eq!(pair.remote_binding_requests, 1);
+        assert_eq!(pair.remote_binding_request_time, Some(now));
     }
 
     #[test]

@@ -104,7 +104,7 @@ impl SrtpProfile {
         match self {
              // MASTER_KEY_LEN * 2 + MASTER_SALT * 2
              // TODO: This is a duplication of info that is held in srtp.rs, because we
-             // don't want a dependenct in that direction.
+             // don't want a dependency in that direction.
             SrtpProfile::Aes128CmSha1_80 => 16 * 2 + 14 * 2,
             SrtpProfile::AeadAes128Gcm   => 16 * 2 + 12 * 2,
         }
@@ -135,6 +135,12 @@ pub struct Dtls {
 
     /// The fingerprint of the certificate.
     fingerprint: Fingerprint,
+
+    /// Verify the fingerprint.
+    fingerprint_verification: bool,
+
+    /// Remote fingerprint.
+    remote_fingerprint: Option<Fingerprint>,
 
     /// Context belongs together with Fingerprint.
     ///
@@ -171,13 +177,15 @@ impl Dtls {
     ///
     /// `active` indicates whether this side should initiate the handshake or not.
     /// This in turn is governed by the `a=setup` SDP attribute.
-    pub fn new(cert: DtlsCert) -> Result<Self, DtlsError> {
+    pub fn new(cert: DtlsCert, fingerprint_verification: bool) -> Result<Self, DtlsError> {
         let fingerprint = cert.fingerprint();
         let context = dtls_create_ctx(&cert)?;
         let ssl = dtls_ssl_create(&context)?;
         Ok(Dtls {
             _cert: cert,
             fingerprint,
+            fingerprint_verification,
+            remote_fingerprint: None,
             _context: context,
             tls: TlsStream::new(ssl, IoBuffer::default()),
             events: VecDeque::new(),
@@ -209,6 +217,11 @@ impl Dtls {
     /// To be communicated in SDP offers sent to the remote peer.
     pub fn local_fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
+    }
+
+    /// Remote fingerprint.
+    pub fn remote_fingerprint(&self) -> &Option<Fingerprint> {
+        &self.remote_fingerprint
     }
 
     /// Poll for the next datagram to send.
@@ -284,8 +297,12 @@ impl Dtls {
                 .take_srtp_keying_material()
                 .expect("Exported keying material");
 
-            self.events
-                .push_back(DtlsEvent::RemoteFingerprint(fingerprint));
+            self.remote_fingerprint = Some(fingerprint.clone());
+
+            if self.fingerprint_verification {
+                self.events
+                    .push_back(DtlsEvent::RemoteFingerprint(fingerprint));
+            }
 
             self.events
                 .push_back(DtlsEvent::SrtpKeyingMaterial(keying_material, srtp_profile));

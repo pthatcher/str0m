@@ -5,13 +5,13 @@ use crate::dtls::{KeyingMaterial, SrtpProfile};
 use crate::format::CodecConfig;
 use crate::format::PayloadParams;
 use crate::io::{DatagramSend, DATAGRAM_MTU, DATAGRAM_MTU_WARN};
-use crate::media::KeyframeRequest;
 use crate::media::KeyframeRequestKind;
 use crate::media::Media;
 use crate::media::{MediaAdded, MediaChanged};
+use crate::net;
 use crate::packet::SendSideBandwithEstimator;
 use crate::packet::{LeakyBucketPacer, NullPacer, Pacer, PacerImpl};
-use crate::rtp::StreamPaused;
+use crate::rtp::RawPacket;
 use crate::rtp_::Direction;
 use crate::rtp_::Pt;
 use crate::rtp_::SeqNo;
@@ -22,7 +22,7 @@ use crate::rtp_::{SrtpContext, Ssrc};
 use crate::stats::StatsSnapshot;
 use crate::streams::{RtpPacket, Streams};
 use crate::util::{already_happened, not_happening, Soonest};
-use crate::{net, MediaData};
+use crate::Event;
 use crate::{RtcConfig, RtcError};
 
 /// Minimum time we delay between sending nacks. This should be
@@ -98,18 +98,8 @@ pub(crate) struct Session {
 
     feedback_tx: VecDeque<Rtcp>,
     feedback_rx: VecDeque<Rtcp>,
-}
 
-#[allow(clippy::large_enum_variant)]
-pub enum MediaEvent {
-    Data(MediaData),
-    Changed(MediaChanged),
-    Error(RtcError),
-    Added(MediaAdded),
-    KeyframeRequest(KeyframeRequest),
-    EgressBitrateEstimate(Bitrate),
-    RtpPacket(RtpPacket),
-    StreamPaused(StreamPaused),
+    raw_packets: Option<VecDeque<RawPacket>>,
 }
 
 impl Session {
@@ -146,7 +136,7 @@ impl Session {
             reordering_size_video: config.reordering_size_video,
             send_buffer_audio: config.send_buffer_audio,
             send_buffer_video: config.send_buffer_video,
-            exts: config.exts,
+            exts: config.exts.clone(),
 
             // Both sending and receiving starts from the configured codecs.
             // These can then be changed in the SDP OFFER/ANSWER dance.
@@ -169,6 +159,11 @@ impl Session {
             rtp_mode: config.rtp_mode,
             feedback_tx: VecDeque::new(),
             feedback_rx: VecDeque::new(),
+            raw_packets: if config.enable_raw_packets {
+                Some(VecDeque::new())
+            } else {
+                None
+            },
         }
     }
 
@@ -355,7 +350,8 @@ impl Session {
                     if let Some(stream) = stream_mid_rid {
                         if stream.ssrc() != ssrc {
                             // We got a change in main SSRC for this stream.
-                            stream.maybe_reset_ssrc(ssrc);
+                            let ssrc_from = stream.ssrc();
+                            self.change_stream_rx_ssrc(ssrc_from, ssrc);
                         }
                     }
 
@@ -370,7 +366,7 @@ impl Session {
                 };
 
                 // If stream already exists, this might only "fill in" the RTX.
-                self.streams.expect_stream_rx(ssrc, rtx, mid, None);
+                self.streams.expect_stream_rx(ssrc_main, rtx, mid, None);
 
                 // Insert an entry so we can look up on SSRC alone later.
                 let reason = format!("MID header, no RID and PT: {}", header.payload_type);
@@ -393,7 +389,8 @@ impl Session {
                 if let Some(stream) = stream_mid_rid {
                     if stream.ssrc() != ssrc {
                         // We got a change in main SSRC for this stream.
-                        stream.maybe_reset_ssrc(ssrc);
+                        let ssrc_from = stream.ssrc();
+                        self.change_stream_rx_ssrc(ssrc_from, ssrc);
                     }
                 }
                 ssrc
@@ -402,10 +399,10 @@ impl Session {
             // Declare entries in streams for receiving these streams.
             if is_repair {
                 self.streams
-                    .expect_stream_rx(ssrc_main, Some(ssrc), mid, Some(rid))
+                    .expect_stream_rx(ssrc_main, Some(ssrc), mid, Some(rid));
             } else {
                 self.streams
-                    .expect_stream_rx(ssrc_main, None, mid, Some(rid))
+                    .expect_stream_rx(ssrc_main, None, mid, Some(rid));
             }
 
             // Insert an entry so we can look up on SSRC alone later.
@@ -429,6 +426,13 @@ impl Session {
             reason
         );
         self.source_keys.insert(ssrc, (mid, ssrc_main));
+    }
+
+    fn change_stream_rx_ssrc(&mut self, ssrc_from: Ssrc, ssrc_to: Ssrc) {
+        self.streams.change_stream_rx_ssrc(ssrc_from, ssrc_to);
+
+        self.source_keys
+            .retain(|k, (_, s)| *k != ssrc_from && *s != ssrc_from);
     }
 
     fn handle_rtp(&mut self, now: Instant, mut header: RtpHeader, buf: &[u8]) {
@@ -495,13 +499,17 @@ impl Session {
             return;
         }
 
+        if let Some(raw_packets) = &mut self.raw_packets {
+            raw_packets.push_back(RawPacket::RtpRx(header.clone(), data.clone()));
+        }
+
         // RTX packets must be rewritten to be a normal packet. This only changes the
         // the seq_no, however MediaTime might be different when interpreted against the
         // the "main" register.
         let receipt = if is_repair {
             // Drop RTX packets that are just empty padding. The payload here
             // is empty because we would have done RtpHeader::unpad_payload above.
-            // For unpausing, it's enough with the stream.uodate() already done above.
+            // For unpausing, it's enough with the stream.update() already done above.
             if data.is_empty() {
                 return;
             }
@@ -542,11 +550,17 @@ impl Session {
     }
 
     fn handle_rtcp(&mut self, now: Instant, buf: &[u8]) -> Option<()> {
-        let srtp = self.srtp_rx.as_mut()?;
+        let srtp: &mut SrtpContext = self.srtp_rx.as_mut()?;
         let unprotected = srtp.unprotect_rtcp(buf)?;
 
         Rtcp::read_packet(&unprotected, &mut self.feedback_rx);
         let mut need_configure_pacer = false;
+
+        if let Some(raw_packets) = &mut self.raw_packets {
+            for fb in &self.feedback_rx {
+                raw_packets.push_back(RawPacket::RtcpRx(fb.clone()));
+            }
+        }
 
         for fb in RtcpFb::from_rtcp(self.feedback_rx.drain(..)) {
             if let RtcpFb::Twcc(twcc) = fb {
@@ -590,9 +604,9 @@ impl Session {
         Some(())
     }
 
-    pub fn poll_event(&mut self) -> Option<MediaEvent> {
+    pub fn poll_event(&mut self) -> Option<Event> {
         if let Some(bitrate_estimate) = self.bwe.as_mut().and_then(|bwe| bwe.poll_estimate()) {
-            return Some(MediaEvent::EgressBitrateEstimate(bitrate_estimate));
+            return Some(Event::EgressBitrateEstimate(bitrate_estimate));
         }
 
         // If we're not ready to flow media, don't send any events.
@@ -600,25 +614,31 @@ impl Session {
             return None;
         }
 
+        if let Some(raw_packets) = &mut self.raw_packets {
+            if let Some(p) = raw_packets.pop_front() {
+                return Some(Event::RawPacket(p));
+            }
+        }
+
         // This must be before pending_packet.take() since we need to emit the unpaused event
         // before the first packet causing the unpause.
         if let Some(paused) = self.streams.poll_stream_paused() {
-            return Some(MediaEvent::StreamPaused(paused));
+            return Some(Event::StreamPaused(paused));
         }
 
         if let Some(packet) = self.pending_packet.take() {
-            return Some(MediaEvent::RtpPacket(packet));
+            return Some(Event::RtpPacket(packet));
         }
 
         if let Some(req) = self.streams.poll_keyframe_request() {
-            return Some(MediaEvent::KeyframeRequest(req));
+            return Some(Event::KeyframeRequest(req));
         }
 
         for media in &mut self.medias {
             if media.need_open_event {
                 media.need_open_event = false;
 
-                return Some(MediaEvent::Added(MediaAdded {
+                return Some(Event::MediaAdded(MediaAdded {
                     mid: media.mid(),
                     kind: media.kind(),
                     direction: media.direction(),
@@ -628,7 +648,7 @@ impl Session {
 
             if media.need_changed_event {
                 media.need_changed_event = false;
-                return Some(MediaEvent::Changed(MediaChanged {
+                return Some(Event::MediaChanged(MediaChanged {
                     mid: media.mid(),
                     direction: media.direction(),
                 }));
@@ -636,8 +656,8 @@ impl Session {
 
             if let Some(r) = media.poll_sample(&self.codec_config) {
                 match r {
-                    Ok(v) => return Some(MediaEvent::Data(v)),
-                    Err(e) => return Some(MediaEvent::Error(e)),
+                    Ok(v) => return Some(Event::MediaData(v)),
+                    Err(e) => return Some(Event::Error(e)),
                 }
             }
         }
@@ -682,7 +702,14 @@ impl Session {
 
         let mut data = vec![0_u8; ENCRYPTABLE_MTU];
 
-        let len = Rtcp::write_packet(&mut self.feedback_tx, &mut data);
+        let mut raw_packets = self.raw_packets.as_mut();
+        let output = move |fb| {
+            if let Some(raw_packets) = &mut raw_packets {
+                raw_packets.push_back(RawPacket::RtcpTx(fb));
+            }
+        };
+
+        let len = Rtcp::write_packet(&mut self.feedback_tx, &mut data, output);
 
         if len == 0 {
             return None;
@@ -739,6 +766,10 @@ impl Session {
         }
 
         self.pacer.register_send(now, payload_size.into(), mid);
+
+        if let Some(raw_packets) = &mut self.raw_packets {
+            raw_packets.push_back(RawPacket::RtpTx(header.clone(), buf.clone()));
+        }
 
         let protected = srtp_tx.protect_rtp(buf, &header, *seq_no);
 

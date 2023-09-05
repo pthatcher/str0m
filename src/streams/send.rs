@@ -108,6 +108,9 @@ pub struct StreamTx {
 
     /// Statistics of outgoing data.
     stats: StreamTxStats,
+
+    // downsampled rtx ratio (value, last calculation)
+    rtx_ratio: (f32, Instant),
 }
 
 /// Holder of stats.
@@ -165,10 +168,11 @@ impl StreamTx {
             resends: VecDeque::new(),
             padding: 0,
             blank_packet: RtpPacket::blank(),
-            rtx_cache: RtxCache::new(1024, DEFAULT_RTX_CACHE_DURATION),
+            rtx_cache: RtxCache::new(2000, DEFAULT_RTX_CACHE_DURATION),
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             stats: StreamTxStats::default(),
+            rtx_ratio: (0.0, already_happened()),
         }
     }
 
@@ -231,7 +235,7 @@ impl StreamTx {
     ///               probably needs to weigh in clock drifts and data provided via the statistics, receiver
     ///               reports etc.
     /// * `marker` Whether to "mark" this packet. This is usually done for the last packet belonging to
-    ///            a series of RTP packets consituting the same frame in a video stream.
+    ///            a series of RTP packets constituting the same frame in a video stream.
     /// * `ext_vals` The RTP header extension values to set. The values must be mapped in the session,
     ///              or they will not be set on the RTP packet.
     /// * `nackable` Whether we should respond this packet for incoming NACK from the remote peer. For
@@ -250,7 +254,13 @@ impl StreamTx {
         nackable: bool,
         payload: Vec<u8>,
     ) -> Result<(), RtcError> {
-        //
+        let first_call = self.rtp_and_wallclock.is_none();
+
+        if first_call && seq_no.roc() > 0 {
+            // TODO: make it possible to supress this.
+            warn!("First SeqNo has non-zero ROC ({}), which needs out-of-band signalling to remote peer", seq_no.roc());
+        }
+
         // This 1 in clock frequency will be fixed in poll_output.
         let media_time = MediaTime::new(time as i64, 1);
         self.rtp_and_wallclock = Some((time, wallclock));
@@ -457,7 +467,9 @@ impl StreamTx {
                 .send_queue
                 .pop(now)
                 .expect("head of send_queue to be there");
-            self.rtx_cache.cache_sent_packet(pkt, now);
+            if self.rtx_enabled() {
+                self.rtx_cache.cache_sent_packet(pkt, now);
+            }
         }
 
         // This is set here due to borrow checker.
@@ -478,10 +490,7 @@ impl StreamTx {
 
     fn poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
         let from = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
-        let bytes_transmitted = self.stats.bytes_transmitted.sum_since(from);
-        let bytes_retransmitted = self.stats.bytes_retransmitted.sum_since(from);
-        let ratio = bytes_retransmitted as f32 / (bytes_retransmitted + bytes_transmitted) as f32;
-        let ratio = if ratio.is_finite() { ratio } else { 0_f32 };
+        let ratio = self.rtx_ratio_downsampled(now, from);
 
         // If we hit the cap, stop doing resends by clearing those we have queued.
         if ratio > 0.15_f32 {
@@ -490,6 +499,20 @@ impl StreamTx {
         }
 
         self.do_poll_packet_resend(now)
+    }
+
+    fn rtx_ratio_downsampled(&mut self, now: Instant, from: Instant) -> f32 {
+        let (value, ts) = self.rtx_ratio;
+        if now - ts < Duration::from_millis(50) {
+            // not worth re-evaluating, return the old value
+            return value;
+        }
+        let bytes_transmitted = self.stats.bytes_transmitted.sum_since(from);
+        let bytes_retransmitted = self.stats.bytes_retransmitted.sum_since(from);
+        let ratio = bytes_retransmitted as f32 / (bytes_retransmitted + bytes_transmitted) as f32;
+        let ratio = if ratio.is_finite() { ratio } else { 0_f32 };
+        self.rtx_ratio = (ratio, now);
+        ratio
     }
 
     fn do_poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
@@ -588,7 +611,7 @@ impl StreamTx {
         let seq_no = self.seq_no_rtx.inc();
 
         let pkt = &mut self.blank_packet;
-        pkt.seq_no = self.seq_no_rtx.inc();
+        pkt.seq_no = seq_no;
 
         let len = self
             .padding
@@ -645,7 +668,7 @@ impl StreamTx {
     ) -> Option<()> {
         // Turning NackEntry into SeqNo we need to know a SeqNo "close by" to lengthen the 16 bit
         // sequence number into the 64 bit we have in SeqNo.
-        let seq_no = self.rtx_cache.first_cached_seq_no()?;
+        let seq_no = self.rtx_cache.last_cached_seq_no()?;
         let iter = entries.flat_map(|n| n.into_iter(seq_no));
 
         // Schedule all resends. They will be handled on next poll_packet

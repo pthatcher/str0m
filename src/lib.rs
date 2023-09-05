@@ -6,6 +6,9 @@
 //! talking. Furthermore it has no internal threads or async tasks. All operations are synchronously
 //! happening from the calls of the public API.
 //!
+//! This is deliberately not a standard `RTCPeerConnection` API since that isn't a great fit for Rust.
+//! See more details in below section.
+//!
 //! # Join us
 //!
 //! We are discussing str0m things on Zulip. Join us using this [invitation link][zulip]. Or browse the
@@ -492,6 +495,7 @@
 #![allow(clippy::new_without_default)]
 #![allow(clippy::bool_to_int_with_if)]
 #![allow(clippy::assertions_on_constants)]
+#![allow(clippy::manual_range_contains)]
 #![deny(missing_docs)]
 
 #[macro_use]
@@ -499,6 +503,7 @@ extern crate tracing;
 
 use bwe::Bwe;
 use change::{DirectApi, SdpApi};
+use rtp::RawPacket;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -529,11 +534,37 @@ use rtp_::{Extension, ExtensionMap, InstantExt};
 
 /// Low level RTP access.
 pub mod rtp {
-    pub use crate::rtp_::{
-        Extension, ExtensionMap, ExtensionValues, RtpHeader, SeqNo, Ssrc, VideoLayersAllocation,
-        VideoOrientation,
-    };
+    /// Feedback for RTP.
+    pub mod rtcp {
+        pub use crate::rtp_::{Descriptions, ExtendedReport, Fir, Goodbye, Nack, Pli};
+        pub use crate::rtp_::{Dlrr, NackEntry, ReceptionReport, ReportBlock};
+        pub use crate::rtp_::{FirEntry, ReceiverReport, SenderInfo, SenderReport, Twcc};
+        pub use crate::rtp_::{ReportList, Rrtr, Rtcp, Sdes, SdesType};
+    }
+    use self::rtcp::Rtcp;
+
+    pub use crate::rtp_::{vla::VideoLayersAllocation, ExtensionValues, UserExtensionValues};
+    pub use crate::rtp_::{Extension, ExtensionMap, ExtensionSerializer};
+
+    pub use crate::rtp_::{RtpHeader, SeqNo, Ssrc, VideoOrientation};
     pub use crate::streams::{RtpPacket, StreamPaused, StreamRx, StreamTx};
+
+    /// Debug output of the unencrypted RTP and RTCP packets.
+    ///
+    /// Enable using [`RtcConfig::enable_raw_packets()`][crate::RtcConfig::enable_raw_packets].
+    /// This clones data, and is therefore expensive.
+    /// Should not be enabled outside of tests and troubleshooting.
+    #[derive(Debug)]
+    pub enum RawPacket {
+        /// Sent RTCP.
+        RtcpTx(Rtcp),
+        /// Incoming RTCP.
+        RtcpRx(Rtcp),
+        /// Sent RTP.
+        RtpTx(RtpHeader, Vec<u8>),
+        /// Incoming RTP.
+        RtpRx(RtpHeader, Vec<u8>),
+    }
 }
 
 pub mod bwe;
@@ -562,7 +593,7 @@ mod util;
 use util::{already_happened, not_happening, Soonest};
 
 mod session;
-use session::{MediaEvent, Session};
+use session::Session;
 
 pub mod stats;
 use stats::{MediaEgressStats, MediaIngressStats, PeerStats, Stats, StatsEvent, StatsSnapshot};
@@ -811,6 +842,17 @@ pub enum Event {
 
     /// Incoming RTP data.
     RtpPacket(RtpPacket),
+
+    /// Debug output of incoming and outgoing RTCP/RTP packets.
+    ///
+    /// Enable using [`RtcConfig::enable_raw_packets()`].
+    /// This clones data, and is therefore expensive.
+    /// Should not be enabled outside of tests and troubleshooting.
+    RawPacket(RawPacket),
+
+    /// Internal for passing data from Session to Rtc.
+    #[doc(hidden)]
+    Error(RtcError),
 }
 
 /// Input as expected by [`Rtc::handle_input()`]. Either network data or a timeout.
@@ -874,7 +916,8 @@ impl Rtc {
         Rtc {
             alive: true,
             ice,
-            dtls: Dtls::new(config.dtls_cert).expect("DTLS to init without problem"),
+            dtls: Dtls::new(config.dtls_cert, config.fingerprint_verification)
+                .expect("DTLS to init without problem"),
             session,
             sctp: RtcSctp::new(),
             chan: ChannelHandler::default(),
@@ -1241,19 +1284,12 @@ impl Rtc {
             }
         }
 
-        if let Some(e) = self.session.poll_event() {
-            return Ok(match e {
-                MediaEvent::Added(m) => Output::Event(Event::MediaAdded(m)),
-                MediaEvent::Changed(m) => Output::Event(Event::MediaChanged(m)),
-                MediaEvent::Data(m) => Output::Event(Event::MediaData(m)),
-                MediaEvent::Error(e) => return Err(e),
-                MediaEvent::KeyframeRequest(r) => Output::Event(Event::KeyframeRequest(r)),
-                MediaEvent::EgressBitrateEstimate(b) => {
-                    Output::Event(Event::EgressBitrateEstimate(b))
-                }
-                MediaEvent::RtpPacket(p) => Output::Event(Event::RtpPacket(p)),
-                MediaEvent::StreamPaused(p) => Output::Event(Event::StreamPaused(p)),
-            });
+        if let Some(ev) = self.session.poll_event() {
+            if let Event::Error(err) = ev {
+                return Err(err);
+            } else {
+                return Ok(Output::Event(ev));
+            }
         }
 
         if let Some(e) = self.stats.as_mut().and_then(|s| s.poll_output()) {
@@ -1398,10 +1434,15 @@ impl Rtc {
         Ok(())
     }
 
-    fn do_handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
+    fn init_time(&mut self, now: Instant) {
         // We assume this first "now" is a time 0 start point for calculating ntp/unix time offsets.
         // This initializes the conversion of Instant -> NTP/Unix time.
         let _ = now.to_unix_duration();
+    }
+
+    fn do_handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
+        self.init_time(now);
+
         self.last_now = now;
         self.ice.handle_timeout(now);
         self.sctp.handle_timeout(now);
@@ -1422,6 +1463,8 @@ impl Rtc {
     }
 
     fn do_handle_receive(&mut self, now: Instant, r: net::Receive) -> Result<(), RtcError> {
+        self.init_time(now);
+
         trace!("IN {:?}", r);
         self.last_now = now;
         use net::DatagramRecv::*;
@@ -1505,8 +1548,14 @@ impl Rtc {
 
     /// All current RTP header extensions. For integration tests.
     #[doc(hidden)]
-    pub fn exts(&self) -> ExtensionMap {
-        self.session.exts
+    pub fn exts(&self) -> &ExtensionMap {
+        &self.session.exts
+    }
+
+    /// Current local ICE credentials. For integration tests.
+    #[doc(hidden)]
+    pub fn local_ice_creds(&self) -> IceCreds {
+        self.ice.local_credentials().clone()
     }
 }
 
@@ -1525,6 +1574,7 @@ impl Rtc {
 pub struct RtcConfig {
     local_ice_credentials: IceCreds,
     dtls_cert: DtlsCert,
+    fingerprint_verification: bool,
     ice_lite: bool,
     codec_config: CodecConfig,
     exts: ExtensionMap,
@@ -1536,6 +1586,7 @@ pub struct RtcConfig {
     send_buffer_audio: usize,
     send_buffer_video: usize,
     rtp_mode: bool,
+    enable_raw_packets: bool,
 }
 
 impl RtcConfig {
@@ -1556,6 +1607,12 @@ impl RtcConfig {
         &self.dtls_cert
     }
 
+    /// Set DTLS certification.
+    pub fn set_dtls_cert(mut self, dtls_cert: DtlsCert) -> Self {
+        self.dtls_cert = dtls_cert;
+        self
+    }
+
     /// Toggle ice lite. Ice lite is a mode for WebRTC servers with public IP address.
     /// An [`Rtc`] instance in ice lite mode will not make STUN binding requests, but only
     /// answer to requests from the remote peer.
@@ -1565,6 +1622,26 @@ impl RtcConfig {
     /// [1]: https://www.rfc-editor.org/rfc/rfc8445#page-13
     pub fn set_ice_lite(mut self, enabled: bool) -> Self {
         self.ice_lite = enabled;
+        self
+    }
+
+    /// Get fingerprint verification mode.
+    ///
+    /// ```
+    /// # use str0m::RtcConfig;
+    ///
+    /// // Verify that fingerprint verification is enabled by default.
+    /// assert!(RtcConfig::default().fingerprint_verification());
+    /// ```
+    pub fn fingerprint_verification(&self) -> bool {
+        self.fingerprint_verification
+    }
+
+    /// Toggle certificate fingerprint verification.
+    ///
+    /// By default the certificate fingerprint is verified.
+    pub fn set_fingerprint_verification(mut self, enabled: bool) -> Self {
+        self.fingerprint_verification = enabled;
         self
     }
 
@@ -1883,6 +1960,15 @@ impl RtcConfig {
         self.rtp_mode
     }
 
+    /// Enable the [`Event::RawPacket`] event.
+    ///
+    /// This clones data, and is therefore expensive.
+    /// Should not be enabled outside of tests and troubleshooting.
+    pub fn enable_raw_packets(mut self, enabled: bool) -> Self {
+        self.enable_raw_packets = enabled;
+        self
+    }
+
     /// Create a [`Rtc`] from the configuration.
     pub fn build(self) -> Rtc {
         Rtc::new_from_config(self)
@@ -1894,6 +1980,7 @@ impl Default for RtcConfig {
         Self {
             local_ice_credentials: IceCreds::new(),
             dtls_cert: DtlsCert::new(),
+            fingerprint_verification: true,
             ice_lite: false,
             codec_config: CodecConfig::new_with_defaults(),
             exts: ExtensionMap::standard(),
@@ -1904,6 +1991,7 @@ impl Default for RtcConfig {
             send_buffer_audio: 50,
             send_buffer_video: 1000,
             rtp_mode: false,
+            enable_raw_packets: false,
         }
     }
 }
@@ -1986,4 +2074,10 @@ mod test {
         fn is_unwind_safe<T: UnwindSafe>(_t: T) {}
         is_unwind_safe(Rtc::new());
     }
+}
+
+#[cfg(fuzzing)]
+#[allow(missing_docs)]
+pub mod fuzz {
+    pub use crate::streams::rtx_cache_buf::EvictingBuffer;
 }

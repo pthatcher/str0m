@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use str0m::format::Codec;
 use str0m::media::MediaKind;
+use str0m::rtp::SeqNo;
 use str0m::rtp::{ExtensionValues, Ssrc};
 use str0m::{Event, RtcError};
 
@@ -10,24 +11,31 @@ mod common;
 use common::{connect_l_r, init_log, progress};
 
 #[test]
-pub fn rtp_direct_ssrc() -> Result<(), RtcError> {
+pub fn rtp_direct_with_roc() -> Result<(), RtcError> {
     init_log();
 
     let (mut l, mut r) = connect_l_r();
 
     let mid = "aud".into();
 
-    // In this example we are not using RID to identify the stream, we are simply
-    // using SSRC 1 as knowledge shared between sending and receiving side.
-    let ssrc: Ssrc = 1.into();
+    // In this example we are using MID only (no RID) to identify the incoming media.
+    let ssrc_tx: Ssrc = 42.into();
 
     l.direct_api().declare_media(mid, MediaKind::Audio);
 
-    l.direct_api().declare_stream_tx(ssrc, None, mid, None);
+    l.direct_api().declare_stream_tx(ssrc_tx, None, mid, None);
 
     r.direct_api().declare_media(mid, MediaKind::Audio);
 
-    r.direct_api().expect_stream_rx(ssrc, None, mid, None);
+    let mut d = r.direct_api();
+    let rx = d.expect_stream_rx(ssrc_tx, None, mid, None);
+
+    // Above 2^16, which means we have ROC:ed.
+    let seq_no_offset: SeqNo = 100_000.into();
+
+    // By telling the receiver side to start at a specific ROC, we can send first ever
+    // packet from a high sequence number.
+    rx.reset_roc(seq_no_offset.roc());
 
     let max = l.last.max(r.last);
     l.last = max;
@@ -64,7 +72,9 @@ pub fn rtp_direct_ssrc() -> Result<(), RtcError> {
 
                 let count = counts.remove(0);
                 let time = (count * 1000 + 47_000_000) as u32;
-                let seq_no = (47_000 + count).into();
+
+                // this seqno is already past first ROC
+                let seq_no = (*seq_no_offset + count).into();
 
                 let exts = ExtensionValues {
                     audio_level: Some(-42 - count as i8),
@@ -79,7 +89,7 @@ pub fn rtp_direct_ssrc() -> Result<(), RtcError> {
                         time,
                         wallclock,
                         false,
-                        exts.clone(),
+                        exts,
                         false,
                         packet.to_vec(),
                     )
@@ -107,26 +117,6 @@ pub fn rtp_direct_ssrc() -> Result<(), RtcError> {
         .collect();
 
     assert_eq!(media.len(), 3);
-
-    let h0 = media[0].header.clone();
-    let h1 = media[1].header.clone();
-    let h2 = media[2].header.clone();
-
-    assert_eq!(h0.sequence_number, 47000);
-    assert_eq!(h1.sequence_number, 47003);
-    assert_eq!(h2.sequence_number, 47001);
-
-    assert_eq!(h0.timestamp, 47_000_000);
-    assert_eq!(h1.timestamp, 47_003_000);
-    assert_eq!(h2.timestamp, 47_001_000);
-
-    assert_eq!(h0.ext_vals.audio_level, Some(-42));
-    assert_eq!(h1.ext_vals.audio_level, Some(-45));
-    assert_eq!(h2.ext_vals.audio_level, Some(-43));
-
-    assert!(!h0.marker);
-    assert!(!h1.marker);
-    assert!(!h2.marker);
 
     assert!(l.media(mid).is_some());
     assert!(l.direct_api().stream_tx_by_mid(mid, None).is_some());

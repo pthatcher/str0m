@@ -69,7 +69,7 @@ pub fn bidirectional_same_m_line() -> Result<(), RtcError> {
     let media_count_r = r
         .events
         .iter()
-        .filter(|e| matches!(e, Event::MediaData(_)))
+        .filter(|(_, e)| matches!(e, Event::MediaData(_)))
         .count();
 
     assert!(
@@ -81,11 +81,11 @@ pub fn bidirectional_same_m_line() -> Result<(), RtcError> {
     let media_count_l = l
         .events
         .iter()
-        .filter(|e| matches!(e, Event::MediaData(_)))
+        .filter(|(_, e)| matches!(e, Event::MediaData(_)))
         .count();
 
     assert!(
-        media_count_l > 170,
+        media_count_l > 1700,
         "Not enough MediaData at L: {}",
         media_count_l
     );

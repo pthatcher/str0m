@@ -75,6 +75,12 @@ impl<'a> Writer<'a> {
         self
     }
 
+    /// Set a user extension value.
+    pub fn user_extension_value<T: Send + Sync + 'static>(mut self, val: T) -> Self {
+        self.ext_vals.user_values.set(val);
+        self
+    }
+
     /// Write media.
     ///
     /// This operation fails if the PT doesn't match a negotiated codec, or the RID (`None` or a value)
@@ -108,6 +114,15 @@ impl<'a> Writer<'a> {
                 return Err(RtcError::UnknownRid(rid));
             }
         }
+
+        trace!(
+            "write {:?} {:?} {:?} time: {:?} len: {}",
+            self.mid,
+            self.rid,
+            pt,
+            rtp_time,
+            data.len()
+        );
 
         let to_payload = ToPayload {
             pt,

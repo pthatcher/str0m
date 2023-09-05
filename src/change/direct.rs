@@ -52,6 +52,11 @@ impl<'a> DirectApi<'a> {
         self.rtc.ice.local_credentials().clone()
     }
 
+    /// Sets the local ICE credentials.
+    pub fn set_local_ice_credentials(&mut self, local_ice_credentials: IceCreds) {
+        self.rtc.ice.set_local_credentials(local_ice_credentials);
+    }
+
     /// Sets the remote ICE credentials.
     pub fn set_remote_ice_credentials(&mut self, remote_ice_credentials: IceCreds) {
         self.rtc.ice.set_remote_credentials(remote_ice_credentials);
@@ -63,6 +68,11 @@ impl<'a> DirectApi<'a> {
     /// peer connection and establish a secure communication channel between the peers.
     pub fn local_dtls_fingerprint(&self) -> Fingerprint {
         self.rtc.dtls.local_fingerprint().clone()
+    }
+
+    /// Returns a reference to the remote DTLS fingerprint used by this peer connection.
+    pub fn remote_dtls_fingerprint(&self) -> Option<Fingerprint> {
+        self.rtc.dtls.remote_fingerprint().clone()
     }
 
     /// Sets the remote DTLS fingerprint.
@@ -148,7 +158,13 @@ impl<'a> DirectApi<'a> {
     /// Allow incoming traffic from remote peer for the given SSRC.
     ///
     /// Can be called multiple times if the `rtx` is discovered later via RTP header extensions.
-    pub fn expect_stream_rx(&mut self, ssrc: Ssrc, rtx: Option<Ssrc>, mid: Mid, rid: Option<Rid>) {
+    pub fn expect_stream_rx(
+        &mut self,
+        ssrc: Ssrc,
+        rtx: Option<Ssrc>,
+        mid: Mid,
+        rid: Option<Rid>,
+    ) -> &mut StreamRx {
         self.rtc
             .session
             .streams
@@ -166,7 +182,7 @@ impl<'a> DirectApi<'a> {
     ///
     /// In RTP mode, the receive stream is used to signal keyframe requests.
     ///
-    /// The stream must first be declared usig [`DirectApi::expect_stream_rx`].
+    /// The stream must first be declared using [`DirectApi::expect_stream_rx`].
     pub fn stream_rx(&mut self, ssrc: &Ssrc) -> Option<&mut StreamRx> {
         self.rtc.session.streams.stream_rx(ssrc)
     }
@@ -222,7 +238,7 @@ impl<'a> DirectApi<'a> {
 
     /// Obtain a send stream to write RTP data directly.
     ///
-    /// The stream must first be declared usig [`DirectApi::declare_stream_tx`].
+    /// The stream must first be declared using [`DirectApi::declare_stream_tx`].
     pub fn stream_tx(&mut self, ssrc: &Ssrc) -> Option<&mut StreamTx> {
         self.rtc.session.streams.stream_tx(ssrc)
     }

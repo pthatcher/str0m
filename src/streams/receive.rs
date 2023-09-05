@@ -29,6 +29,10 @@ pub struct StreamRx {
     /// Identifier of a resend (RTX) stream. This can be set later, once we discover it.
     rtx: Option<Ssrc>,
 
+    /// Previous main SSRC. This is to ensure we never go "backwards" in terms
+    /// of changing SSRC (for FF).
+    previous_ssrc: Option<Ssrc>,
+
     /// The Media mid this stream belongs to.
     mid: Mid,
 
@@ -49,6 +53,9 @@ pub struct StreamRx {
 
     /// Last received sender info.
     sender_info: Option<(Instant, SenderInfo)>,
+
+    /// ROC to reset with on next incoming packet.
+    reset_roc: Option<u64>,
 
     /// Register of received packets. For NACK handling.
     ///
@@ -119,12 +126,14 @@ impl StreamRx {
         StreamRx {
             ssrc,
             rtx: None,
+            previous_ssrc: None,
             mid,
             rid,
             cname: None,
             suppress_nack: false,
             last_used: already_happened(),
             sender_info: None,
+            reset_roc: None,
             register: None,
             register_rtx: None,
             last_time: None,
@@ -188,7 +197,7 @@ impl StreamRx {
     /// Suppress NACK sending.
     ///
     /// Normally NACK is disabled by not having an RTX SSRC set. In some situations it might be
-    /// desirable to manuall suppress NACK sending regardless of RTX setting.
+    /// desirable to manually suppress NACK sending regardless of RTX setting.
     pub fn suppress_nack(&mut self, suppress: bool) {
         self.suppress_nack = suppress;
     }
@@ -293,7 +302,21 @@ impl StreamRx {
         let register =
             register_ref.get_or_insert_with(|| ReceiverRegister::new(header.sequence_number(None)));
 
-        let seq_no = header.sequence_number(Some(register.max_seq()));
+        // If the user has called `reset_seq_no`, this is the time to handle it, but only
+        // if the incoming packet is for main (not repair).
+        let mut reset_seq_no = None;
+        if !is_repair {
+            if let Some(reset_roc) = self.reset_roc.take() {
+                let s: SeqNo = (reset_roc << 16 | header.sequence_number as u64).into();
+                reset_seq_no = Some(s);
+            }
+        }
+
+        let seq_no = if let Some(reset_seq_no) = reset_seq_no {
+            reset_seq_no
+        } else {
+            header.sequence_number(Some(register.max_seq()))
+        };
 
         let is_new_packet = register.update_seq(seq_no);
         register.update_time(now, header.timestamp, clock_rate);
@@ -412,12 +435,14 @@ impl StreamRx {
             self.stats.update_loss(l);
         }
 
-        debug!("Created feedback RR: {:?}", rr);
-        feedback.push_back(Rtcp::ReceiverReport(rr));
+        let xr = self.create_extended_receiver_report(now);
 
-        let er = self.create_extended_receiver_report(now);
-        debug!("Created feedback extended receiver report: {:?}", er);
-        feedback.push_back(Rtcp::ExtendedReport(er));
+        debug!(
+            "Created feedback RR/XR ({:?}/{:?}): {:?} {:?}",
+            self.mid, self.rid, rr, xr
+        );
+        feedback.push_back(Rtcp::ReceiverReport(rr));
+        feedback.push_back(Rtcp::ExtendedReport(xr));
 
         self.last_receiver_report = now;
     }
@@ -557,8 +582,8 @@ impl StreamRx {
         self.pending_request_keyframe = None;
     }
 
-    pub(crate) fn maybe_reset_ssrc(&mut self, ssrc: Ssrc) {
-        if self.ssrc == ssrc {
+    pub(crate) fn change_ssrc(&mut self, ssrc: Ssrc) {
+        if ssrc == self.ssrc || Some(ssrc) == self.previous_ssrc {
             return;
         }
 
@@ -567,6 +592,9 @@ impl StreamRx {
             self.ssrc, ssrc, self.mid, self.rid
         );
 
+        // Remember which was the previous in case a stray packet turns up
+        // so do we don't go "backwards".
+        self.previous_ssrc = Some(self.ssrc);
         self.ssrc = ssrc;
         self.register = None;
     }
@@ -587,6 +615,25 @@ impl StreamRx {
 
         self.rtx = Some(rtx);
         self.register_rtx = None;
+    }
+
+    /// Reset the current rollover counter (ROC).
+    ///
+    /// This is used in scenarios where we use a single sequence number across all
+    /// receivers of the same stream (as opposed to a sequence number unique per peer).
+    ///
+    /// [RFC3711](https://datatracker.ietf.org/doc/html/rfc3711#section-3.3.1):
+    ///
+    /// > Receivers joining an on-going session MUST be given the
+    /// > current ROC value using out-of-band signaling such as key-management
+    /// > signaling.  Furthermore, the receiver SHALL initialize s_l to the RTP
+    /// > sequence number (SEQ) of the first observed SRTP packet (unless the
+    /// > initial value is provided by out of band signaling such as key
+    /// > management).
+    pub fn reset_roc(&mut self, roc: u64) {
+        self.register = None;
+        self.register_rtx = None;
+        self.reset_roc = Some(roc);
     }
 }
 

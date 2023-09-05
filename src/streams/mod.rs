@@ -18,6 +18,7 @@ pub use self::send::StreamTx;
 mod receive;
 mod register;
 mod rtx_cache;
+pub(crate) mod rtx_cache_buf;
 mod send;
 mod send_queue;
 
@@ -146,7 +147,13 @@ impl Default for Streams {
 }
 
 impl Streams {
-    pub fn expect_stream_rx(&mut self, ssrc: Ssrc, rtx: Option<Ssrc>, mid: Mid, rid: Option<Rid>) {
+    pub fn expect_stream_rx(
+        &mut self,
+        ssrc: Ssrc,
+        rtx: Option<Ssrc>,
+        mid: Mid,
+        rid: Option<Rid>,
+    ) -> &mut StreamRx {
         let stream = self
             .streams_rx
             .entry(ssrc)
@@ -155,6 +162,8 @@ impl Streams {
         if let Some(rtx) = rtx {
             stream.maybe_reset_rtx(rtx);
         }
+
+        stream
     }
 
     pub fn remove_stream_rx(&mut self, ssrc: Ssrc) -> bool {
@@ -258,7 +267,7 @@ impl Streams {
         for stream in self.streams_tx.values_mut() {
             let mid = stream.mid();
 
-            // All StreamTx belongin to the same Mid are reported together.
+            // All StreamTx belonging to the same Mid are reported together.
             if self.mids_to_report.contains(&mid) {
                 stream.create_sr_and_update(now, feedback);
             }
@@ -426,6 +435,16 @@ impl Streams {
         for s in self.streams_rx_by_mid(mid) {
             s.reset_buffers();
         }
+    }
+
+    pub(crate) fn change_stream_rx_ssrc(&mut self, ssrc_from: Ssrc, ssrc_to: Ssrc) {
+        // This unwrap is OK, because we can't call change_stream_rx_ssrc without first
+        // knowing there is such a StreamRx.
+        let mut to_change = self.streams_rx.remove(&ssrc_from).unwrap();
+        to_change.change_ssrc(ssrc_to);
+
+        // Reinsert under new SSRC key.
+        self.streams_rx.insert(ssrc_to, to_change);
     }
 }
 

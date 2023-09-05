@@ -1,6 +1,6 @@
 [package]
 name = "str0m"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Martin Algesten <martin@algesten.se>", "Hugo Tunius <h@tunius.se>", "Davide Bertola <dade@dadeb.it>"]
 description = "WebRTC library in Sans-IO style"
 license = "MIT/Apache-2.0"
@@ -44,6 +44,3 @@ systemstat = "0.2.2"
 # This is to ensure MSRV 1.65
 # Remove when we move MSRV
 time = "=0.3.23"
-
-[target.'cfg(fuzzing)'.dev-dependencies]
-fuzzcheck = "0.12"
