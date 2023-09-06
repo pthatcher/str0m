@@ -543,8 +543,10 @@ pub mod rtp {
     }
     use self::rtcp::Rtcp;
 
-    pub use crate::rtp_::{vla::VideoLayersAllocation, ExtensionValues, UserExtensionValues};
+    /// Video Layers Allocation Header Extension
+    pub mod vla;
     pub use crate::rtp_::{Extension, ExtensionMap, ExtensionSerializer};
+    pub use crate::rtp_::{ExtensionValues, UserExtensionValues};
 
     pub use crate::rtp_::{RtpHeader, SeqNo, Ssrc, VideoOrientation};
     pub use crate::streams::{RtpPacket, StreamPaused, StreamRx, StreamTx};

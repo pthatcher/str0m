@@ -10,8 +10,6 @@ mod ext;
 pub use ext::{Extension, ExtensionMap, ExtensionSerializer, ExtensionValues};
 pub use ext::{UserExtensionValues, VideoOrientation};
 
-pub mod vla;
-
 mod dir;
 pub use dir::Direction;
 

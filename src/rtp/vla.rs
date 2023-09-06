@@ -2,8 +2,15 @@ use std::collections::VecDeque;
 
 use super::{ExtensionSerializer, ExtensionValues};
 
-/// Video Layers Allocation RTP Header Extension
-/// See http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00
+#[allow(dead_code)]
+/// URI for Video Layers Allocation RTP Header Extension
+pub const URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00";
+
+/// Top-level "allocation" for the Video Layers Allocation RTP Header Extension
+/// Contains allocations for many simulcast streams, which contain many spatial layers.
+/// In practice, there are either many simulcast streams with 1 spatial layer each (simulcast)
+/// or 1 simulcast stream with many spatial layers (SVC)
+/// or 1 simulcast stream with 1 spatial layer (only temporal layers used)
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct VideoLayersAllocation {
     /// Erroneously called "RID" in the spec.
@@ -15,28 +22,41 @@ pub struct VideoLayersAllocation {
     pub simulcast_streams: Vec<SimulcastStreamAllocation>,
 }
 
+/// A spatial layer, which may contain many allocations for spatial layers.
+/// There may be many per top-level allocation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SimulcastStreamAllocation {
+    /// May contains many spatial layers, or none.
     pub spatial_layers: Vec<SpatialLayerAllocation>,
 }
 
+/// An allocation for a spatial layer, which may contain many allocations for temporal layers.
+/// There may be many per simulcast stream.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SpatialLayerAllocation {
+    /// Contains many temporal layers, or none.
     /// If empty, the spatial layer is not active.
     pub temporal_layers: Vec<TemporalLayerAllocation>,
+    /// Contains an optional resolution and framerate
     pub resolution_and_framerate: Option<ResolutionAndFramerate>,
 }
 
+/// An allocation for a temporal layer.  There may be many per spatial layer.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TemporalLayerAllocation {
-    // Cumulative across the temporal layers within a spatial layer
+    /// Cumulative bitrate for this temporal layer and all below it within a spatial layer.
     pub cumulative_kbps: u64,
 }
 
+/// A resolution and a frame rate, tied together because that's how it's encoded.
+/// Either they are both there or neither or there.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ResolutionAndFramerate {
+    /// Width in number of pixels
     pub width: u16,
+    /// Height in number of pixels
     pub height: u16,
+    /// Framerate in frames per second
     pub framerate: u8,
 }
 
@@ -162,15 +182,22 @@ impl VideoLayersAllocation {
     }
 }
 
-impl ExtensionSerializer for VideoLayersAllocation {
+/// Serializer of Video Layers Allocation Header Extension
+#[derive(Debug)]
+pub struct Serializer;
+
+impl ExtensionSerializer for Serializer {
     /// Write the extension to the buffer of bytes. Must return the number
     /// of bytes written. This can be 0 if the extension could not be serialized.
-    fn write_to(&self, _buf: &mut [u8], _ev: &ExtensionValues) -> usize {
-        todo!();
+    fn write_to(&self, _buf: &mut [u8], ev: &ExtensionValues) -> usize {
+        if ev.user_values.get::<VideoLayersAllocation>().is_some() {
+            todo!();
+        }
+        0
     }
 
     fn parse_value(&self, buf: &[u8], ev: &mut ExtensionValues) -> bool {
-        let Some(vla) = Self::parse(buf) else {
+        let Some(vla) = VideoLayersAllocation::parse(buf) else {
             return false;
         };
         ev.user_values.set(vla);

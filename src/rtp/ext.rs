@@ -845,6 +845,16 @@ impl UserExtensionValues {
             // unwrap here is OK because TypeId::of::<T> is guaranteed to be unique
             .map(|boxed| (&**boxed as &(dyn Any + 'static)).downcast_ref().unwrap())
     }
+
+    /// Like .get(), but clones and returns the Arc.
+    pub fn get_arc<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        self.map
+            .as_ref()?
+            .get(&TypeId::of::<T>())?
+            .clone()
+            .downcast()
+            .ok()
+    }
 }
 
 impl UnwindSafe for UserExtensionValues {}
