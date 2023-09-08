@@ -315,6 +315,7 @@ impl Pacer for LeakyBucketPacer {
         self.clear_debt(elapsed);
         self.maybe_update_adjusted_bitrate(now);
 
+        // If this always returns None, then we'll never send padding, and may get into a hot loop.
         if let Some(request) = self.maybe_create_padding_request() {
             self.next_poll_queue = Some(request.mid);
             return Some(request);
@@ -480,6 +481,7 @@ impl LeakyBucketPacer {
         let mut drain_debt_time =
             (self.media_debt / self.adjusted_bitrate).max(self.padding_debt / self.padding_bitrate);
         if drain_debt_time.is_zero() {
+            warn!("Padding debt time is zero.  Padding is likely not being sent.  This can cause a hot loop.");
             // Give the main loop some time to do something else e.g. queue media.
             drain_debt_time = Duration::from_micros(1);
         }
@@ -547,6 +549,9 @@ impl LeakyBucketPacer {
         }
 
         // Queues must be empty.
+        // Warning: this could be non-empty because of the "fake packets" from StreamTx.queue_state_padding,
+        // But then padding won't' be sent, so the "fake packets" will never be drained and we'll be stuck
+        // in that state forever.  And this can cause a hot loop.
         let all_queues_empty = self
             .queue_states
             .iter()
