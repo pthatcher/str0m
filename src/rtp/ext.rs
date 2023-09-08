@@ -1027,7 +1027,7 @@ mod test {
         };
 
         let mut buf = vec![0_u8; 8];
-        exts.write_to(&mut buf[..], &ev);
+        exts.write_to(&mut buf[..], &ev, false);
 
         let mut ev2 = ExtensionValues::default();
         exts.parse(&buf, false, &mut ev2);
@@ -1046,7 +1046,7 @@ mod test {
         };
 
         let mut buf = vec![0_u8; 8];
-        exts.write_to(&mut buf[..], &ev);
+        exts.write_to(&mut buf[..], &ev, false);
 
         let mut ev2 = ExtensionValues::default();
         exts.parse(&buf, false, &mut ev2);

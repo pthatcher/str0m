@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use super::{ExtensionSerializer, ExtensionValues};
 
 #[allow(dead_code)]
-/// URI for Video Layers Allocation RTP Header Extension
+/// URI for the Video Layers Allocation RTP Header Extension
 pub const URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00";
 
 /// Top-level "allocation" for the Video Layers Allocation RTP Header Extension
@@ -182,13 +182,16 @@ impl VideoLayersAllocation {
     }
 }
 
-/// Serializer of Video Layers Allocation Header Extension
+/// Serializer of the Video Layers Allocation Header Extension
 #[derive(Debug)]
 pub struct Serializer;
 
 impl ExtensionSerializer for Serializer {
-    /// Write the extension to the buffer of bytes. Must return the number
-    /// of bytes written. This can be 0 if the extension could not be serialized.
+    fn needs_two_byte_header(&self, _ev: &ExtensionValues) -> bool {
+        // Writing isn't implemented yet
+        false
+    }
+
     fn write_to(&self, _buf: &mut [u8], ev: &ExtensionValues) -> usize {
         if ev.user_values.get::<VideoLayersAllocation>().is_some() {
             todo!();
@@ -204,7 +207,6 @@ impl ExtensionSerializer for Serializer {
         true
     }
 
-    /// Tell if this extension should be used for video media.
     fn is_video(&self) -> bool {
         true
     }

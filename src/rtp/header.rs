@@ -45,10 +45,16 @@ impl RtpHeader {
         buf[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
         buf[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
 
-        buf[12..14].copy_from_slice(&0xbede_u16.to_be_bytes());
+        let two_byte_header = exts.needs_two_byte_header(&self.ext_vals);
+        dbg!(two_byte_header);
+        buf[12..14].copy_from_slice(if two_byte_header {
+            &[0x10, 0x00]
+        } else {
+            &[0xBE, 0xDE]
+        });
 
         let ext_buf = &mut buf[16..];
-        let mut ext_len = exts.write_to(ext_buf, &self.ext_vals);
+        let mut ext_len = exts.write_to(ext_buf, &self.ext_vals, two_byte_header);
 
         let pad = 4 - ext_len % 4;
         if pad < 4 {
@@ -195,7 +201,7 @@ impl RtpHeader {
             if ext_type == 0xbede {
                 // one byte header
                 exts.parse(&buf[..ext_len], false, &mut ext);
-            } else if (ext_type >> 4) == 0x100 {
+            } else if (ext_type >> 4) == 0x0100 {
                 // two byte header
                 exts.parse(&buf[..ext_len], true, &mut ext);
             } else {
