@@ -46,7 +46,6 @@ impl RtpHeader {
         buf[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
 
         let two_byte_header = exts.needs_two_byte_header(&self.ext_vals);
-        dbg!(two_byte_header);
         buf[12..14].copy_from_slice(if two_byte_header {
             &[0x10, 0x00]
         } else {

@@ -428,17 +428,44 @@ impl ExtensionMap {
         }
     }
 
-    pub(crate) fn write_to(&self, ext_buf: &mut [u8], ev: &ExtensionValues) -> usize {
+    pub(crate) fn needs_two_byte_header(&self, ev: &ExtensionValues) -> bool {
+        self.0.iter().any(|x| {
+            if let Some(MapEntry {
+                ext: Extension::UnknownUri(_, serializer),
+                ..
+            }) = x
+            {
+                serializer.needs_two_byte_header(ev)
+            } else {
+                // Assume all the built-in ones fit into 16 bytes
+                false
+            }
+        })
+    }
+
+    pub(crate) fn write_to(
+        &self,
+        ext_buf: &mut [u8],
+        ev: &ExtensionValues,
+        two_byte_header: bool,
+    ) -> usize {
         let orig_len = ext_buf.len();
         let mut b = ext_buf;
 
         for (idx, x) in self.0.iter().enumerate() {
+            let header_len = if two_byte_header { 2 } else { 1 };
             if let Some(v) = x {
-                if let Some(n) = v.ext.write_to(&mut b[1..], ev) {
-                    assert!(n <= 16);
-                    assert!(n > 0);
-                    b[0] = (idx as u8 + 1) << 4 | (n as u8 - 1);
-                    b = &mut b[1 + n..];
+                if let Some(value_len) = v.ext.write_to(&mut b[header_len..], ev) {
+                    let id = idx + 1;
+                    if two_byte_header {
+                        b[0] = id as u8;
+                        b[1] = value_len as u8;
+                    } else {
+                        assert!(value_len > 0);
+                        assert!(value_len <= 16);
+                        b[0] = ((id << 4) | (value_len - 1)) as u8;
+                }
+                    b = &mut b[header_len + value_len..];
                 }
             }
         }
