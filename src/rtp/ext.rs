@@ -63,6 +63,10 @@ impl UnwindSafe for Extension {}
 
 /// Trait for parsing/writing user RTP header extensions.
 pub trait ExtensionSerializer: Debug + Send + Sync + 'static {
+    /// When calling write_to, if the size of the written value will exceed 16,
+    /// which requires a 2-byte extension header.
+    fn needs_two_byte_header(&self, ev: &ExtensionValues) -> bool;
+
     /// Write the extension to the buffer of bytes. Must return the number
     /// of bytes written. This can be 0 if the extension could not be serialized.
     fn write_to(&self, buf: &mut [u8], ev: &ExtensionValues) -> usize;
@@ -84,6 +88,9 @@ struct SdpUnknownUri;
 
 impl ExtensionSerializer for SdpUnknownUri {
     // If an unreachable happens, it's a bug.
+    fn needs_two_byte_header(&self, _ev: &ExtensionValues) -> bool {
+        unreachable!("Incorrect ExtensionSerializer::needs_two_byte_header")
+    }
     fn write_to(&self, _buf: &mut [u8], _ev: &ExtensionValues) -> usize {
         unreachable!("Incorrect ExtensionSerializer::write_to")
     }
@@ -464,7 +471,7 @@ impl ExtensionMap {
                         assert!(value_len > 0);
                         assert!(value_len <= 16);
                         b[0] = ((id << 4) | (value_len - 1)) as u8;
-                }
+                    }
                     b = &mut b[header_len + value_len..];
                 }
             }
@@ -846,9 +853,7 @@ impl UserExtensionValues {
     /// exts.user_values.set(MySpecialType(42));
     /// ```
     pub fn set<T: Send + Sync + 'static>(&mut self, val: T) {
-        self.map
-            .get_or_insert_with(HashMap::default)
-            .insert(TypeId::of::<T>(), Arc::new(val));
+        self.set_arc(Arc::new(val));
     }
 
     /// Get a user extension value (by type).
@@ -871,6 +876,13 @@ impl UserExtensionValues {
             .and_then(|map| map.get(&TypeId::of::<T>()))
             // unwrap here is OK because TypeId::of::<T> is guaranteed to be unique
             .map(|boxed| (&**boxed as &(dyn Any + 'static)).downcast_ref().unwrap())
+    }
+
+    /// Like .set(), but takes an Arc.
+    pub fn set_arc<T: Send + Sync + 'static>(&mut self, val: Arc<T>) {
+        self.map
+            .get_or_insert_with(HashMap::default)
+            .insert(TypeId::of::<T>(), val);
     }
 
     /// Like .get(), but clones and returns the Arc.
