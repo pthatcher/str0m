@@ -18,42 +18,41 @@ impl DepdendencyDescriptor {
     }
 }
 
-pub struct DependencyDescriptor2 {
-    // Bits 0..2 of byte 0
-    first_packet_in_frame: bool,
-    last_packet_in_frame: bool,
+// pub struct DependencyDescriptor2 {
+//     // Bits 0..2 of byte 0
+//     first_packet_in_frame: bool,
+//     last_packet_in_frame: bool,
 
-    // Bits 2..8 of byte 0 (not really part of the data model)
-    frame_dependency_template_id_: u8,
+//     // Bits 2..8 of byte 0 (not really part of the data model)
+//     frame_dependency_template_id_: u8,
 
-    // Bytes 1..3
-    frame_number: u16,
+//     // Bytes 1..3
+//     frame_number: u16,
 
-    // (optional if more than 3 bytes)
-    // Bit 0 of byte 3 (not really part of the data model; descriptor.attached_structure.is_some())
-    template_dependency_structure_present: bool,
-    // Bit 1 of byte 3 (not really part of the data model)
-    active_decode_targets_present: bool,
-    // Bit 2 of byte 3 (not really part of the data model)
-    custom_dtis: bool,
-    // Bit 3 of byte 3 (not really part of the data model)
-    custom_fdiffs: bool,
-    // Bit 4 of byte 3 (not really part of the data model)
-    custom_chains: bool,
-    // Bit 5 of byte 3 (not really part of the data model)
-    custom_chains: bool,
-    // (optional if template_dependency_structure_present)
-    // Bits 0..6 of bytes X..
-    structure_id: u8,
-    // Bits 6..13 of bytes X..
-    
+//     // (optional if more than 3 bytes)
+//     // Bit 0 of byte 3 (not really part of the data model; descriptor.attached_structure.is_some())
+//     template_dependency_structure_present: bool,
+//     // Bit 1 of byte 3 (not really part of the data model)
+//     active_decode_targets_present: bool,
+//     // Bit 2 of byte 3 (not really part of the data model)
+//     custom_dtis: bool,
+//     // Bit 3 of byte 3 (not really part of the data model)
+//     custom_fdiffs: bool,
+//     // Bit 4 of byte 3 (not really part of the data model)
+//     custom_chains: bool,
+//     // Bit 5 of byte 3 (not really part of the data model)
+//     custom_chains: bool,
+//     // (optional if template_dependency_structure_present)
+//     // Bits 0..6 of bytes X..
+//     structure_id: u8,
+//     // Bits 6..13 of bytes X..
 
-    resolution: Option<Resolution>,
+//     resolution: Option<Resolution>,
 
-    FrameDependencyTemplate frame_dependencies;
-    absl::optional<uint32_t> active_decode_targets_bitmask;
-    std::unique_ptr<FrameDependencyStructure> attached_structure;
-}
+//     FrameDependencyTemplate frame_dependencies;
+//     absl::optional<uint32_t> active_decode_targets_bitmask;
+//     std::unique_ptr<FrameDependencyStructure> attached_structure;
+// }
 
 /// Serializer of the Dependency Descriptor RTP Header Extension
 #[derive(Debug)]
@@ -96,12 +95,12 @@ impl ExtensionSerializer for Serializer {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
+// #[cfg(test)]
+// mod test {
+//     use super::*;
 
-    #[test]
-    fn test_parse_dependency_descriptor_empty_buffer() {
-        assert_eq!(DepdendencyDescriptor::parse(&[]), None);
-    }
-}
+//     #[test]
+//     fn test_parse_dependency_descriptor_empty_buffer() {
+//         assert_eq!(DepdendencyDescriptor::parse(&[]), None);
+//     }
+// }

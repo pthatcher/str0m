@@ -842,14 +842,10 @@ impl StreamTx {
         }
 
         // TODO: Be more scientific about these factors.
-        // const AVERAGE_PADDING_PACKET_SIZE: usize = 800;
+        const AVERAGE_PADDING_PACKET_SIZE: usize = 800;
         const FAKE_PADDING_DURATION_MILLIS: usize = 5;
 
-        // let fake_packets = self.padding / AVERAGE_PADDING_PACKET_SIZE;
-        // Warning: If this is greater than 0, then Pacer.maybe_create_padding_request will
-        // always return None and padding won't be sent, and the "fake packets" will never be drained
-        // and we'll be stuck in that state forever.  And this can cause a hot loop.
-        let fake_packets = 0;
+        let fake_packets = self.padding / AVERAGE_PADDING_PACKET_SIZE;
         let fake_millis = fake_packets * FAKE_PADDING_DURATION_MILLIS;
         let fake_duration = Duration::from_millis(fake_millis as u64);
 
