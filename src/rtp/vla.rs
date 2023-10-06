@@ -72,9 +72,9 @@ impl VideoLayersAllocation {
                 simulcast_streams: vec![],
             });
         }
-        let current_simulcast_stream_index = read_bits(b0, 0..2);
-        let simulcast_stream_count = read_bits(b0, 2..4) + 1;
-        let shared_spatial_layer_bitmask = read_bits(b0, 4..8);
+        let current_simulcast_stream_index = read_ms_bits_of_byte(b0, 0..2);
+        let simulcast_stream_count = read_ms_bits_of_byte(b0, 2..4) + 1;
+        let shared_spatial_layer_bitmask = read_ms_bits_of_byte(b0, 4..8);
 
         // Spatial layer bitmasks
         let (spatial_layer_actives, after_spatial_layer_bitmasks) =
@@ -221,8 +221,8 @@ impl ExtensionSerializer for Serializer {
 fn parse_leb_u64(bytes: &[u8]) -> (u64, &[u8]) {
     let mut result = 0;
     for (index, &byte) in bytes.iter().enumerate() {
-        let is_last = !read_bit(byte, 0);
-        let chunk = read_bits(byte, 1..8);
+        let is_last = !read_ms_bit_of_byte(byte, 0);
+        let chunk = read_ms_bits_of_byte(byte, 1..8);
         result |= (chunk as u64) << (7 * index);
         if is_last {
             return (result, &bytes[(index + 1)..]);
@@ -252,16 +252,19 @@ fn div_round_up(top: usize, bottom: usize) -> usize {
 
 #[allow(dead_code)]
 fn split_byte_in2(byte: u8) -> [u8; 2] {
-    [read_bits(byte, 0..4), read_bits(byte, 4..8)]
+    [
+        read_ms_bits_of_byte(byte, 0..4),
+        read_ms_bits_of_byte(byte, 4..8),
+    ]
 }
 
 #[allow(dead_code)]
 fn split_byte_in4(byte: u8) -> [u8; 4] {
     [
-        read_bits(byte, 0..2),
-        read_bits(byte, 2..4),
-        read_bits(byte, 4..6),
-        read_bits(byte, 6..8),
+        read_ms_bits_of_byte(byte, 0..2),
+        read_ms_bits_of_byte(byte, 2..4),
+        read_ms_bits_of_byte(byte, 4..6),
+        read_ms_bits_of_byte(byte, 6..8),
     ]
 }
 
@@ -269,7 +272,7 @@ fn truncated_bools_from_lower_4bits(bits: u8) -> Vec<bool> {
     let mut count = 0;
     let mut bools: Vec<bool> = (0..=3u8)
         .map(|index| {
-            let high = read_bit(bits, 7 - index);
+            let high = read_ms_bit_of_byte(bits, 7 - index);
             if high {
                 count = index + 1;
             }
@@ -280,13 +283,14 @@ fn truncated_bools_from_lower_4bits(bits: u8) -> Vec<bool> {
     bools
 }
 
+// TODO: Move to a common place where this can be reused.
 #[allow(dead_code)]
-fn read_bit(bits: u8, index: u8) -> bool {
-    read_bits(bits, index..(index + 1)) > 0
+fn read_ms_bit_of_byte(bits: u8, index: u8) -> bool {
+    read_ms_bits_of_byte(bits, index..(index + 1)) > 0
 }
 
 #[allow(dead_code)]
-fn read_bits(bits: u8, range: std::ops::Range<u8>) -> u8 {
+fn read_ms_bits_of_byte(bits: u8, range: std::ops::Range<u8>) -> u8 {
     assert!(range.end <= 8);
     (bits >> (8 - range.end)) & (0b1111_1111 >> (8 - range.len()))
 }
@@ -297,14 +301,14 @@ mod test {
 
     #[test]
     fn test_read_bits() {
-        assert_eq!(read_bits(0b1100_0000, 0..2), 0b0000_0011);
-        assert_eq!(read_bits(0b1001_0101, 0..2), 0b0000_0010);
-        assert_eq!(read_bits(0b0110_1010, 0..2), 0b0000_0001);
-        assert_eq!(read_bits(0b0011_1111, 0..2), 0b0000_0000);
-        assert_eq!(read_bits(0b0011_0000, 2..4), 0b0000_0011);
-        assert_eq!(read_bits(0b0110_0101, 2..4), 0b0000_0010);
-        assert_eq!(read_bits(0b1001_1010, 2..4), 0b0000_0001);
-        assert_eq!(read_bits(0b1100_1111, 2..4), 0b0000_0000);
+        assert_eq!(read_ms_bits_of_byte(0b1100_0000, 0..2), 0b0000_0011);
+        assert_eq!(read_ms_bits_of_byte(0b1001_0101, 0..2), 0b0000_0010);
+        assert_eq!(read_ms_bits_of_byte(0b0110_1010, 0..2), 0b0000_0001);
+        assert_eq!(read_ms_bits_of_byte(0b0011_1111, 0..2), 0b0000_0000);
+        assert_eq!(read_ms_bits_of_byte(0b0011_0000, 2..4), 0b0000_0011);
+        assert_eq!(read_ms_bits_of_byte(0b0110_0101, 2..4), 0b0000_0010);
+        assert_eq!(read_ms_bits_of_byte(0b1001_1010, 2..4), 0b0000_0001);
+        assert_eq!(read_ms_bits_of_byte(0b1100_1111, 2..4), 0b0000_0000);
     }
 
     #[test]
