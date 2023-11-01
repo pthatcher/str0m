@@ -47,8 +47,26 @@ pub enum NetError {
     Io(#[from] io::Error),
 }
 
+/// Type of protocol used in [`Transmit`] and [`Receive`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    /// UDP
+    Udp,
+    /// TCP (See RFC 4571 for framing)
+    Tcp,
+    /// TCP with fixed SSL Hello Exchange
+    /// See AsyncSSLServerSocket implementation for exchange details:
+    /// <https://webrtc.googlesource.com/src/+/refs/heads/main/rtc_base/server_socket_adapters.cc#19>
+    SslTcp,
+    /// TLS (only used via relay)
+    Tls,
+}
+
 /// An outgoing packet
 pub struct Transmit {
+    /// This protocol the socket is using.
+    pub proto: Protocol,
+
     /// The source socket this packet should be sent from.
     ///
     /// For ICE it's important to match up outgoing packets with source network interface.
@@ -71,9 +89,18 @@ impl From<Vec<u8>> for DatagramSend {
     }
 }
 
+impl From<DatagramSend> for Vec<u8> {
+    fn from(value: DatagramSend) -> Self {
+        value.0
+    }
+}
+
 #[derive(Debug)]
 /// Received incoming data.
 pub struct Receive<'a> {
+    /// The protocol the socket this received data originated from is using.
+    pub proto: Protocol,
+
     /// The socket this received data originated from.
     pub source: SocketAddr,
 
@@ -87,12 +114,14 @@ pub struct Receive<'a> {
 impl<'a> Receive<'a> {
     /// Creates a new instance by trying to parse the contents of `buf`.
     pub fn new(
+        proto: Protocol,
         source: SocketAddr,
         destination: SocketAddr,
         buf: &'a [u8],
     ) -> Result<Self, NetError> {
         let contents = DatagramRecv::try_from(buf)?;
         Ok(Receive {
+            proto,
             source,
             destination,
             contents,
@@ -177,6 +206,7 @@ impl<'a> TryFrom<&'a Transmit> for Receive<'a> {
 
     fn try_from(t: &'a Transmit) -> Result<Self, Self::Error> {
         Ok(Receive {
+            proto: t.proto,
             source: t.source,
             destination: t.destination,
             contents: DatagramRecv::try_from(&t.contents[..])?,
@@ -212,4 +242,37 @@ impl fmt::Debug for DatagramRecv<'_> {
         }
     }
     //
+}
+
+impl TryFrom<&str> for Protocol {
+    type Error = ();
+
+    fn try_from(proto: &str) -> Result<Self, Self::Error> {
+        let proto = proto.to_lowercase();
+        match proto.as_str() {
+            "udp" => Ok(Protocol::Udp),
+            "tcp" => Ok(Protocol::Tcp),
+            "ssltcp" => Ok(Protocol::SslTcp),
+            "tls" => Ok(Protocol::Tls),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<Protocol> for &str {
+    fn from(proto: Protocol) -> Self {
+        match proto {
+            Protocol::Udp => "udp",
+            Protocol::Tcp => "tcp",
+            Protocol::SslTcp => "ssltcp",
+            Protocol::Tls => "tls",
+        }
+    }
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let x: &str = (*self).into();
+        write!(f, "{}", x)
+    }
 }

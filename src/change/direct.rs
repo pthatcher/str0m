@@ -10,7 +10,17 @@ use crate::RtcError;
 
 /// Direct change strategy.
 ///
-/// Makes immediate changes to the Rtc session without any Sdp OFFER/ANSWER.
+/// Makes immediate changes to the Rtc session without any SDP OFFER/ANSWER. This
+/// is an alternative to [`Rtc::sdp_api()`] for use cases when you don’t want to use SDP
+/// (or when you want to write RTP directly).
+///
+/// To use the Direct API together with a browser client, you would need to make
+/// the equivalent changes on the browser side by manually generating the correct
+/// SDP OFFER/ANSWER to make the `RTCPeerConnection` match str0m's state.
+///
+/// To change str0m's state through the Direct API followed by the SDP API produce
+/// an SDP OFFER is not a supported use case. Either pick SDP API and let str0m handle
+/// the OFFER/ANSWER or use Direct API and deal with SDP manually. Not both.
 ///
 /// <div class="warning"><b>This is a low level API.</b>
 ///
@@ -97,6 +107,11 @@ impl<'a> DirectApi<'a> {
         id
     }
 
+    /// Close a data channel.
+    pub fn close_data_channel(&mut self, channel_id: ChannelId) {
+        self.rtc.chan.close_channel(channel_id, &mut self.rtc.sctp);
+    }
+
     /// Set whether to enable ice-lite.
     pub fn set_ice_lite(&mut self, ice_lite: bool) {
         self.rtc.ice.set_ice_lite(ice_lite);
@@ -165,10 +180,17 @@ impl<'a> DirectApi<'a> {
         mid: Mid,
         rid: Option<Rid>,
     ) -> &mut StreamRx {
+        let Some(_media) = self.rtc.session.media_by_mid(mid) else {
+            panic!("No media declared for mid: {}", mid);
+        };
+
+        // By default we do not suppress nacks, this has to be called explicitly by the user of direct API.
+        let suppress_nack = false;
+
         self.rtc
             .session
             .streams
-            .expect_stream_rx(ssrc, rtx, mid, rid)
+            .expect_stream_rx(ssrc, rtx, mid, rid, suppress_nack, None)
     }
 
     /// Remove the receive stream for the given SSRC.

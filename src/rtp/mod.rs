@@ -14,12 +14,11 @@ mod dir;
 pub use dir::Direction;
 
 mod mtime;
-pub(crate) use mtime::InstantExt;
 pub use mtime::MediaTime;
 
 mod header;
 pub use header::RtpHeader;
-pub(crate) use header::{extend_u16, extend_u32, extend_u8};
+pub(crate) use header::{extend_u15, extend_u16, extend_u32, extend_u7, extend_u8};
 
 mod srtp;
 pub(crate) use srtp::SrtpContext;
@@ -32,7 +31,7 @@ mod bandwidth;
 pub use bandwidth::{Bitrate, DataSize};
 
 // Max in the RFC 3550 is 255 bytes, we limit it to be modulus 16 for SRTP and to match libWebRTC
-pub const MAX_BLANK_PADDING_PAYLOAD_SIZE: usize = 224;
+pub const MAX_BLANK_PADDING_PAYLOAD_SIZE: usize = 240;
 
 /// Errors that can arise in RTP.
 #[derive(Debug, Error)]

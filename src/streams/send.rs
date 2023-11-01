@@ -13,7 +13,7 @@ use crate::media::MediaKind;
 use crate::packet::QueuePriority;
 use crate::packet::QueueSnapshot;
 use crate::packet::QueueState;
-use crate::rtp_::{extend_u16, Descriptions, InstantExt, ReportList, Rtcp};
+use crate::rtp_::{extend_u16, Descriptions, ReportList, Rtcp};
 use crate::rtp_::{ExtensionMap, ReceptionReport, RtpHeader};
 use crate::rtp_::{ExtensionValues, MediaTime, Mid, NackEntry};
 use crate::rtp_::{Pt, Rid, RtcpFb, SenderInfo, SenderReport, Ssrc};
@@ -23,6 +23,7 @@ use crate::session::PacketReceipt;
 use crate::stats::MediaEgressStats;
 use crate::stats::StatsSnapshot;
 use crate::util::value_history::ValueHistory;
+use crate::util::InstantExt;
 use crate::util::{already_happened, calculate_rtt_ms, not_happening};
 use crate::RtcError;
 
@@ -289,6 +290,9 @@ impl StreamTx {
             // in handle_timeout() we delegate to self.send_queue.handle_timeout() to mark the enqueued
             // timestamp of all packets that are about to be sent.
             timestamp: not_happening(),
+
+            // This is only relevant for incoming RTP packets.
+            last_sender_info: None,
         };
 
         self.send_queue.push(packet);
@@ -489,8 +493,7 @@ impl StreamTx {
     }
 
     fn poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
-        let from = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
-        let ratio = self.rtx_ratio_downsampled(now, from);
+        let ratio = self.rtx_ratio_downsampled(now);
 
         // If we hit the cap, stop doing resends by clearing those we have queued.
         if ratio > 0.15_f32 {
@@ -501,14 +504,16 @@ impl StreamTx {
         self.do_poll_packet_resend(now)
     }
 
-    fn rtx_ratio_downsampled(&mut self, now: Instant, from: Instant) -> f32 {
+    fn rtx_ratio_downsampled(&mut self, now: Instant) -> f32 {
         let (value, ts) = self.rtx_ratio;
         if now - ts < Duration::from_millis(50) {
             // not worth re-evaluating, return the old value
             return value;
         }
-        let bytes_transmitted = self.stats.bytes_transmitted.sum_since(from);
-        let bytes_retransmitted = self.stats.bytes_retransmitted.sum_since(from);
+
+        // bytes stats refer to the last second by default
+        let bytes_transmitted = self.stats.bytes_transmitted.sum();
+        let bytes_retransmitted = self.stats.bytes_retransmitted.sum();
         let ratio = bytes_retransmitted as f32 / (bytes_retransmitted + bytes_transmitted) as f32;
         let ratio = if ratio.is_finite() { ratio } else { 0_f32 };
         self.rtx_ratio = (ratio, now);
@@ -724,7 +729,7 @@ impl StreamTx {
         s.values.push((SdesType::CNAME, cname.to_string()));
 
         let mut d = Descriptions {
-            reports: ReportList::new(),
+            reports: Box::new(ReportList::new()),
         };
         d.reports.push(s);
 
@@ -732,12 +737,12 @@ impl StreamTx {
     }
 
     fn sender_info(&self, now: Instant) -> SenderInfo {
-        let rtp_time = self.current_rtp_time(now).map(|t| t.numer()).unwrap_or(0);
+        let rtp_time = self.current_rtp_time(now).unwrap_or(MediaTime::ZERO);
 
         SenderInfo {
             ssrc: self.ssrc,
-            ntp_time: MediaTime::new_ntp_time(now),
-            rtp_time: rtp_time as u32,
+            ntp_time: now,
+            rtp_time,
             sender_packet_count: self.stats.packets as u32,
             sender_octet_count: self.stats.bytes as u32,
         }

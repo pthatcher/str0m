@@ -1,14 +1,19 @@
 #![allow(unused)]
+use std::io::Cursor;
 use std::net::Ipv4Addr;
 use std::ops::{Deref, DerefMut};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use pcap_file::pcap::PcapReader;
 use rand::Rng;
 use str0m::change::SdpApi;
 use str0m::format::Codec;
 use str0m::format::PayloadParams;
+use str0m::net::Protocol;
 use str0m::net::Receive;
+use str0m::rtp::ExtensionMap;
+use str0m::rtp::RtpHeader;
 use str0m::Candidate;
 use str0m::{Event, Input, Output, Rtc, RtcError};
 use tracing::info_span;
@@ -77,6 +82,7 @@ pub fn progress(l: &mut TestRtc, r: &mut TestRtc) -> Result<(), RtcError> {
                 let input = Input::Receive(
                     f.last,
                     Receive {
+                        proto: v.proto,
                         source: v.source,
                         destination: v.destination,
                         contents: (&*data).try_into()?,
@@ -117,6 +123,7 @@ pub fn progress_with_loss(l: &mut TestRtc, r: &mut TestRtc, loss: f32) -> Result
                 let input = Input::Receive(
                     f.last,
                     Receive {
+                        proto: v.proto,
                         source: v.source,
                         destination: v.destination,
                         contents: (&*data).try_into()?,
@@ -137,16 +144,18 @@ pub fn progress_with_loss(l: &mut TestRtc, r: &mut TestRtc, loss: f32) -> Result
 ///
 /// The closure is passed the [`SdpApi`] for the offer side to make any changes, these are then
 /// applied locally and the offer is negotiated with the answerer.
-pub fn negotiate<F>(offerer: &mut TestRtc, answerer: &mut TestRtc, mut do_change: F)
+pub fn negotiate<F, R>(offerer: &mut TestRtc, answerer: &mut TestRtc, mut do_change: F) -> R
 where
-    F: FnMut(&mut SdpApi),
+    F: FnMut(&mut SdpApi) -> R,
 {
-    let (offer, pending) = offerer.span.in_scope(|| {
+    let (offer, pending, result) = offerer.span.in_scope(|| {
         let mut change = offerer.rtc.sdp_api();
 
-        do_change(&mut change);
+        let result = do_change(&mut change);
 
-        change.apply().unwrap()
+        let (offer, pending) = change.apply().unwrap();
+
+        (offer, pending, result)
     });
 
     let answer = answerer
@@ -160,6 +169,8 @@ where
             .accept_answer(pending, answer)
             .unwrap();
     });
+
+    result
 }
 
 impl Deref for TestRtc {
@@ -209,8 +220,8 @@ pub fn connect_l_r() -> (TestRtc, TestRtc) {
     let mut l = TestRtc::new_with_rtc(info_span!("L"), rtc1);
     let mut r = TestRtc::new_with_rtc(info_span!("R"), rtc2);
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into()).unwrap();
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into()).unwrap();
+    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp").unwrap();
+    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp").unwrap();
     l.add_local_candidate(host1.clone());
     l.add_remote_candidate(host2.clone());
     r.add_local_candidate(host2);
@@ -245,4 +256,34 @@ pub fn connect_l_r() -> (TestRtc, TestRtc) {
     }
 
     (l, r)
+}
+
+pub fn vp8_data() -> Vec<(Duration, RtpHeader, Vec<u8>)> {
+    let reader = Cursor::new(include_bytes!("data/vp8.pcap"));
+    let mut r = PcapReader::new(reader).expect("vp8 pcap reader");
+
+    let exts = ExtensionMap::standard();
+
+    let mut ret = vec![];
+
+    let mut first = None;
+
+    while let Some(pkt) = r.next_packet() {
+        let pkt = pkt.unwrap();
+
+        if first.is_none() {
+            first = Some(pkt.timestamp);
+        }
+        let relative_time = pkt.timestamp - first.unwrap();
+
+        // This magic number 42 is the ethernet/IP/UDP framing of the packet.
+        let rtp_data = &pkt.data[42..];
+
+        let header = RtpHeader::parse(rtp_data, &exts).unwrap();
+        let payload = &rtp_data[header.header_len..];
+
+        ret.push((relative_time, header, payload.to_vec()));
+    }
+
+    ret
 }

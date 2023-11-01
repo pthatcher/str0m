@@ -1,4 +1,9 @@
-use super::{FeedbackMessageType, MediaTime, RtcpType, Ssrc};
+use std::time::Instant;
+
+use crate::rtp_::MediaTime;
+use crate::util::InstantExt;
+
+use super::{FeedbackMessageType, RtcpType, Ssrc};
 use super::{ReceptionReport, ReportList, RtcpHeader, RtcpPacket};
 
 /// A report of packets sent.
@@ -12,13 +17,21 @@ pub struct SenderReport {
 }
 
 /// Information about a stream being sent.
-#[allow(missing_docs)]
+///
+/// A subset of the information contained in Sender Reports(SR).
+///
+/// See [RFC 3550 6.4.1](https://www.rfc-editor.org/rfc/rfc3550#section-6.4.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SenderInfo {
+    /// The SSRC of the SR originator.
     pub ssrc: Ssrc,
-    pub ntp_time: MediaTime,
-    pub rtp_time: u32,
+    /// The 64 bit NTP timestamp converted to an [`Instant`].
+    pub ntp_time: Instant,
+    /// The RTP timestamp that corresponds to the same point in time as the NTP timestamp above.
+    pub rtp_time: MediaTime,
+    /// The total number of packets the sender had sent when this information was generated.
     pub sender_packet_count: u32,
+    /// The total number of octets the sender had sent when this information was generated.
     pub sender_octet_count: u32,
 }
 
@@ -62,7 +75,7 @@ impl SenderInfo {
         let mt = self.ntp_time.as_ntp_64();
         buf[4..12].copy_from_slice(&mt.to_be_bytes());
 
-        buf[12..16].copy_from_slice(&self.rtp_time.to_be_bytes());
+        buf[12..16].copy_from_slice(&(self.rtp_time.numer() as u32).to_be_bytes());
         buf[16..20].copy_from_slice(&self.sender_packet_count.to_be_bytes());
         buf[20..24].copy_from_slice(&self.sender_octet_count.to_be_bytes());
     }
@@ -110,7 +123,7 @@ impl<'a> TryFrom<&'a [u8]> for SenderInfo {
         let ntp_time = u64::from_be_bytes([
             buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
         ]);
-        let ntp_time = MediaTime::from_ntp_64(ntp_time);
+        let ntp_time = Instant::from_ntp_64(ntp_time);
 
         // https://www.cs.columbia.edu/~hgs/rtp/faq.html#timestamp-computed
         // For video, time clock rate is fixed at 90 kHz. The timestamps generated
@@ -120,6 +133,8 @@ impl<'a> TryFrom<&'a [u8]> for SenderInfo {
         // Thus, for a 30 f/s video, timestamps would increase by 3,000 for each
         // frame, for a 25 f/s video by 3,600 for each frame.
         let rtp_time = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        // The base (90kHz etc) is set higher up the stack (in StreamRx to be precise).
+        let rtp_time = MediaTime::new(rtp_time as i64, 1);
 
         let sender_packet_count = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
         let sender_octet_count = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);

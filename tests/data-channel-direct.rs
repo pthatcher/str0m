@@ -17,8 +17,8 @@ pub fn data_channel_direct() -> Result<(), RtcError> {
     let rtc_r = RtcConfig::new().set_ice_lite(true).build();
     let mut r = TestRtc::new_with_rtc(info_span!("R"), rtc_r);
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into())?;
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into())?;
+    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
+    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
     l.add_local_candidate(host1.clone());
     l.add_remote_candidate(host2.clone());
     r.add_local_candidate(host2);
@@ -77,11 +77,25 @@ pub fn data_channel_direct() -> Result<(), RtcError> {
         }
     }
 
-    assert!(r.events.len() > 120);
+    l.direct_api().close_data_channel(cid);
+
+    loop {
+        progress(&mut l, &mut r)?;
+
+        if l.duration() > Duration::from_secs(12) {
+            break;
+        }
+    }
+
     assert!(l
         .events
         .iter()
         .any(|(_, event)| event == &Event::ChannelOpen(cid, "my-chan".into())));
+    assert!(r.events.len() > 120);
+    assert!(l
+        .events
+        .iter()
+        .any(|(_, event)| event == &Event::ChannelClose(cid)));
 
     Ok(())
 }

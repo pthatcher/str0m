@@ -19,7 +19,7 @@
 //! # Usage
 //!
 //! The [`chat`][x-chat] example shows how to connect multiple browsers
-//! together and act as an SFU (Signal Forwarding Unit). The example
+//! together and act as an SFU (Selective Forwarding Unit). The example
 //! multiplexes all traffic over one server UDP socket and uses two threads
 //! (one for the web server, and one for the SFU loop).
 //!
@@ -57,7 +57,7 @@
 //!
 //! //  Add some ICE candidate such as a locally bound UDP port.
 //! let addr = "1.2.3.4:5000".parse().unwrap();
-//! let candidate = Candidate::host(addr).unwrap();
+//! let candidate = Candidate::host(addr, "udp").unwrap();
 //! rtc.add_local_candidate(candidate);
 //!
 //! // Accept an incoming offer from the remote peer
@@ -84,7 +84,7 @@
 //!
 //! // Add some ICE candidate such as a locally bound UDP port.
 //! let addr = "1.2.3.4:5000".parse().unwrap();
-//! let candidate = Candidate::host(addr).unwrap();
+//! let candidate = Candidate::host(addr, "udp").unwrap();
 //! rtc.add_local_candidate(candidate);
 //!
 //! // Create a `SdpApi`. The change lets us make multiple changes
@@ -114,7 +114,7 @@
 //!
 //! ```no_run
 //! # use str0m::{Rtc, Output, IceConnectionState, Event, Input};
-//! # use str0m::net::Receive;
+//! # use str0m::net::{Receive, Protocol};
 //! # use std::io::ErrorKind;
 //! # use std::net::UdpSocket;
 //! # use std::time::Instant;
@@ -183,6 +183,7 @@
 //!             Input::Receive(
 //!                 Instant::now(),
 //!                 Receive {
+//!                     proto: Protocol::Udp,
 //!                     source,
 //!                     destination: socket.local_addr().unwrap(),
 //!                     contents: buf.as_slice().try_into().unwrap(),
@@ -230,9 +231,9 @@
 //! let pt = writer.payload_params()[0].pt();
 //!
 //! // Write the data
-//! let wallclock = todo!();  // Absolute time of the data
-//! let media_time = todo!(); // Media time, in RTP time
-//! let data = todo!();       // Actual data
+//! let wallclock = todo!();   // Absolute time of the data
+//! let media_time = todo!();  // Media time, in RTP time
+//! let data: &[u8] = todo!(); // Actual data
 //! writer.write(pt, wallclock, media_time, data).unwrap();
 //! ```
 //!
@@ -444,7 +445,7 @@
 //!
 //! ## Panics, Errors and unwraps
 //!
-//! Rust adheres to [fail-last][ff]. That means rather than brushing state
+//! Rust adheres to [fail-fast][ff]. That means rather than brushing state
 //! bugs under the carpet, it panics. We make a distinction between errors and
 //! bugs.
 //!
@@ -476,6 +477,84 @@
 //! to safely discard a faulty `Rtc` instance. Since `Rtc` has no internal threads, locks or async
 //! tasks, discarding the instance never risk poisoning locks or other issues that can happen
 //! when catching a panic.
+//!
+//! ## FAQ
+//!
+//! ### Features
+//!
+//! Below is a brief comparison of features between libWebRTC and str0m to help you determine
+//! if str0m is suitable for your project.
+//!
+//! | Feature                  | str0m              | libWebRTC          |
+//! | ------------------------ | ------------------ | ------------------ |
+//! | Peer Connection API      | :x:                | :white_check_mark: |
+//! | SDP                      | :white_check_mark: | :white_check_mark: |
+//! | ICE                      | :white_check_mark: | :white_check_mark: |
+//! | Data Channels            | :white_check_mark: | :white_check_mark: |
+//! | Send/Recv Reports        | :white_check_mark: | :white_check_mark: |
+//! | Transport Wide CC        | :white_check_mark: | :white_check_mark: |
+//! | Bandwidth Estimation     | :white_check_mark: | :white_check_mark: |
+//! | Simulcast                | :white_check_mark: | :white_check_mark: |
+//! | NACK                     | :white_check_mark: | :white_check_mark: |
+//! | Packetize                | :white_check_mark: | :white_check_mark: |
+//! | Fixed Depacketize Buffer | :white_check_mark: | :white_check_mark: |
+//! | Adaptive Jitter Buffer   | :x:                | :white_check_mark: |
+//! | Video/audio capture      | :x:                | :white_check_mark: |
+//! | Video/audio encode       | :x:                | :white_check_mark: |
+//! | Video/audio decode       | :x:                | :white_check_mark: |
+//! | Audio render             | :x:                | :white_check_mark: |
+//! | Turn                     | :x:                | :white_check_mark: |
+//! | Network interface enum   | :x:                | :white_check_mark: |
+//!
+//! ### Platform Support
+//!
+//! Platforms str0m is compiled and tested on:
+//!
+//! | Platform                   | Compiled          | Tested            |
+//! | -------------------------- | ----------------- | ----------------- |
+//! | `x86_64-pc-windows-msvc`   | :white_check_mark:| :white_check_mark:|
+//! | `x86_64-unknown-linux-gnu` | :white_check_mark:| :white_check_mark:|
+//! | `x86_64-apple-darwin`      | :white_check_mark:| :white_check_mark:|
+//!
+//! If your platform isn't listed but is supported by Rust, we'd love for you to give str0m a try and
+//! share your experience. We greatly appreciate your feedback!
+//!
+//! ### Does str0m support IPv4, IPv6, UDP and TCP?
+//!
+//! Certainly! str0m fully support IPv4, IPv6, UDP and TCP protocols.
+//!
+//! ### Can I utilize str0m with any Rust async runtime?
+//!
+//! Absolutely! str0m is fully sync, ensuring that it integrates seamlessly with any Rust async
+//! runtime you opt for.
+//!
+//! ### Can I create a client with str0m?
+//!
+//! Of course! You have the freedom to create a client with str0m. However, please note that some
+//! common client features like media encoding, decoding, and capture are not included in str0m. But
+//! don't let that stop you from building amazing applications!
+//!
+//! ### Can I use str0m in a media server?
+//!
+//! Yes! str0m excels as a server component with support for both RTP API and Sample API. You can
+//! easily build that recording server or SFU you dreamt of in Rust!
+//!
+//! ### Can I deploy the chat example into production?
+//!
+//! While the chat example showcases how to use str0m's API, it's not intended for production use or
+//! heavy load. Writing a full-featured SFU or MCU (Multipoint Control Unit) is a significant
+//! undertaking, involving various design decisions based on production requirements.
+//!
+//! ### Discovered a bug? Here's how to share it with us
+//!
+//! We'd love to hear about it! Please submit an issue and consider joining our Zulip community
+//! to discuss further. For a seamless reporting experience, refer to this exemplary
+//! bug report: <https://github.com/algesten/str0m/issues/382>. We appreciate your contribution
+//! to making str0m better!
+//!
+//! ### I am allergic to SDP can you help me?
+//!
+//! Yes use the direct API!
 //!
 //! [sansio]:     https://sans-io.readthedocs.io
 //! [quinn]:      https://github.com/quinn-rs/quinn
@@ -510,6 +589,7 @@ use std::time::{Duration, Instant};
 use streams::RtpPacket;
 use streams::StreamPaused;
 use thiserror::Error;
+use util::InstantExt;
 
 mod dtls;
 use dtls::DtlsCert;
@@ -517,10 +597,10 @@ use dtls::Fingerprint;
 use dtls::{Dtls, DtlsEvent};
 
 mod ice;
-pub use ice::Candidate;
 use ice::IceAgent;
 use ice::IceAgentEvent;
 use ice::IceCreds;
+pub use ice::{Candidate, CandidateKind};
 
 mod io;
 use io::DatagramRecv;
@@ -530,7 +610,7 @@ mod packet;
 #[path = "rtp/mod.rs"]
 mod rtp_;
 use rtp_::Bitrate;
-use rtp_::{Extension, ExtensionMap, InstantExt};
+use rtp_::{Extension, ExtensionMap};
 
 /// Low level RTP access.
 pub mod rtp {
@@ -606,7 +686,7 @@ mod streams;
 
 /// Network related types to get socket data in/out of [`Rtc`].
 pub mod net {
-    pub use crate::io::{DatagramRecv, DatagramSend, Receive, Transmit};
+    pub use crate::io::{DatagramRecv, DatagramSend, Protocol, Receive, Transmit};
 }
 
 /// Various error types.
@@ -698,7 +778,7 @@ pub enum RtcError {
 
     /// [`SdpApi`] was not done in a correct order.
     ///
-    /// For [`SdpApi`][change::SdpApi]:
+    /// For [`SdpApi`]:
     ///
     /// 1. We created an [`SdpOffer`][change::SdpOffer].
     /// 2. The remote side created an [`SdpOffer`][change::SdpOffer] at the same time.
@@ -760,6 +840,7 @@ pub struct Rtc {
 }
 
 struct SendAddr {
+    proto: net::Protocol,
     source: SocketAddr,
     destination: SocketAddr,
 }
@@ -767,7 +848,6 @@ struct SendAddr {
 /// Events produced by [`Rtc::poll_output()`].
 #[derive(Debug)]
 #[non_exhaustive]
-#[allow(clippy::large_enum_variant)]
 #[rustfmt::skip]
 pub enum Event {
     // =================== ICE related events ===================
@@ -852,11 +932,22 @@ pub enum Event {
     /// Enable using [`RtcConfig::enable_raw_packets()`].
     /// This clones data, and is therefore expensive.
     /// Should not be enabled outside of tests and troubleshooting.
-    RawPacket(RawPacket),
+    RawPacket(Box<RawPacket>),
 
     /// Internal for passing data from Session to Rtc.
     #[doc(hidden)]
     Error(RtcError),
+}
+
+impl Event {
+    /// Reference to the [`RawPacket`] if this is indeed an `Event::RawPacket`.
+    pub fn as_raw_packet(&self) -> Option<&RawPacket> {
+        if let Self::RawPacket(boxed) = &self {
+            Some(&**boxed)
+        } else {
+            None
+        }
+    }
 }
 
 /// Input as expected by [`Rtc::handle_input()`]. Either network data or a timeout.
@@ -920,8 +1011,11 @@ impl Rtc {
         Rtc {
             alive: true,
             ice,
-            dtls: Dtls::new(config.dtls_cert, config.fingerprint_verification)
-                .expect("DTLS to init without problem"),
+            dtls: Dtls::new(
+                config.dtls_cert.unwrap_or_else(DtlsCert::new),
+                config.fingerprint_verification,
+            )
+            .expect("DTLS to init without problem"),
             session,
             sctp: RtcSctp::new(),
             chan: ChannelHandler::default(),
@@ -991,7 +1085,7 @@ impl Rtc {
     /// let mut rtc = Rtc::new();
     ///
     /// let a = "127.0.0.1:5000".parse().unwrap();
-    /// let c = Candidate::host(a).unwrap();
+    /// let c = Candidate::host(a, "udp").unwrap();
     ///
     /// rtc.add_local_candidate(c);
     /// ```
@@ -1014,7 +1108,7 @@ impl Rtc {
     /// let mut rtc = Rtc::new();
     ///
     /// let a = "1.2.3.4:5000".parse().unwrap();
-    /// let c = Candidate::host(a).unwrap();
+    /// let c = Candidate::host(a, "udp").unwrap();
     ///
     /// rtc.add_remote_candidate(c);
     /// ```
@@ -1085,7 +1179,7 @@ impl Rtc {
     /// // Match incoming PT to an outgoing PT.
     /// let pt = writer.match_params(data.params).unwrap();
     ///
-    /// writer.write(pt, data.network_time, data.time, &data.data).unwrap();
+    /// writer.write(pt, data.network_time, data.time, data.data).unwrap();
     /// ```
     ///
     /// This is a sample level API: For RTP level see [`DirectApi::stream_tx()`] and [`DirectApi::stream_rx()`].
@@ -1188,22 +1282,24 @@ impl Rtc {
                 IceAgentEvent::IceConnectionStateChange(v) => {
                     return Ok(Output::Event(Event::IceConnectionStateChange(v)))
                 }
-                IceAgentEvent::DiscoveredRecv { source } => {
-                    info!("ICE remote address: {:?}", source);
+                IceAgentEvent::DiscoveredRecv { proto, source } => {
+                    info!("ICE remote address: {:?}/{:?}", source, proto);
                     self.remote_addrs.push(source);
                     while self.remote_addrs.len() > 20 {
                         self.remote_addrs.remove(0);
                     }
                 }
                 IceAgentEvent::NominatedSend {
+                    proto,
                     source,
                     destination,
                 } => {
                     info!(
-                        "ICE nominated send from: {:?} to: {:?}",
-                        source, destination
+                        "ICE nominated send from: {:?} to: {:?} with protocol {:?}",
+                        source, destination, proto,
                     );
                     self.send_addr = Some(SendAddr {
+                        proto,
                         source,
                         destination,
                     });
@@ -1262,6 +1358,11 @@ impl Rtc {
                             }
                         }
                         packets.pop_front();
+                        // If there are still packets, they are sent on next
+                        // poll_output()
+                        if !packets.is_empty() {
+                            self.sctp.push_back_transmit(packets);
+                        }
                         break;
                     }
                 }
@@ -1275,6 +1376,7 @@ impl Rtc {
                         warn!("Drop ChannelClose event for id: {:?}", id);
                         continue;
                     };
+                    self.chan.remove_channel(id);
                     return Ok(Output::Event(Event::ChannelClose(id)));
                 }
                 SctpEvent::Data { id, binary, data } => {
@@ -1316,6 +1418,7 @@ impl Rtc {
 
             if let Some(contents) = datagram {
                 let t = net::Transmit {
+                    proto: send.proto,
                     source: send.source,
                     destination: send.destination,
                     contents,
@@ -1577,7 +1680,7 @@ impl Rtc {
 #[derive(Debug, Clone)]
 pub struct RtcConfig {
     local_ice_credentials: IceCreds,
-    dtls_cert: DtlsCert,
+    dtls_cert: Option<DtlsCert>,
     fingerprint_verification: bool,
     ice_lite: bool,
     codec_config: CodecConfig,
@@ -1604,16 +1707,41 @@ impl RtcConfig {
         &self.local_ice_credentials
     }
 
-    /// The configured DtlsCert.
+    /// Get the configured DTLS certificate, if set.
     ///
-    /// The certificate is uniquely created per new RtcConfig.
-    pub fn dtls_cert(&self) -> &DtlsCert {
-        &self.dtls_cert
+    /// Returns [`None`] if no DTLS certificate is set. In such cases,
+    /// the certificate will be created on build and you can use the
+    /// direct API on an [`Rtc`] instance to obtain the local
+    /// DTLS fingerprint.
+    ///
+    /// ```
+    /// use str0m::RtcConfig;
+    ///
+    /// let fingerprint = RtcConfig::default()
+    ///     .build()
+    ///     .direct_api()
+    ///     .local_dtls_fingerprint();
+    /// ```
+    pub fn dtls_cert(&self) -> Option<&DtlsCert> {
+        self.dtls_cert.as_ref()
     }
 
-    /// Set DTLS certification.
+    /// Set the DTLS certificate for secure communication.
+    ///
+    /// Generating a certificate can be a time-consuming process.
+    /// Use this API to reuse a previously created [`DtlsCert`] if available.
+    ///
+    /// ```
+    /// use str0m::RtcConfig;
+    /// use str0m::change::DtlsCert;
+    ///
+    /// let dtls_cert = DtlsCert::new();
+    ///
+    /// let rtc_config = RtcConfig::default()
+    ///     .set_dtls_cert(dtls_cert);
+    /// ```
     pub fn set_dtls_cert(mut self, dtls_cert: DtlsCert) -> Self {
-        self.dtls_cert = dtls_cert;
+        self.dtls_cert = Some(dtls_cert);
         self
     }
 
@@ -1940,7 +2068,7 @@ impl RtcConfig {
 
     /// Make the entire Rtc be in RTP mode.
     ///
-    /// This means all media, read from [`RtpPacket`][crate::rtp::RtpPacket] and written to
+    /// This means all media, read from [`RtpPacket`] and written to
     /// [`StreamTx::write_rtp`][crate::rtp::StreamTx::write_rtp] are RTP packetized.
     /// It bypasses all internal packetization/depacketization inside str0m.
     ///
@@ -1983,7 +2111,7 @@ impl Default for RtcConfig {
     fn default() -> Self {
         Self {
             local_ice_credentials: IceCreds::new(),
-            dtls_cert: DtlsCert::new(),
+            dtls_cert: None,
             fingerprint_verification: true,
             ice_lite: false,
             codec_config: CodecConfig::new_with_defaults(),
@@ -2077,6 +2205,13 @@ mod test {
     fn rtc_is_unwind_safe() {
         fn is_unwind_safe<T: UnwindSafe>(_t: T) {}
         is_unwind_safe(Rtc::new());
+    }
+
+    #[test]
+    fn event_is_reasonably_sized() {
+        let n = std::mem::size_of::<Event>();
+        println!("{:?}", n);
+        assert!(n < 450);
     }
 }
 

@@ -35,6 +35,7 @@ use null::{NullDepacketizer, NullPacketizer};
 
 mod buffer_rx;
 pub(crate) use buffer_rx::{Depacketized, DepacketizingBuffer, RtpMeta};
+mod vp8_contiguity;
 
 mod payload;
 pub(crate) use payload::Payloader;
@@ -45,8 +46,6 @@ pub(crate) use bwe::SendSideBandwithEstimator;
 mod pacer;
 pub(crate) use pacer::{LeakyBucketPacer, NullPacer, Pacer, PacerImpl};
 pub(crate) use pacer::{QueuePriority, QueueSnapshot, QueueState};
-
-mod ring;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Types of media.

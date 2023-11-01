@@ -43,7 +43,6 @@ mod rtcpfb;
 pub use rtcpfb::RtcpFb;
 
 use super::extend_u16;
-use super::MediaTime;
 use super::SeqNo;
 use super::Ssrc;
 
@@ -289,8 +288,7 @@ impl Rtcp {
             // if we manage to merge anything into fb_a.
             let mut any_change = false;
 
-            // j goes from the item _after_ i and indexes fb_b.
-            #[allow(clippy::needless_range_loop)]
+            // fb_b goes from the item _after_ i
             for fb_b in pack_from {
                 // if fb_a is full (or empty), we don't want to move any more elements into fb_a.
                 if fb_a.is_full() || fb_a.is_empty() {
@@ -316,7 +314,7 @@ impl Rtcp {
             }
         }
 
-        // Prune empty, however must keep the first SR/RR even if it is empty for SRTCP.
+        // Prune empty.
         feedback.retain(|f| !f.is_empty());
     }
 
@@ -454,10 +452,11 @@ fn pad_bytes_to_word(n: usize) -> usize {
 
 #[cfg(test)]
 mod test {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    use crate::rtp_::MediaTime;
 
     use super::twcc::{Delta, PacketChunk, PacketStatus};
-    use super::MediaTime;
     use super::*;
 
     #[test]
@@ -503,8 +502,7 @@ mod test {
 
     #[test]
     fn pack_sr_4_rr() {
-        let time = Instant::now();
-        let now = MediaTime::new_ntp_time(time);
+        let now = Instant::now();
         let mut queue = VecDeque::new();
         queue.push_back(rr(3));
         queue.push_back(rr(4));
@@ -555,8 +553,7 @@ mod test {
 
     #[test]
     fn roundtrip_sr_rr() {
-        let time = Instant::now();
-        let now = MediaTime::new_ntp_time(time);
+        let now = Instant::now();
         let mut feedback = VecDeque::new();
         feedback.push_back(sr(1, now));
         feedback.push_back(rr(3));
@@ -570,22 +567,31 @@ mod test {
         let mut parsed = VecDeque::new();
         Rtcp::read_packet(&buf, &mut parsed);
 
+        let Rtcp::SenderReport(s) = parsed.get(0).unwrap() else {
+            panic!("Not a SenderReport in Rtcp");
+        };
+        let now2 = s.sender_info.ntp_time;
+
         let mut compare = VecDeque::new();
-        compare.push_back(sr(1, now));
+        compare.push_back(sr(1, now2));
         compare.push_back(rr(3));
         compare.push_back(rr(4));
         compare.push_back(rr(5));
         Rtcp::pack(&mut compare, 1400);
 
         assert_eq!(parsed, compare);
+
+        // Ensure ntp_time is not too far off.
+        let abs = if now > now2 { now - now2 } else { now2 - now };
+        assert!(abs < Duration::from_millis(1));
     }
 
-    fn sr(ssrc: u32, ntp_time: MediaTime) -> Rtcp {
+    fn sr(ssrc: u32, ntp_time: Instant) -> Rtcp {
         Rtcp::SenderReport(SenderReport {
             sender_info: SenderInfo {
                 ssrc: ssrc.into(),
                 ntp_time,
-                rtp_time: 4,
+                rtp_time: MediaTime::new(4, 1),
                 sender_packet_count: 5,
                 sender_octet_count: 6,
             },

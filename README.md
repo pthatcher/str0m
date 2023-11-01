@@ -21,7 +21,7 @@ discussions anonymously at [str0m.zulipchat.com][zulip-anon]
 ## Usage
 
 The [`chat`][x-chat] example shows how to connect multiple browsers
-together and act as an SFU (Signal Forwarding Unit). The example
+together and act as an SFU (Selective Forwarding Unit). The example
 multiplexes all traffic over one server UDP socket and uses two threads
 (one for the web server, and one for the SFU loop).
 
@@ -58,7 +58,7 @@ let mut rtc = Rtc::new();
 
 //  Add some ICE candidate such as a locally bound UDP port.
 let addr = "1.2.3.4:5000".parse().unwrap();
-let candidate = Candidate::host(addr).unwrap();
+let candidate = Candidate::host(addr, "udp").unwrap();
 rtc.add_local_candidate(candidate);
 
 // Accept an incoming offer from the remote peer
@@ -83,7 +83,7 @@ let mut rtc = Rtc::new();
 
 // Add some ICE candidate such as a locally bound UDP port.
 let addr = "1.2.3.4:5000".parse().unwrap();
-let candidate = Candidate::host(addr).unwrap();
+let candidate = Candidate::host(addr, "udp").unwrap();
 rtc.add_local_candidate(candidate);
 
 // Create a `SdpApi`. The change lets us make multiple changes
@@ -176,6 +176,7 @@ loop {
             Input::Receive(
                 Instant::now(),
                 Receive {
+                    proto: Protocol::Udp,
                     source,
                     destination: socket.local_addr().unwrap(),
                     contents: buf.as_slice().try_into().unwrap(),
@@ -220,9 +221,9 @@ let writer = rtc.writer(mid).unwrap();
 let pt = writer.payload_params()[0].pt();
 
 // Write the data
-let wallclock = todo!();  // Absolute time of the data
-let media_time = todo!(); // Media time, in RTP time
-let data = todo!();       // Actual data
+let wallclock = todo!();   // Absolute time of the data
+let media_time = todo!();  // Media time, in RTP time
+let data: &[u8] = todo!(); // Actual data
 writer.write(pt, wallclock, media_time, data).unwrap();
 ```
 
@@ -433,7 +434,7 @@ collected or reference counted languages, but not great with Rust.
 
 ### Panics, Errors and unwraps
 
-Rust adheres to [fail-last][ff]. That means rather than brushing state
+Rust adheres to [fail-fast][ff]. That means rather than brushing state
 bugs under the carpet, it panics. We make a distinction between errors and
 bugs.
 
@@ -466,6 +467,84 @@ to safely discard a faulty `Rtc` instance. Since `Rtc` has no internal threads, 
 tasks, discarding the instance never risk poisoning locks or other issues that can happen
 when catching a panic.
 
+### FAQ
+
+#### Features
+
+Below is a brief comparison of features between libWebRTC and str0m to help you determine
+if str0m is suitable for your project.
+
+| Feature                  | str0m              | libWebRTC          |
+| ------------------------ | ------------------ | ------------------ |
+| Peer Connection API      | :x:                | :white_check_mark: |
+| SDP                      | :white_check_mark: | :white_check_mark: |
+| ICE                      | :white_check_mark: | :white_check_mark: |
+| Data Channels            | :white_check_mark: | :white_check_mark: |
+| Send/Recv Reports        | :white_check_mark: | :white_check_mark: |
+| Transport Wide CC        | :white_check_mark: | :white_check_mark: |
+| Bandwidth Estimation     | :white_check_mark: | :white_check_mark: |
+| Simulcast                | :white_check_mark: | :white_check_mark: |
+| NACK                     | :white_check_mark: | :white_check_mark: |
+| Packetize                | :white_check_mark: | :white_check_mark: |
+| Fixed Depacketize Buffer | :white_check_mark: | :white_check_mark: |
+| Adaptive Jitter Buffer   | :x:                | :white_check_mark: |
+| Video/audio capture      | :x:                | :white_check_mark: |
+| Video/audio encode       | :x:                | :white_check_mark: |
+| Video/audio decode       | :x:                | :white_check_mark: |
+| Audio render             | :x:                | :white_check_mark: |
+| Turn                     | :x:                | :white_check_mark: |
+| Network interface enum   | :x:                | :white_check_mark: |
+
+#### Platform Support
+
+Platforms str0m is compiled and tested on:
+
+| Platform                   | Compiled          | Tested            |
+| -------------------------- | ----------------- | ----------------- |
+| `x86_64-pc-windows-msvc`   | :white_check_mark:| :white_check_mark:|
+| `x86_64-unknown-linux-gnu` | :white_check_mark:| :white_check_mark:|
+| `x86_64-apple-darwin`      | :white_check_mark:| :white_check_mark:|
+
+If your platform isn't listed but is supported by Rust, we'd love for you to give str0m a try and
+share your experience. We greatly appreciate your feedback!
+
+#### Does str0m support IPv4, IPv6, UDP and TCP?
+
+Certainly! str0m fully support IPv4, IPv6, UDP and TCP protocols.
+
+#### Can I utilize str0m with any Rust async runtime?
+
+Absolutely! str0m is fully sync, ensuring that it integrates seamlessly with any Rust async
+runtime you opt for.
+
+#### Can I create a client with str0m?
+
+Of course! You have the freedom to create a client with str0m. However, please note that some
+common client features like media encoding, decoding, and capture are not included in str0m. But
+don't let that stop you from building amazing applications!
+
+#### Can I use str0m in a media server?
+
+Yes! str0m excels as a server component with support for both RTP API and Sample API. You can
+easily build that recording server or SFU you dreamt of in Rust!
+
+#### Can I deploy the chat example into production?
+
+While the chat example showcases how to use str0m's API, it's not intended for production use or
+heavy load. Writing a full-featured SFU or MCU (Multipoint Control Unit) is a significant
+undertaking, involving various design decisions based on production requirements.
+
+#### Discovered a bug? Here's how to share it with us
+
+We'd love to hear about it! Please submit an issue and consider joining our Zulip community
+to discuss further. For a seamless reporting experience, refer to this exemplary
+bug report: <https://github.com/algesten/str0m/issues/382>. We appreciate your contribution
+to making str0m better!
+
+#### I am allergic to SDP can you help me?
+
+Yes use the direct API!
+
 [sansio]:     https://sans-io.readthedocs.io
 [quinn]:      https://github.com/quinn-rs/quinn
 [pion]:       https://github.com/pion/webrtc
@@ -486,4 +565,4 @@ when catching a panic.
 
 <a href="https://zulip.com/"><image width="70px" src="https://raw.githubusercontent.com/zulip/zulip/main/static/images/logo/zulip-icon-circle.svg" alt="Zulip logo"></image></a>
 
-License: MIT/Apache-2.0
+License: MIT OR Apache-2.0

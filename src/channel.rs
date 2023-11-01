@@ -1,6 +1,6 @@
 //! Data channel related types.
 
-use std::{fmt, time::Instant};
+use std::{fmt, str, time::Instant};
 
 use crate::sctp::RtcSctp;
 use crate::util::already_happened;
@@ -58,11 +58,41 @@ impl<'a> Channel<'a> {
 
 impl fmt::Debug for ChannelData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ChannelData")
-            .field("id", &self.id)
-            .field("binary", &self.binary)
-            .field("data", &self.data.len())
-            .finish()
+        let mut ds = f.debug_struct("ChannelData");
+
+        ds.field("id", &self.id);
+        ds.field("binary", &self.binary);
+
+        let len = &self.data.len();
+        if self.binary {
+            ds.field("data", len);
+        } else {
+            match str::from_utf8(&self.data) {
+                Ok(s) => {
+                    const MAX_LINE_WIDTH: usize = 79;
+                    const REST_OF_LINE_WIDTH: usize =
+                        "ChannelData { id: ChannelId(0), binary: false, data: \"\" }".len();
+                    const TUPLE_WIDTH: usize = "(xxx, ..)".len();
+                    const DATA_WIDTH: usize = MAX_LINE_WIDTH - REST_OF_LINE_WIDTH;
+                    const PREFIX_WIDTH: usize = DATA_WIDTH - TUPLE_WIDTH;
+                    if s.is_ascii() {
+                        if len > &DATA_WIDTH {
+                            let trunc: String = s.chars().take(PREFIX_WIDTH).collect();
+                            ds.field("data", &format_args!("({}, \"{}\"..)", len, trunc));
+                        } else {
+                            ds.field("data", &s);
+                        }
+                    } else {
+                        ds.field("data", len);
+                    }
+                }
+                Err(e) => {
+                    ds.field("data", &format_args!("{:?}", (len, &e)));
+                }
+            }
+        }
+
+        ds.finish()
     }
 }
 
@@ -233,5 +263,20 @@ impl ChannelHandler {
             };
             self.allocations.push(alloc);
         }
+    }
+
+    pub fn close_channel(&mut self, id: ChannelId, sctp: &mut RtcSctp) {
+        if let Some(sctp_stream_id) = self
+            .allocations
+            .iter()
+            .find(|a| a.id == id)
+            .and_then(|s| s.sctp_stream_id)
+        {
+            sctp.close_stream(sctp_stream_id);
+        }
+    }
+
+    pub fn remove_channel(&mut self, id: ChannelId) {
+        self.allocations.retain(|a| a.id != id)
     }
 }
