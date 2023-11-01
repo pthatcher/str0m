@@ -16,8 +16,8 @@ pub fn unidirectional() -> Result<(), RtcError> {
     let mut l = TestRtc::new(info_span!("L"));
     let mut r = TestRtc::new(info_span!("R"));
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into())?;
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into())?;
+    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
+    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
     l.add_local_candidate(host1);
     r.add_local_candidate(host2);
 
@@ -49,7 +49,9 @@ pub fn unidirectional() -> Result<(), RtcError> {
     loop {
         let wallclock = l.start + l.duration();
         let time = l.duration().into();
-        l.writer(mid).unwrap().write(pt, wallclock, time, &data_a)?;
+        l.writer(mid)
+            .unwrap()
+            .write(pt, wallclock, time, data_a.clone())?;
 
         progress(&mut l, &mut r)?;
 

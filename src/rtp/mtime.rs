@@ -2,14 +2,10 @@
 
 use std::cmp::Ordering;
 use std::ops::{Add, Sub};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
+use std::time::Instant;
 
-use once_cell::sync::OnceCell;
-
-/// 2^32 as float.
-const F32: f64 = 4_294_967_296.0;
-// /// 2^16 as float.
-// const F16: f64 = 65_536.0;
+use crate::util::InstantExt;
 
 /// Microseconds in a second.
 const MICROS: i64 = 1_000_000;
@@ -24,7 +20,6 @@ const MILLIS: i64 = 1_000;
 #[derive(Debug, Clone, Copy)]
 pub struct MediaTime(i64, i64);
 
-#[allow(dead_code)]
 impl MediaTime {
     pub const ZERO: MediaTime = MediaTime(0, 1);
 
@@ -32,13 +27,7 @@ impl MediaTime {
         MediaTime(numer, denom)
     }
 
-    pub fn new_unix_time(time: Instant) -> Self {
-        let dur = time.to_unix_duration();
-        let micros = dur.as_micros() as i64;
-        MediaTime(micros, MICROS)
-    }
-
-    pub fn new_ntp_time(time: Instant) -> Self {
+    pub(crate) fn new_ntp_time(time: Instant) -> Self {
         let dur = time.to_ntp_duration();
         let micros = dur.as_micros() as i64;
         MediaTime(micros, MICROS)
@@ -76,43 +65,6 @@ impl MediaTime {
 
     pub const fn as_micros(&self) -> i64 {
         self.rebase(MICROS).numer()
-    }
-
-    #[inline(always)]
-    pub fn from_ntp_64(v: u64) -> MediaTime {
-        // https://tools.ietf.org/html/rfc3550#section-4
-        // Wallclock time (absolute date and time) is represented using the
-        // timestamp format of the Network Time Protocol (NTP), which is in
-        // seconds relative to 0h UTC on 1 January 1900 [4]. The full
-        // resolution NTP timestamp is a 64-bit unsigned fixed-point number with
-        // the integer part in the first 32 bits and the fractional part in the
-        // last 32 bits.
-        let secs = (v as f64) / F32;
-
-        MediaTime::from_seconds(secs)
-    }
-
-    #[inline(always)]
-    pub fn as_ntp_64(&self) -> u64 {
-        let secs = self.as_seconds();
-        assert!(secs >= 0.0);
-
-        // sec * (2 ^ 32)
-        (secs * F32) as u64
-    }
-
-    // #[inline(always)]
-    // pub fn from_ntp_32(v: u32) -> Ts {
-    //     let secs = (v as f64) / F16;
-
-    //     Ts::from_seconds(secs)
-    // }
-
-    #[inline(always)]
-    pub fn as_ntp_32(&self) -> u32 {
-        let ntp_64 = self.as_ntp_64();
-
-        ((ntp_64 >> 16) & 0xffff_ffff) as u32
     }
 
     #[inline(always)]
@@ -157,8 +109,7 @@ impl Eq for MediaTime {}
 impl PartialOrd for MediaTime {
     #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        let (t0, t1) = MediaTime::same_base(*self, *other);
-        Some(t0.cmp(&t1))
+        Some(self.cmp(other))
     }
 }
 
@@ -196,53 +147,6 @@ impl Add for MediaTime {
     }
 }
 
-pub trait InstantExt {
-    /// Convert an Instant to a Duration for unix time.
-    ///
-    /// First ever time must be "now".
-    ///
-    /// panics if `time` goes backwards, i.e. we use this for one Instant and then an earlier Instant.
-    fn to_unix_duration(&self) -> Duration;
-
-    /// Convert an Instant to a Duration for ntp time.
-    fn to_ntp_duration(&self) -> Duration;
-}
-
-impl InstantExt for Instant {
-    fn to_unix_duration(&self) -> Duration {
-        // This is a bit fishy. We "freeze" a moment in time for Instant and SystemTime,
-        // so we can make relative comparisons of Instant - Instant and translate that to
-        // SystemTime - unix epoch. Hopefully the error is quite small.
-        static TIME_START: OnceCell<(Instant, SystemTime)> = OnceCell::new();
-        let _ = TIME_START.set((*self, SystemTime::now()));
-
-        let tstart = TIME_START.get().unwrap();
-
-        if *self < tstart.0 {
-            warn!("Time went backwards from first ever Instant");
-        }
-
-        let duration_since_time_0 = self.duration_since(tstart.0);
-        let system_time = tstart.1 + duration_since_time_0;
-
-        system_time
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("clock to go forwards from unix epoch")
-    }
-
-    fn to_ntp_duration(&self) -> Duration {
-        // RTP spec "wallclock" uses NTP time, which starts at 1900-01-01.
-        //
-        // https://tools.ietf.org/html/rfc868
-        //
-        // 365 days * 70 years + 17 leap year days
-        // (365 * 70 + 17) * 86400 = 2208988800
-        const MICROS_1900: Duration = Duration::from_micros(2_208_988_800 * MICROS as u64);
-
-        self.to_unix_duration() + MICROS_1900
-    }
-}
-
 impl From<MediaTime> for Duration {
     fn from(val: MediaTime) -> Self {
         let m = val.rebase(MICROS);
@@ -268,12 +172,5 @@ mod test {
         assert_eq!(t2.denom(), 90_000);
 
         println!("{}", (10.0234_f64).fract());
-    }
-
-    #[test]
-    fn from_instant() {
-        let now = Instant::now();
-        let m = MediaTime::new_ntp_time(now);
-        assert!(m.as_seconds() > 3871711275.0);
     }
 }

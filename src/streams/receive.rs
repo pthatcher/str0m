@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::media::KeyframeRequestKind;
-use crate::rtp_::{
-    extend_u32, DlrrItem, ExtendedReport, Fir, FirEntry, InstantExt, MediaTime, Mid, Pli, Pt,
-    ReceiverReport, ReportBlock, ReportList, Rid, Rrtr, Rtcp, RtcpFb, RtpHeader, SenderInfo, SeqNo,
-};
+use crate::rtp_::{extend_u32, DlrrItem, ExtendedReport, Fir, FirEntry, MediaTime};
+use crate::rtp_::{Mid, Pli, Pt, ReceiverReport};
+use crate::rtp_::{ReportBlock, ReportList, Rid, Rrtr, Rtcp, RtcpFb, RtpHeader, SenderInfo, SeqNo};
 use crate::rtp_::{SdesType, Ssrc};
 use crate::stats::{MediaIngressStats, StatsSnapshot};
+use crate::util::InstantExt;
 use crate::util::{already_happened, calculate_rtt_ms};
 
 use super::register::ReceiverRegister;
@@ -45,11 +45,16 @@ pub struct StreamRx {
     /// Whether we explicitly want to supress NACK sending. This is normally done by not
     /// setting an RTX, however this can be toggled off manually despite RTX being there.
     ///
+    /// This is also set to true if the SDP negotiation disables RTX.
+    ///
     /// Defaults to false.
     suppress_nack: bool,
 
     /// Timestamp when we got some indication of remote using this stream.
     last_used: Instant,
+
+    /// Last seen pt and clock_rate in
+    last_clock_rate: Option<(Pt, i64)>,
 
     /// Last received sender info.
     sender_info: Option<(Instant, SenderInfo)>,
@@ -120,7 +125,7 @@ pub(crate) struct StreamRxStats {
 }
 
 impl StreamRx {
-    pub(crate) fn new(ssrc: Ssrc, mid: Mid, rid: Option<Rid>) -> Self {
+    pub(crate) fn new(ssrc: Ssrc, mid: Mid, rid: Option<Rid>, suppress_nack: bool) -> Self {
         debug!("Create StreamRx for SSRC: {}", ssrc);
 
         StreamRx {
@@ -130,8 +135,9 @@ impl StreamRx {
             mid,
             rid,
             cname: None,
-            suppress_nack: false,
+            suppress_nack,
             last_used: already_happened(),
+            last_clock_rate: None,
             sender_info: None,
             reset_roc: None,
             register: None,
@@ -243,7 +249,21 @@ impl StreamRx {
         }
     }
 
-    fn set_sender_info(&mut self, now: Instant, info: SenderInfo) {
+    fn set_sender_info(&mut self, now: Instant, mut info: SenderInfo) {
+        // Extend the incoming time given our knowledge of last time.
+        let extended = {
+            let prev = self.sender_info.map(|(_, sr)| sr.rtp_time.numer() as u64);
+            let r_u32 = info.rtp_time.numer() as u32;
+            extend_u32(prev, r_u32)
+        };
+
+        // The MediaTime has a base 1 after being parsed. At this point
+        // we know whether it's audio or video and set the base accordingly.
+        let clock_rate = self.last_clock_rate.map(|(_, r)| r).unwrap_or(1);
+
+        // Clock rate is that of the last received packet.
+        info.rtp_time = MediaTime::new(extended as i64, clock_rate);
+
         self.sender_info = Some((now, info));
     }
 
@@ -299,8 +319,7 @@ impl StreamRx {
             &mut self.register
         };
 
-        let register =
-            register_ref.get_or_insert_with(|| ReceiverRegister::new(header.sequence_number(None)));
+        let register = register_ref.get_or_insert_with(ReceiverRegister::new);
 
         // If the user has called `reset_seq_no`, this is the time to handle it, but only
         // if the incoming packet is for main (not repair).
@@ -315,11 +334,10 @@ impl StreamRx {
         let seq_no = if let Some(reset_seq_no) = reset_seq_no {
             reset_seq_no
         } else {
-            header.sequence_number(Some(register.max_seq()))
+            header.sequence_number(register.max_seq())
         };
 
-        let is_new_packet = register.update_seq(seq_no);
-        register.update_time(now, header.timestamp, clock_rate);
+        let is_new_packet = register.update(seq_no, now, header.timestamp, clock_rate);
 
         let previous_time = self.last_time.map(|t| t.numer() as u64);
         let time_u32 = extend_u32(previous_time, header.timestamp);
@@ -347,12 +365,23 @@ impl StreamRx {
     ) -> Option<RtpPacket> {
         trace!("Handle RTP: {:?}", header);
 
+        let need_clock_rate = self.last_clock_rate.map(|(pt, _)| pt) != Some(header.payload_type);
+        if need_clock_rate {
+            self.last_clock_rate = Some((header.payload_type, time.denom()));
+
+            // If we get an SR before the first packet, we update the potential clock rate.
+            if let Some(info) = &mut self.sender_info {
+                info.1.rtp_time = MediaTime::new(info.1.rtp_time.numer(), time.denom());
+            }
+        }
+
         let packet = RtpPacket {
             seq_no,
             time,
             header,
             payload: data,
             nackable: false,
+            last_sender_info: self.sender_info.map(|(_, s)| s),
             timestamp: now,
         };
 
@@ -448,7 +477,7 @@ impl StreamRx {
     }
 
     fn create_receiver_report(&mut self, now: Instant) -> ReceiverReport {
-        let Some(mut report) = self.register.as_mut().map(|r| r.reception_report()) else {
+        let Some(mut report) = self.register.as_mut().and_then(|r| r.reception_report()) else {
             return ReceiverReport {
                 sender_ssrc: 0.into(), // set one level up
                 reports: ReportList::new(),
@@ -464,7 +493,7 @@ impl StreamRx {
             let t = self
                 .sender_info
                 .map(|(_, s)| s.ntp_time)
-                .unwrap_or(MediaTime::ZERO);
+                .unwrap_or(already_happened());
 
             let t64 = t.as_ntp_64();
             (t64 >> 16) as u32
@@ -490,9 +519,7 @@ impl StreamRx {
     fn create_extended_receiver_report(&self, now: Instant) -> ExtendedReport {
         // we only want to report our time to measure RTT,
         // the source will answer with Dlrr feedback, allowing us to calculate RTT
-        let block = ReportBlock::Rrtr(Rrtr {
-            ntp_time: MediaTime::new_ntp_time(now),
-        });
+        let block = ReportBlock::Rrtr(Rrtr { ntp_time: now });
         ExtendedReport {
             ssrc: self.ssrc,
             blocks: vec![block],
@@ -500,17 +527,9 @@ impl StreamRx {
     }
 
     fn nack_enabled(&self) -> bool {
-        self.rtx.is_some() && !self.suppress_nack
-    }
-
-    pub(crate) fn has_nack(&mut self) -> bool {
-        if !self.nack_enabled() {
-            return false;
-        }
-        self.register
-            .as_mut()
-            .map(|r| r.has_nack_report())
-            .unwrap_or(false)
+        // Deliberately don't look at RTX is_some() here, since when using dynamic SSRC, we might need
+        // to send NACK before discovering the remote RTX.
+        !self.suppress_nack
     }
 
     pub(crate) fn maybe_create_nack(
@@ -522,21 +541,13 @@ impl StreamRx {
             return None;
         }
 
-        let mut nacks = self.register.as_mut().map(|r| r.nack_reports())?;
+        let nacks = self.register.as_mut().and_then(|r| r.nack_report())?;
 
-        for nack in &mut nacks {
+        for mut nack in nacks {
             nack.sender_ssrc = sender_ssrc;
             nack.ssrc = self.ssrc;
 
             debug!("Created feedback NACK: {:?}", nack);
-            self.stats.nacks += 1;
-        }
-
-        if !nacks.is_empty() {
-            debug!("Send nacks: {:?}", nacks);
-        }
-
-        for nack in nacks {
             feedback.push_back(Rtcp::Nack(nack));
             self.stats.nacks += 1;
         }

@@ -3,18 +3,22 @@ use std::time::Duration;
 
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind};
-use str0m::{Candidate, Event, RtcError};
+use str0m::stats::MediaEgressStats;
+use str0m::{Candidate, Event, RtcConfig, RtcError};
 use tracing::info_span;
 
 mod common;
 use common::{init_log, progress, TestRtc};
 
 #[test]
-pub fn bidirectional_same_m_line() -> Result<(), RtcError> {
+pub fn stats() -> Result<(), RtcError> {
     init_log();
 
-    let mut l = TestRtc::new(info_span!("L"));
-    let mut r = TestRtc::new(info_span!("R"));
+    let l_config = RtcConfig::new().set_stats_interval(Some(Duration::from_secs(10)));
+    let r_config = RtcConfig::new().set_stats_interval(Some(Duration::from_secs(10)));
+
+    let mut l = TestRtc::new_with_rtc(info_span!("L"), l_config.build());
+    let mut r = TestRtc::new_with_rtc(info_span!("R"), r_config.build());
 
     let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
     let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
@@ -65,7 +69,7 @@ pub fn bidirectional_same_m_line() -> Result<(), RtcError> {
 
         progress(&mut l, &mut r)?;
 
-        if l.duration() > Duration::from_secs(10) {
+        if l.duration() > Duration::from_secs(25) {
             break;
         }
     }
@@ -87,6 +91,42 @@ pub fn bidirectional_same_m_line() -> Result<(), RtcError> {
         .iter()
         .filter(|(_, e)| matches!(e, Event::MediaData(_)))
         .count();
+
+    let egress_stats_l: Vec<MediaEgressStats> = l
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e, Event::MediaEgressStats(_)))
+        .map(|(_, e)| {
+            if let Event::MediaEgressStats(stats) = e {
+                stats.clone()
+            } else {
+                panic!("Unexpected event type!")
+            }
+        })
+        .collect();
+
+    egress_stats_l
+        .iter()
+        .filter_map(|egress_stat_l| egress_stat_l.rtt)
+        .for_each(|rtt| assert!(rtt < 100_f32)); // rtt should be under 100ms in this scenario
+
+    let egress_stats_r: Vec<MediaEgressStats> = l
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e, Event::MediaEgressStats(_)))
+        .map(|(_, e)| {
+            if let Event::MediaEgressStats(stats) = e {
+                stats.clone()
+            } else {
+                panic!("Unexpected event type!")
+            }
+        })
+        .collect();
+
+    egress_stats_r
+        .iter()
+        .filter_map(|egress_stat_l| egress_stat_l.rtt)
+        .for_each(|rtt| assert!(rtt < 100_f32)); // rtt should be under 100ms in this scenario
 
     assert!(
         media_count_l > 1700,

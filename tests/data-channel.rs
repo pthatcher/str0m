@@ -14,8 +14,8 @@ pub fn data_channel() -> Result<(), RtcError> {
     let mut l = TestRtc::new(info_span!("L"));
     let mut r = TestRtc::new(info_span!("R"));
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into())?;
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into())?;
+    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
+    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
     l.add_local_candidate(host1);
     r.add_local_candidate(host2);
 

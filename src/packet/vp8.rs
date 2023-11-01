@@ -1,4 +1,4 @@
-use crate::rtp_::{extend_u16, extend_u8};
+use crate::rtp_::{extend_u15, extend_u16, extend_u7, extend_u8};
 
 use super::{BitRead, CodecExtra, Depacketizer, MediaKind, PacketError, Packetizer};
 
@@ -8,16 +8,16 @@ pub const VP8_HEADER_SIZE: usize = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vp8CodecExtra {
     /// True if the frame can be discarded safely, without causing decoding problems
-    /// No other frames are encoded depending on this frame
+    /// No other frames are encoded depending on this frame (non-reference frame)
     pub discardable: bool,
-    /// True if the frame is encoded only depending on a frame on layer 0.
-    /// This attribute can only be true for frames on layer 1
+    /// True if this frame and subsequent ones on this layer depend only on tl0_pic_idx
     pub sync: bool,
     /// Index of the vp8 temporal layer.
-    /// Only 2 layers are possible in WebRTC
     pub layer_index: u8,
-    /// extended picture id, if present
+    /// Extended picture id, if present
     pub picture_id: Option<u64>,
+    /// Extended picture id of layer 0 frames, if present
+    pub tl0_picture_id: Option<u64>,
 }
 
 /// Packetizes VP8 RTP packets.
@@ -147,10 +147,12 @@ pub struct Vp8Depacketizer {
     /// 8 or 16 bits, picture ID
     pub picture_id: u16,
     // extended picture id
-    pub extended_pid: u64,
+    pub extended_pid: Option<u64>,
 
     /// 8 bits temporal level zero index
     pub tl0_pic_idx: u8,
+    /// extended version of picture_id of temporal layer 0
+    pub extended_tl0_pic_idx: Option<u64>,
     /// 2 bits temporal layer index
     pub tid: u8,
     /// 1 bit layer sync bit
@@ -213,11 +215,11 @@ impl Depacketizer for Vp8Depacketizer {
             if b & 0x80 > 0 {
                 // M == 1, PID is 16bit
                 self.picture_id = (((b & 0x7f) as u16) << 8) | (reader.get_u8() as u16);
-                self.extended_pid = extend_u16(Some(self.extended_pid), self.picture_id);
+                self.extended_pid = Some(extend_u15(self.extended_pid, self.picture_id));
                 payload_index += 1;
             } else {
                 self.picture_id = b as u16;
-                self.extended_pid = extend_u8(Some(self.extended_pid), b);
+                self.extended_pid = Some(extend_u7(self.extended_pid, b));
             }
         }
 
@@ -227,6 +229,8 @@ impl Depacketizer for Vp8Depacketizer {
 
         if self.l == 1 {
             self.tl0_pic_idx = reader.get_u8();
+            self.extended_tl0_pic_idx =
+                Some(extend_u8(self.extended_tl0_pic_idx, self.tl0_pic_idx));
             payload_index += 1;
         }
 
@@ -256,8 +260,9 @@ impl Depacketizer for Vp8Depacketizer {
             discardable: self.n == 1,
             sync: self.y == 1,
             layer_index: self.tid,
-            picture_id: if self.i == 1 {
-                Some(self.extended_pid)
+            picture_id: if self.i == 1 { self.extended_pid } else { None },
+            tl0_picture_id: if self.l == 1 {
+                self.extended_tl0_pic_idx
             } else {
                 None
             },

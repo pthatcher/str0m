@@ -14,9 +14,9 @@ use crate::packet::MediaKind;
 use crate::rtp_::Rid;
 use crate::rtp_::{Direction, Extension, ExtensionMap, Mid, Pt, Ssrc};
 use crate::sctp::ChannelConfig;
+use crate::sdp::SimulcastGroups;
 use crate::sdp::{self, MediaAttribute, MediaLine, MediaType, Msid, Sdp};
 use crate::sdp::{Proto, SessionAttribute, Setup};
-use crate::sdp::{SimulcastGroups, SimulcastOption};
 use crate::session::Session;
 use crate::Rtc;
 use crate::RtcError;
@@ -401,6 +401,35 @@ impl<'a> SdpApi<'a> {
             None
         }
     }
+
+    /// Combines the modifications made in [`SdpApi`] with those in [`SdpPendingOffer`].
+    ///
+    /// This function merges the changes present in [`SdpApi`] with the changes
+    /// in [`SdpPendingOffer`]. In result this [`SdpApi`] will incorporate modifications
+    /// from both the previous [`SdpPendingOffer`] and any newly added changes.
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// # use str0m::media::{Direction, MediaKind};
+    /// # use str0m::Rtc;
+    /// let mut rtc = Rtc::new();
+    /// let mut changes = rtc.sdp_api();
+    /// changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
+    /// let (_offer, pending) = changes.apply().unwrap();
+    ///
+    /// let mut changes = rtc.sdp_api();
+    /// changes.add_media(MediaKind::Video, Direction::SendOnly, None, None);
+    /// changes.merge(pending);
+    ///
+    /// // This `SdpOffer` will have changes from the first `SdpPendingChanges`
+    /// // and new changes from `SdpApi`
+    /// let (_offer, pending) = changes.apply().unwrap();
+    /// ```
+    pub fn merge(&mut self, mut pending_offer: SdpPendingOffer) {
+        pending_offer.retain_relevant(self.rtc);
+        self.changes.extend(pending_offer.changes.drain(..));
+    }
 }
 
 /// Pending offer from a previous [`Rtc::sdp_api()`] call.
@@ -427,6 +456,29 @@ impl<'a> SdpApi<'a> {
 pub struct SdpPendingOffer {
     change_id: usize,
     changes: Changes,
+}
+
+impl SdpPendingOffer {
+    /// Retains only the relevant changes in the `changes` vector based on the provided `Rtc` instance.
+    ///
+    /// This function filters the vector of `Change` instances stored in the current object and retains
+    /// only those changes that are considered relevant with respect to the provided `Rtc` instance.
+    fn retain_relevant(&mut self, rtc: &Rtc) {
+        fn is_relevant(rtc: &Rtc, c: &Change) -> bool {
+            match c {
+                Change::AddMedia(v) => rtc.media(v.mid).is_none(),
+                Change::AddApp(_) => rtc.session.app().is_none(),
+                Change::AddChannel(v) => rtc.chan.stream_id_by_channel_id(v.0).is_none(),
+                Change::Direction(m, d) => {
+                    // If mid is missing, this is not relevant.
+                    rtc.media(*m).map(|m| m.direction() != *d).unwrap_or(false)
+                }
+                Change::IceRestart(v, _) => rtc.ice.local_credentials() != v,
+            }
+        }
+
+        self.changes.retain(|c| is_relevant(rtc, c));
+    }
 }
 
 #[derive(Default)]
@@ -724,18 +776,9 @@ fn ensure_stream_tx(session: &mut Session) {
         let mut rids: Vec<Option<Rid>> = vec![];
 
         if let Some(sim) = media.simulcast() {
-            for group in &*sim.send {
-                for opt in &**group {
-                    match opt {
-                        SimulcastOption::Rid(rid) => {
-                            let rid: Rid = rid.0.as_str().into();
-                            rids.push(Some(rid));
-                        }
-                        SimulcastOption::Ssrc(_) => {
-                            warn!("No support for munged simulcast");
-                        }
-                    }
-                }
+            for rid in &*sim.send {
+                let rid: Rid = rid.0.as_str().into();
+                rids.push(Some(rid));
             }
         } else {
             rids.push(None);
@@ -743,7 +786,10 @@ fn ensure_stream_tx(session: &mut Session) {
 
         // If any payload param has RTX, we need to prepare for RTX. This is because we always
         // communicate a=ssrc lines, which need to be complete with main and RTX SSRC.
-        let has_rtx = session.codec_config.iter().any(|p| p.resend().is_some());
+        let has_rtx = session
+            .codec_config
+            .iter()
+            .any(|p| p.resend().is_some() && media.remote_pts().contains(&p.pt));
 
         for rid in rids {
             // If we already have the stream, we don't make any new one.
@@ -996,37 +1042,48 @@ fn update_media(
     }
     media.set_remote_extmap(remote_extmap);
 
-    // SSRC changes
-    // This will always be for ReceiverSource since any incoming a=ssrc line will be
-    // about the remote side's SSRC.
-    let infos = m.ssrc_info();
+    if new_dir.is_receiving() {
+        // SSRC changes
+        // This will always be for ReceiverSource since any incoming a=ssrc line will be
+        // about the remote side's SSRC.
+        let infos = m.ssrc_info();
+        let main = infos.iter().filter(|i| i.repairs.is_none());
 
-    let main = infos.iter().filter(|i| i.repairs.is_none());
+        if m.simulcast().is_none() {
+            // Only use pre-communicated SSRC if we are running without simulcast.
+            // We found a bug in FF where the order of the simulcast lines does not
+            // correspond to the order of the simulcast declarations. In this case
+            // it's better to fall back on mid/rid dynamic mapping.
 
-    if m.simulcast().is_none() {
-        // Only use pre-communicated SSRC if we are running without simulcast.
-        // We found a bug in FF where the order of the simulcast lines does not
-        // correspond to the order of the simulcast declarations. In this case
-        // it's better to fall back on mid/rid dynamic mapping.
+            for i in main {
+                // TODO: If the remote is communicating _BOTH_ rid and a=ssrc this will fail.
+                info!("Adding pre-communicated SSRC: {:?}", i);
+                let repair_ssrc = infos
+                    .iter()
+                    .find(|r| r.repairs == Some(i.ssrc))
+                    .map(|r| r.ssrc);
 
-        for i in main {
-            // TODO: If the remote is communicating _BOTH_ rid and a=ssrc this will fail.
-            info!("Adding pre-communicated SSRC: {:?}", i);
-            let repair_ssrc = infos
-                .iter()
-                .find(|r| r.repairs == Some(i.ssrc))
-                .map(|r| r.ssrc);
-            streams.expect_stream_rx(i.ssrc, repair_ssrc, media.mid(), None);
+                // If remote communicated a main a=ssrc, but no RTX, we will not send nacks.
+                let suppress_nack = repair_ssrc.is_none();
+                streams.expect_stream_rx(
+                    i.ssrc,
+                    repair_ssrc,
+                    media.mid(),
+                    None,
+                    suppress_nack,
+                    None,
+                );
+            }
         }
-    }
 
-    // Simulcast configuration
-    if let Some(s) = m.simulcast() {
-        if s.is_munged {
-            warn!("Not supporting simulcast via munging SDP");
-        } else if media.simulcast().is_none() {
-            // Invert before setting, since it has a recv and send config.
-            media.set_simulcast(s.invert());
+        // Simulcast configuration
+        if let Some(s) = m.simulcast() {
+            if s.is_munged {
+                warn!("Not supporting simulcast via munging SDP");
+            } else if media.simulcast().is_none() {
+                // Invert before setting, since it has a recv and send config.
+                media.set_simulcast(s.invert());
+            }
         }
     }
 }
@@ -1141,17 +1198,11 @@ impl AsSdpMediaLine for Media {
                 gs: &'a SimulcastGroups,
                 direction: &'static str,
             ) -> impl Iterator<Item = MediaAttribute> + 'a {
-                gs.iter().flat_map(|g| g.iter()).filter_map(move |o| {
-                    if let SimulcastOption::Rid(id) = o {
-                        Some(MediaAttribute::Rid {
-                            id: id.clone(),
-                            direction,
-                            pt: vec![],
-                            restriction: vec![],
-                        })
-                    } else {
-                        None
-                    }
+                gs.iter().map(move |rid| MediaAttribute::Rid {
+                    id: rid.clone(),
+                    direction,
+                    pt: vec![],
+                    restriction: vec![],
                 })
             }
             attrs.extend(to_rids(&s.recv, "recv"));
@@ -1480,6 +1531,22 @@ mod test {
         let r = rtc1.sdp_api().accept_answer(pending1, answer2);
 
         assert!(matches!(r, Err(RtcError::ChangesOutOfOrder)));
+    }
+
+    #[test]
+    fn sdp_api_merge_works() {
+        let mut rtc = Rtc::new();
+        let mut changes = rtc.sdp_api();
+        changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
+        let (offer, pending) = changes.apply().unwrap();
+
+        let mut changes = rtc.sdp_api();
+        changes.add_media(MediaKind::Video, Direction::SendOnly, None, None);
+        changes.merge(pending);
+        let (new_offer, _) = changes.apply().unwrap();
+
+        assert_eq!(offer.media_lines[0], new_offer.media_lines[1]);
+        assert_eq!(new_offer.media_lines.len(), 2);
     }
 
     #[test]

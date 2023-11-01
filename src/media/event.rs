@@ -3,7 +3,7 @@ use std::ops::RangeInclusive;
 use std::time::Instant;
 
 use crate::packet::MediaKind;
-use crate::rtp_::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, SeqNo};
+use crate::rtp_::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, SenderInfo, SeqNo};
 use crate::sdp::Simulcast as SdpSimulcast;
 
 use super::PayloadParams;
@@ -11,19 +11,8 @@ use crate::format::CodecExtra;
 
 impl From<SdpSimulcast> for Simulcast {
     fn from(s: SdpSimulcast) -> Self {
-        let send = s
-            .send
-            .iter()
-            .flat_map(|s| s.iter().map(|s| s.as_stream_id().0.as_ref()))
-            .map(Rid::from)
-            .collect();
-
-        let recv = s
-            .recv
-            .iter()
-            .flat_map(|s| s.iter().map(|s| s.as_stream_id().0.as_ref()))
-            .map(Rid::from)
-            .collect();
+        let send = s.send.iter().map(|r| r.0.as_ref()).map(Rid::from).collect();
+        let recv = s.recv.iter().map(|r| r.0.as_ref()).map(Rid::from).collect();
 
         Simulcast { send, recv }
     }
@@ -137,6 +126,11 @@ pub struct MediaData {
 
     /// Additional codec specific information
     pub codec_extra: CodecExtra,
+
+    /// Sender information from the most recent Sender Report(SR).
+    ///
+    /// If no Sender Report(SR) has been received this is [`None`].
+    pub last_sender_info: Option<SenderInfo>,
 }
 
 /// Details for an incoming a keyframe request (PLI or FIR).

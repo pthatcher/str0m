@@ -27,6 +27,7 @@ pub use writer::Writer;
 pub use crate::packet::MediaKind;
 pub use crate::rtp_::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid};
 
+#[derive(Debug)]
 /// Information about some configured media.
 pub struct Media {
     // ========================================= RTP level =========================================
@@ -143,6 +144,7 @@ impl Rids {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct ToPayload {
     pub pt: Pt,
     pub rid: Option<Rid>,
@@ -253,6 +255,7 @@ impl Media {
                         contiguous: dep.contiguous,
                         ext_vals: dep.ext_vals().clone(),
                         codec_extra: dep.codec_extra,
+                        last_sender_info: dep.first_sender_info(),
                         data: dep.data,
                     })
                     .map_err(|e| RtcError::Packet(self.mid, *pt, e)),
@@ -307,6 +310,7 @@ impl Media {
             time: packet.time,
             seq_no: packet.seq_no,
             header: packet.header.clone(),
+            last_sender_info: packet.last_sender_info,
         };
 
         buffer.push(meta, packet.payload);
@@ -339,7 +343,7 @@ impl Media {
         self.payloaders.entry((pt, rid)).or_insert_with(|| {
             // Unwrap is OK, the pt should be checked already when calling this function.
             let params = params.iter().find(|p| p.pt == pt).unwrap();
-            Payloader::new(params.spec.codec.into())
+            Payloader::new(params.spec)
         })
     }
 
@@ -441,6 +445,11 @@ impl Media {
             .all_for_kind(self.kind)
             .find(|p| p.resend().is_some() && self.remote_pts.contains(&p.pt))
             .map(|p| p.pt())
+    }
+
+    pub(crate) fn reset_depayloader(&mut self, payload_type: Pt, rid: Option<Rid>) {
+        // Simply remove the depayloader, it will be re-created on the next RTP packet.
+        self.depayloaders.remove(&(payload_type, rid));
     }
 }
 

@@ -1,24 +1,13 @@
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
-
 mod bit_pattern;
 
 pub(crate) use bit_pattern::BitPattern;
 
 pub(crate) mod value_history;
 
-pub(crate) fn not_happening() -> Instant {
-    const YEARS_100: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 100);
-    static FUTURE: Lazy<Instant> = Lazy::new(|| Instant::now() + YEARS_100);
-    *FUTURE
-}
-
-pub(crate) fn already_happened() -> Instant {
-    const HOURS_1: Duration = Duration::from_secs(60);
-    static PAST: Lazy<Instant> = Lazy::new(|| Instant::now().checked_sub(HOURS_1).unwrap());
-    *PAST
-}
+mod time_tricks;
+pub(crate) use time_tricks::{already_happened, not_happening, InstantExt};
 
 pub(crate) trait Soonest {
     fn soonest(self, other: Self) -> Self;
@@ -72,6 +61,11 @@ pub(crate) fn calculate_rtt_ms(ntp_time: Duration, delay: u32, last_report: u32)
     // [32 bit seconds].[32 bit fractions]
     //         [16 bit].[16 bit]
 
+    // As per RFC delay is 0 in case no SR packet has been received yet.
+    if delay == 0 {
+        return None;
+    }
+
     let now_secs = ntp_time.as_secs();
     let now_fract_ns = ntp_time.subsec_nanos() as u64;
     let now_fract = ((now_fract_ns * u32::MAX as u64) / 1_000_000_000) as u32;
@@ -84,26 +78,4 @@ pub(crate) fn calculate_rtt_ms(ntp_time: Duration, delay: u32, last_report: u32)
     let rtt_fraction = (rtt & (u16::MAX as u32)) as f32 / (u16::MAX as u32) as f32;
 
     Some(rtt_seconds as f32 * 1000.0 + rtt_fraction * 1000.0)
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn not_happening_works() {
-        assert_eq!(not_happening(), not_happening());
-        assert!(Instant::now() < not_happening());
-    }
-
-    #[test]
-    fn already_happened_works() {
-        assert_eq!(already_happened(), already_happened());
-        assert!(Instant::now() > already_happened());
-    }
-
-    #[test]
-    fn already_happened_ne() {
-        assert_ne!(not_happening(), already_happened())
-    }
 }
