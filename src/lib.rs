@@ -625,6 +625,8 @@ pub mod rtp {
 
     /// Video Layers Allocation RTP Header Extension
     pub mod vla;
+    /// Dependency Descriptor RTP Header Extension
+    pub mod dependency_descriptor;
     pub use crate::rtp_::{Extension, ExtensionMap, ExtensionSerializer};
     pub use crate::rtp_::{ExtensionValues, UserExtensionValues};
 
