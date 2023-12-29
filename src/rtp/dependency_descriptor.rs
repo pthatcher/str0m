@@ -235,7 +235,7 @@ pub struct ParsedDependencyDescriptor {
     /// For all Chains, the relative frame number of the previous frame in the Chain.
     /// As long as every frame in the Chain is received, the frames of any
     /// Decode Target protected by the Chain will be decodable.
-    /// The spec calls it "frame_chain_fdiff" or 
+    /// The spec calls it "frame_chain_fdiff" or
     pub previous_relative_frame_number_by_chain_index: Vec<RelativeFrameNumber>,
 
     /// True if and only if this is the first packet of the current frame.
@@ -478,7 +478,7 @@ impl ExtensionSerializer for Serializer {
         false
     }
 
-    fn requires_two_byte_form(&self, _ev: &ExtensionValues) -> bool {
+    fn requires_two_byte_form(&self, ev: &ExtensionValues) -> bool {
         let Some(unparsed) = ev.user_values.get::<UnparsedSerializedDescriptor>() else {
             return false;
         };
@@ -544,36 +544,39 @@ impl<'bits> Parser<'bits> {
         let decode_targets: Vec<DecodeTarget> = layer_ids_by_decode_target_index
             .into_iter()
             .enumerate()
-            .map(|(decode_target_index, (spatial_layer_id, temporal_layer_id))| {
-                let active = BitStream::read_ls_bit_of_u32(
-                    active_decode_targets_bitmask,
-                    decode_target_index as u8,
-                )
-                .unwrap_or(false);
-                let indication = frame_dependency_definition
-                    .decode_target_indication_by_decode_target_index
-                    .get(decode_target_index)
-                    .copied()
-                    .unwrap_or(DecodeTargetIndication::NotPresent);
-                let protecting_chain_index = shared_structure
-                    .protecting_chain_index_by_decode_target_index
-                    .get(decode_target_index)
-                    .copied();
-                DecodeTarget {
-                    spatial_layer_id,
-                    temporal_layer_id,
-                    active,
-                    indication,
-                    protecting_chain_index,
-                }
-            })
+            .map(
+                |(decode_target_index, (spatial_layer_id, temporal_layer_id))| {
+                    let active = BitStream::read_ls_bit_of_u32(
+                        active_decode_targets_bitmask,
+                        decode_target_index as u8,
+                    )
+                    .unwrap_or(false);
+                    let indication = frame_dependency_definition
+                        .decode_target_indication_by_decode_target_index
+                        .get(decode_target_index)
+                        .copied()
+                        .unwrap_or(DecodeTargetIndication::NotPresent);
+                    let protecting_chain_index = shared_structure
+                        .protecting_chain_index_by_decode_target_index
+                        .get(decode_target_index)
+                        .copied();
+                    DecodeTarget {
+                        spatial_layer_id,
+                        temporal_layer_id,
+                        active,
+                        indication,
+                        protecting_chain_index,
+                    }
+                },
+            )
             .collect();
         Ok(ParsedDependencyDescriptor {
             truncated_frame_number: mandatory_fields.frame_number,
             spatial_layer_id: frame_dependency_definition.spatial_layer_id,
-            temporal_layer_iid: frame_dependency_definition.temporal_layer_id,
+            temporal_layer_id: frame_dependency_definition.temporal_layer_id,
             resolution: frame_dependency_definition.resolution,
-            referred_relative_frame_numbers: frame_dependency_definition.referred_relative_frame_numbers,
+            referred_relative_frame_numbers: frame_dependency_definition
+                .referred_relative_frame_numbers,
             previous_relative_frame_number_by_chain_index: frame_dependency_definition
                 .previous_relative_frame_number_by_chain_index,
             is_first_packet: mandatory_fields.start_of_frame,
@@ -772,20 +775,25 @@ impl<'bits> Parser<'bits> {
         let previous_frame_number_diff_by_chain_index = if custom_flags.chains {
             self.frame_chains(shared_structure.chain_count)?
         } else {
-            template.previous_relative_frame_number_by_chain_index.clone()
+            template
+                .previous_relative_frame_number_by_chain_index
+                .clone()
         };
         // The spec calls this  "FrameMaxWidth" and "FrameMaxHeight"
         let resolution = shared_structure
             .resolution_by_spatial_id
             .as_ref()
-            .and_then(|resolution_by_spatial_id| resolution_by_spatial_id.get(spatial_layer_id as usize))
+            .and_then(|resolution_by_spatial_id| {
+                resolution_by_spatial_id.get(spatial_layer_id as usize)
+            })
             .cloned();
         Ok(FrameDependencyDefinition {
             spatial_layer_id,
             temporal_layer_id,
             decode_target_indication_by_decode_target_index,
             referred_relative_frame_numbers: referred_frame_number_diffs,
-            previous_relative_frame_number_by_chain_index: previous_frame_number_diff_by_chain_index,
+            previous_relative_frame_number_by_chain_index:
+                previous_frame_number_diff_by_chain_index,
             resolution,
         })
     }
@@ -809,7 +817,7 @@ impl<'bits> Parser<'bits> {
             //   Table A.2 describes how the spatial ID and temporal ID values are determined.
             //   A next_layer_idc equal to 3 indicates that no more Frame dependency templates are present
             //   in the Frame dependency structure.
-            //   
+            //
             //   0 The next Frame dependency template has the same spatial ID and temporal ID as the current template
             //   1 The next Frame dependency template has the same spatial ID and temporal ID plus 1 compared with the current Frame dependency template.
             //   2 The next Frame dependency template has temporal ID equal to 0 and spatial ID plus 1 compared with the current Frame dependency template.
