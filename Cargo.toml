@@ -49,6 +49,11 @@ serde_json = "1.0"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "std"] }
 systemstat = "0.2.2"
 _str0m_test = { path = "_str0m_test" } # dummy package that enables "_internal_test_exports"
+criterion = "0.3"
+
+[[bench]]
+name = "rtp"
+harness = false
 
 # This is to ensure MSRV 1.65
 # Remove when we move MSRV
