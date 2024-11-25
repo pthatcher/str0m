@@ -382,11 +382,13 @@ impl RtcSctp {
 
         match event {
             DatagramEvent::NewAssociation(a) => {
-                info!("New remote association");
-                // Remote side initiated the association
-                self.assoc = Some(a);
-                self.handle = handle;
-                set_state(&mut self.state, RtcSctpState::AwaitAssociationEstablished);
+                if self.assoc.is_none() {
+                    info!("New remote association");
+                    // Remote side initiated the association
+                    self.assoc = Some(a);
+                    self.handle = handle;
+                    set_state(&mut self.state, RtcSctpState::AwaitAssociationEstablished);
+                }
             }
             DatagramEvent::AssociationEvent(event) => {
                 self.assoc
