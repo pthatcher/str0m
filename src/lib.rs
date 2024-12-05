@@ -626,8 +626,8 @@ use crypto::CryptoProvider;
 use crypto::Fingerprint;
 
 mod dtls;
-use dtls::DtlsCert;
-use dtls::{Dtls, DtlsEvent};
+use dtls::{Dtls, DtlsCert, DtlsEvent};
+pub use dtls::{DtlsCertOptions, DtlsPKeyType};
 
 #[path = "ice/mod.rs"]
 mod ice_;
@@ -1141,10 +1141,9 @@ impl Rtc {
             ice.set_ice_lite(config.ice_lite);
         }
 
-        let dtls_cert = if let Some(c) = config.dtls_cert {
-            c
-        } else {
-            DtlsCert::new(config.crypto_provider)
+        let dtls_cert = match config.dtls_cert_config {
+            DtlsCertConfig::Options(options) => DtlsCert::new(config.crypto_provider, options),
+            DtlsCertConfig::PregeneratedCert(cert) => cert,
         };
 
         let crypto_provider = dtls_cert.crypto_provider();
@@ -1854,6 +1853,25 @@ impl Rtc {
     }
 }
 
+/// Configuation for the DTLS certificate used for the Rtc instance. This can be set to
+/// allow a pregenerated certificate, or options to pass when generating a certificate
+/// on-the-fly.
+///
+/// The default value is DtlsCertConfig::Options(DtlsCertOptions::default())
+#[derive(Clone, Debug)]
+pub enum DtlsCertConfig {
+    /// The options to use for the DTLS certificate generated for this Rtc instance.
+    Options(DtlsCertOptions),
+    /// A pregenerated certificate to use for this Rtc instance.
+    PregeneratedCert(DtlsCert),
+}
+
+impl Default for DtlsCertConfig {
+    fn default() -> Self {
+        DtlsCertConfig::Options(DtlsCertOptions::default())
+    }
+}
+
 /// Customized config for creating an [`Rtc`] instance.
 ///
 /// ```
@@ -1871,7 +1889,7 @@ impl Rtc {
 pub struct RtcConfig {
     local_ice_credentials: Option<IceCreds>,
     crypto_provider: CryptoProvider,
-    dtls_cert: Option<DtlsCert>,
+    dtls_cert_config: DtlsCertConfig,
     fingerprint_verification: bool,
     ice_lite: bool,
     codec_config: CodecConfig,
@@ -1939,6 +1957,17 @@ impl RtcConfig {
         self.crypto_provider
     }
 
+    /// Returns the configured DTLS certificate configuration.
+    pub fn dtls_cert_config(&self) -> &DtlsCertConfig {
+        &self.dtls_cert_config
+    }
+
+    /// Set the DTLS certificate configuration for certificate generation.
+    pub fn set_dtls_cert_config(mut self, dtls_cert_config: DtlsCertConfig) -> Self {
+        self.dtls_cert_config = dtls_cert_config;
+        self
+    }
+
     /// Get the configured DTLS certificate, if set.
     ///
     /// Returns [`None`] if no DTLS certificate is set. In such cases,
@@ -1956,7 +1985,11 @@ impl RtcConfig {
     /// # }
     /// ```
     pub fn dtls_cert(&self) -> Option<&DtlsCert> {
-        self.dtls_cert.as_ref()
+        if let DtlsCertConfig::PregeneratedCert(ref cert) = self.dtls_cert_config {
+            Some(cert)
+        } else {
+            None
+        }
     }
 
     /// Set the DTLS certificate for secure communication.
@@ -1978,7 +2011,7 @@ impl RtcConfig {
     /// ```
     pub fn set_dtls_cert(mut self, dtls_cert: DtlsCert) -> Self {
         self.crypto_provider = dtls_cert.crypto_provider();
-        self.dtls_cert = Some(dtls_cert);
+        self.dtls_cert_config = DtlsCertConfig::PregeneratedCert(dtls_cert);
         self
     }
 
@@ -2388,7 +2421,7 @@ impl Default for RtcConfig {
         Self {
             local_ice_credentials: None,
             crypto_provider: CryptoProvider::process_default().unwrap_or(CryptoProvider::OpenSsl),
-            dtls_cert: None,
+            dtls_cert_config: Default::default(),
             fingerprint_verification: true,
             ice_lite: false,
             codec_config: CodecConfig::new_with_defaults(),
