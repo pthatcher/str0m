@@ -2,11 +2,11 @@ use super::WinCryptoError;
 use windows::{
     core::{HSTRING, PSTR},
     Win32::Security::Cryptography::{
-        szOID_RSA_SHA256RSA, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptHashData,
-        CertCreateSelfSignCertificate, CertFreeCertificateContext, CertStrToNameW,
-        BCRYPT_HASH_HANDLE, BCRYPT_SHA256_ALG_HANDLE, CERT_CONTEXT, CERT_CREATE_SELFSIGN_FLAGS,
-        CERT_OID_NAME_STR, CRYPT_ALGORITHM_IDENTIFIER, CRYPT_INTEGER_BLOB,
-        HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, X509_ASN_ENCODING,
+        szOID_ECC_CURVE_P256, szOID_RSA_SHA256RSA, BCryptCreateHash, BCryptDestroyHash,
+        BCryptFinishHash, BCryptHashData, CertCreateSelfSignCertificate,
+        CertFreeCertificateContext, CertStrToNameW, BCRYPT_HASH_HANDLE, BCRYPT_SHA256_ALG_HANDLE,
+        CERT_CONTEXT, CERT_CREATE_SELFSIGN_FLAGS, CERT_OID_NAME_STR, CRYPT_ALGORITHM_IDENTIFIER,
+        CRYPT_INTEGER_BLOB, HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, X509_ASN_ENCODING,
     },
 };
 
@@ -31,10 +31,18 @@ impl Certificate {
             pbData: subject_blob_buffer.as_mut_ptr(),
         };
 
-        // Use RSA-SHA256 for the signature, since SHA1 is deprecated.
-        let signature_algorithm = CRYPT_ALGORITHM_IDENTIFIER {
-            pszObjId: PSTR::from_raw(szOID_RSA_SHA256RSA.as_ptr() as *mut u8),
-            Parameters: CRYPT_INTEGER_BLOB::default(),
+        let signature_algorithm = if use_ecdsa_keys {
+            // Use EC-256 which corresponds to NID_X9_62_prime256v1
+            CRYPT_ALGORITHM_IDENTIFIER {
+                pszObjId: PSTR::from_raw(szOID_ECC_CURVE_P256.as_ptr() as *mut u8),
+                Parameters: CRYPT_INTEGER_BLOB::default(),
+            }
+        } else {
+            // Use RSA-SHA256 for the signature, since SHA1 is deprecated.
+            CRYPT_ALGORITHM_IDENTIFIER {
+                pszObjId: PSTR::from_raw(szOID_RSA_SHA256RSA.as_ptr() as *mut u8),
+                Parameters: CRYPT_INTEGER_BLOB::default(),
+            }
         };
 
         // SAFETY: The Windows APIs accept references, so normal borrow checker
@@ -133,8 +141,8 @@ impl Drop for Certificate {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn verify_self_signed() {
-        let cert = super::Certificate::new_self_signed("cn=WebRTC").unwrap();
+    fn verify_self_signed_rsa() {
+        let cert = super::Certificate::new_self_signed(false, "cn=WebRTC").unwrap();
 
         // Verify it is self-signed.
         unsafe {
@@ -147,8 +155,29 @@ mod tests {
     }
 
     #[test]
-    fn verify_fingerprint() {
-        let cert = super::Certificate::new_self_signed("cn=WebRTC").unwrap();
+    fn verify_self_signed_ecdsa() {
+        let cert = super::Certificate::new_self_signed(true, "cn=WebRTC").unwrap();
+
+        // Verify it is self-signed.
+        unsafe {
+            let subject = (*(*cert.0).pCertInfo).Subject;
+            let subject = std::slice::from_raw_parts(subject.pbData, subject.cbData as usize);
+            let issuer = (*(*cert.0).pCertInfo).Issuer;
+            let issuer = std::slice::from_raw_parts(issuer.pbData, issuer.cbData as usize);
+            assert_eq!(issuer, subject);
+        }
+    }
+
+    #[test]
+    fn verify_fingerprint_rsa() {
+        let cert = super::Certificate::new_self_signed(false, "cn=WebRTC").unwrap();
+        let fingerprint = cert.sha256_fingerprint().unwrap();
+        assert_eq!(fingerprint.len(), 32);
+    }
+
+    #[test]
+    fn verify_fingerprint_ecdsa() {
+        let cert = super::Certificate::new_self_signed(true, "cn=WebRTC").unwrap();
         let fingerprint = cert.sha256_fingerprint().unwrap();
         assert_eq!(fingerprint.len(), 32);
     }
