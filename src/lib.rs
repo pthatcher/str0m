@@ -600,8 +600,8 @@ mod crypto;
 use crypto::Fingerprint;
 
 mod dtls;
-use dtls::DtlsCert;
-use dtls::{Dtls, DtlsEvent};
+use dtls::{Dtls, DtlsCert, DtlsEvent};
+pub use dtls::{DtlsCertOptions, DtlsPKeyType};
 
 #[path = "ice/mod.rs"]
 mod ice_;
@@ -1110,11 +1110,11 @@ impl Rtc {
         } else {
             #[cfg(feature = "openssl")]
             {
-                DtlsCert::new_openssl()
+                DtlsCert::new_openssl(config.dtls_cert_options)
             }
             #[cfg(feature = "wincrypto")]
             {
-                DtlsCert::new_wincrypto()
+                DtlsCert::new_wincrypto(config.dtls_cert_options)
             }
             #[cfg(not(any(feature = "openssl", feature = "wincrypto")))]
             {
@@ -1829,6 +1829,7 @@ impl Rtc {
 pub struct RtcConfig {
     local_ice_credentials: Option<IceCreds>,
     dtls_cert: Option<DtlsCert>,
+    dtls_cert_options: DtlsCertOptions,
     fingerprint_verification: bool,
     ice_lite: bool,
     codec_config: CodecConfig,
@@ -1902,6 +1903,17 @@ impl RtcConfig {
     ///     .set_dtls_cert(dtls_cert);
     pub fn set_dtls_cert(mut self, dtls_cert: DtlsCert) -> Self {
         self.dtls_cert = Some(dtls_cert);
+        self
+    }
+
+    /// Returns the configured DTLS certificate options.
+    pub fn dtls_cert_options(&self) -> &DtlsCertOptions {
+        &self.dtls_cert_options
+    }
+
+    /// Set the DTLS certificate options for certificate generation.
+    pub fn set_dtls_cert_options(mut self, dtls_cert_options: DtlsCertOptions) -> Self {
+        self.dtls_cert_options = dtls_cert_options;
         self
     }
 
@@ -2307,6 +2319,7 @@ impl Default for RtcConfig {
         Self {
             local_ice_credentials: None,
             dtls_cert: None,
+            dtls_cert_options: Default::default(),
             fingerprint_verification: true,
             ice_lite: false,
             codec_config: CodecConfig::new_with_defaults(),

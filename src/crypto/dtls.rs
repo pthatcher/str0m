@@ -33,6 +33,25 @@ pub enum DtlsEvent {
     Data(Vec<u8>),
 }
 
+/// Defines the type of key pair to generate for the DTLS certificate.
+#[derive(Clone, Debug, Default)]
+pub enum DtlsPKeyType {
+    /// Generate an RSA key pair
+    #[default]
+    Rsa,
+    /// Generate an EC-DSA key pair using the NIST P-256 curve
+    Ecdsa,
+}
+
+/// Controls certificate generation options.
+#[derive(Clone, Debug, Default)]
+pub struct DtlsCertOptions {
+    /// Set the common name for the certificate. If not provided a default will be used.
+    pub common_name: Option<String>,
+    /// Set the key pair type to generate.
+    pub pkey_type: DtlsPKeyType,
+}
+
 /// Certificate used for DTLS.
 #[derive(Clone)]
 pub struct DtlsCert(DtlsCertInner);
@@ -48,15 +67,15 @@ enum DtlsCertInner {
 impl DtlsCert {
     #[cfg(feature = "openssl")]
     /// Create a new OpenSSL variant of the certificate.
-    pub fn new_openssl() -> Self {
-        let cert = super::ossl::OsslDtlsCert::new();
+    pub fn new_openssl(options: DtlsCertOptions) -> Self {
+        let cert = super::ossl::OsslDtlsCert::new(options);
         DtlsCert(DtlsCertInner::OpenSsl(cert))
     }
 
     #[cfg(feature = "wincrypto")]
     /// Create a new Windows Crypto variant of the certificate.
-    pub fn new_wincrypto() -> Self {
-        let cert = super::wincrypto::WinCryptoDtlsCert::new();
+    pub fn new_wincrypto(options: DtlsCertOptions) -> Self {
+        let cert = super::wincrypto::WinCryptoDtlsCert::new(options);
         DtlsCert(DtlsCertInner::WinCrypto(cert))
     }
 

@@ -10,7 +10,7 @@ mod ossl;
 pub mod wincrypto;
 
 mod dtls;
-pub use dtls::{DtlsCert, DtlsEvent, DtlsImpl};
+pub use dtls::{DtlsCert, DtlsCertOptions, DtlsEvent, DtlsImpl, DtlsPKeyType};
 
 mod finger;
 pub use finger::Fingerprint;
