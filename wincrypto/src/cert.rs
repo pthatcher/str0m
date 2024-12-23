@@ -1,13 +1,15 @@
 use super::WinCryptoError;
 use windows::{
-    core::{HSTRING, PSTR},
-    Win32::Security::Cryptography::{
-        szOID_ECC_CURVE_P256, szOID_RSA_SHA256RSA, BCryptCreateHash, BCryptDestroyHash,
+    core::{HSTRING, PWSTR,PSTR, w},
+    Win32::{Foundation::GetLastError, Security::Cryptography::{
+        szOID_ECDSA_SHA256, szOID_RSA_SHA256RSA, BCryptCreateHash, BCryptDestroyHash,
         BCryptFinishHash, BCryptHashData, CertCreateSelfSignCertificate,
         CertFreeCertificateContext, CertStrToNameW, BCRYPT_HASH_HANDLE, BCRYPT_SHA256_ALG_HANDLE,
         CERT_CONTEXT, CERT_CREATE_SELFSIGN_FLAGS, CERT_OID_NAME_STR, CRYPT_ALGORITHM_IDENTIFIER,
-        CRYPT_INTEGER_BLOB, HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, X509_ASN_ENCODING,
-    },
+        CRYPT_INTEGER_BLOB, HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, X509_ASN_ENCODING, CRYPT_KEY_PROV_INFO,
+        NCRYPT_SILENT_FLAG, MS_KEY_STORAGE_PROVIDER, CRYPT_KEY_FLAGS, NCryptFinalizeKey, NCryptCreatePersistedKey, CERT_KEY_SPEC, NCRYPT_FLAGS,
+        NCRYPT_ECDSA_P256_ALGORITHM, NCryptOpenStorageProvider, NCRYPT_KEY_HANDLE, NCRYPT_PROV_HANDLE,
+    }},
 };
 
 /// Certificate wraps the CERT_CONTEXT pointer, so that it can be destroyed
@@ -31,18 +33,40 @@ impl Certificate {
             pbData: subject_blob_buffer.as_mut_ptr(),
         };
 
-        let signature_algorithm = if use_ecdsa_keys {
+        let mut h_provider = NCRYPT_PROV_HANDLE::default();
+        let mut h_key = NCRYPT_KEY_HANDLE::default();
+        let key_prov_info = CRYPT_KEY_PROV_INFO {
+            pwszContainerName: PWSTR::from_raw(w!("YourKeyContainer").as_ptr() as *mut u16),
+            pwszProvName: PWSTR::from_raw(MS_KEY_STORAGE_PROVIDER.as_ptr() as *mut u16),
+            dwProvType: 0,
+            dwFlags: CRYPT_KEY_FLAGS(0),
+            cProvParam: 0,
+            rgProvParam: std::ptr::null_mut(),
+            dwKeySpec: 0,
+        };
+
+        let (key, key_prov_info_ref, signature_algorithm) = if use_ecdsa_keys {
             // Use EC-256 which corresponds to NID_X9_62_prime256v1
-            CRYPT_ALGORITHM_IDENTIFIER {
-                pszObjId: PSTR::from_raw(szOID_ECC_CURVE_P256.as_ptr() as *mut u8),
-                Parameters: CRYPT_INTEGER_BLOB::default(),
+            unsafe {
+                NCryptOpenStorageProvider(&mut h_provider, MS_KEY_STORAGE_PROVIDER, 0)?;
+                NCryptCreatePersistedKey(h_provider, &mut h_key, NCRYPT_ECDSA_P256_ALGORITHM, None, CERT_KEY_SPEC(0), NCRYPT_FLAGS(0))?;
+                NCryptFinalizeKey(h_key, NCRYPT_SILENT_FLAG)?;
             }
+            (HCRYPTPROV_OR_NCRYPT_KEY_HANDLE(h_key.0),
+            Some(&key_prov_info as *const CRYPT_KEY_PROV_INFO),
+            CRYPT_ALGORITHM_IDENTIFIER {
+                pszObjId: PSTR::from_raw(szOID_ECDSA_SHA256.as_ptr() as *mut u8),
+                Parameters: CRYPT_INTEGER_BLOB::default(),
+            })
         } else {
             // Use RSA-SHA256 for the signature, since SHA1 is deprecated.
-            CRYPT_ALGORITHM_IDENTIFIER {
+            (
+                HCRYPTPROV_OR_NCRYPT_KEY_HANDLE(0),
+                None,
+                CRYPT_ALGORITHM_IDENTIFIER {
                 pszObjId: PSTR::from_raw(szOID_RSA_SHA256RSA.as_ptr() as *mut u8),
                 Parameters: CRYPT_INTEGER_BLOB::default(),
-            }
+            })
         };
 
         // SAFETY: The Windows APIs accept references, so normal borrow checker
@@ -61,10 +85,10 @@ impl Certificate {
 
             // Generate the self-signed cert.
             let cert_context = CertCreateSelfSignCertificate(
-                HCRYPTPROV_OR_NCRYPT_KEY_HANDLE(0),
+                key,
                 &subject_blob,
                 CERT_CREATE_SELFSIGN_FLAGS(0),
-                None,
+                key_prov_info_ref,
                 Some(&signature_algorithm),
                 None,
                 None,
@@ -72,8 +96,9 @@ impl Certificate {
             );
 
             if cert_context.is_null() {
+                let win_err = GetLastError();
                 Err(WinCryptoError(
-                    "Failed to generate self-signed certificate".to_string(),
+                    format!("Failed to generate self-signed certificate: {:?}", win_err),
                 ))
             } else {
                 Ok(Self(cert_context))
@@ -140,12 +165,19 @@ impl Drop for Certificate {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Security::Cryptography::{
+            szOID_ECC_PUBLIC_KEY, szOID_RSA_RSA,
+        };
+    use std::ffi::CStr;
+    
     #[test]
     fn verify_self_signed_rsa() {
         let cert = super::Certificate::new_self_signed(false, "cn=WebRTC").unwrap();
 
         // Verify it is self-signed.
         unsafe {
+            assert_eq!(CStr::from_ptr((*(*cert.0).pCertInfo).SubjectPublicKeyInfo.Algorithm.pszObjId.0 as *const i8), 
+                CStr::from_ptr(szOID_RSA_RSA.as_ptr() as *const i8));
             let subject = (*(*cert.0).pCertInfo).Subject;
             let subject = std::slice::from_raw_parts(subject.pbData, subject.cbData as usize);
             let issuer = (*(*cert.0).pCertInfo).Issuer;
@@ -160,6 +192,8 @@ mod tests {
 
         // Verify it is self-signed.
         unsafe {
+            assert_eq!(CStr::from_ptr((*(*cert.0).pCertInfo).SubjectPublicKeyInfo.Algorithm.pszObjId.0 as *const i8), 
+                CStr::from_ptr(szOID_ECC_PUBLIC_KEY.as_ptr() as *const i8));
             let subject = (*(*cert.0).pCertInfo).Subject;
             let subject = std::slice::from_raw_parts(subject.pbData, subject.cbData as usize);
             let issuer = (*(*cert.0).pCertInfo).Issuer;
