@@ -9,14 +9,21 @@ pub struct WinCryptoDtlsCert {
 }
 
 impl WinCryptoDtlsCert {
-    pub fn new(options: &DtlsCertOptions) -> Self {
-        let identity = options
+    pub fn new(options: DtlsCertOptions) -> Self {
+        let common_name = options
             .common_name
-            .as_ref()
             .map_or(DTLS_CERT_IDENTITY, |s| s.as_str());
+        let use_ecdsa_keys = match options.dtls_pkey_type {
+            DtlsPkeyType::Rsa => false,
+            DtlsPkeyType::Ecdsa => true,
+        };
+
         let certificate = Arc::new(
-            str0m_wincrypto::Certificate::new_self_signed(&format!("CN={}", identity))
-                .expect("Failed to create self-signed certificate"),
+            str0m_wincrypto::Certificate::new_self_signed(
+                use_ecdsa_keys,
+                &format!("CN={}", common_name),
+            )
+            .expect("Failed to create self-signed certificate"),
         );
         Self { certificate }
     }

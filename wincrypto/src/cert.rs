@@ -23,7 +23,7 @@ unsafe impl Send for Certificate {}
 unsafe impl Sync for Certificate {}
 
 impl Certificate {
-    pub fn new_self_signed(subject: &str) -> Result<Self, WinCryptoError> {
+    pub fn new_self_signed(use_ecdsa_keys: bool, subject: &str) -> Result<Self, WinCryptoError> {
         let subject = HSTRING::from(subject);
         let mut subject_blob_buffer = vec![0u8; 256];
         let mut subject_blob = CRYPT_INTEGER_BLOB {
