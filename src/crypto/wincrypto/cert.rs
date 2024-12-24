@@ -12,7 +12,7 @@ impl WinCryptoDtlsCert {
     pub fn new(options: DtlsCertOptions) -> Self {
         let common_name = options
             .common_name
-            .map_or(DTLS_CERT_IDENTITY, |s| s.as_str());
+            .map_or(DTLS_CERT_IDENTITY, |s| s.as_str()).clone();
         let use_ecdsa_keys = match options.pkey_type {
             DtlsPKeyType::Rsa => false,
             DtlsPKeyType::Ecdsa => true,
