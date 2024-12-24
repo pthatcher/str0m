@@ -1,4 +1,4 @@
-use crate::crypto::dtls::DTLS_CERT_IDENTITY;
+use crate::crypto::dtls::{DtlsCertOptions, DTLS_CERT_IDENTITY};
 use crate::crypto::Fingerprint;
 use std::sync::Arc;
 use str0m_wincrypto::WinCryptoError;
