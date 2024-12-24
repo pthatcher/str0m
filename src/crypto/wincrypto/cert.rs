@@ -14,8 +14,8 @@ impl WinCryptoDtlsCert {
             .common_name
             .map_or(DTLS_CERT_IDENTITY, |s| s.as_str());
         let use_ecdsa_keys = match options.pkey_type {
-            DtlsPkeyType::Rsa => false,
-            DtlsPkeyType::Ecdsa => true,
+            DtlsPKeyType::Rsa => false,
+            DtlsPKeyType::Ecdsa => true,
         };
 
         let certificate = Arc::new(
