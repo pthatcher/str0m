@@ -1,4 +1,4 @@
-use crate::crypto::dtls::{DtlsCertOptions, DtlsPkeyType, DTLS_CERT_IDENTITY};
+use crate::crypto::dtls::{DtlsCertOptions, DtlsPKeyType, DTLS_CERT_IDENTITY};
 use crate::crypto::Fingerprint;
 use std::sync::Arc;
 use str0m_wincrypto::WinCryptoError;
@@ -13,7 +13,7 @@ impl WinCryptoDtlsCert {
         let common_name = options
             .common_name
             .map_or(DTLS_CERT_IDENTITY, |s| s.as_str());
-        let use_ecdsa_keys = match options.dtls_pkey_type {
+        let use_ecdsa_keys = match options.pkey_type {
             DtlsPkeyType::Rsa => false,
             DtlsPkeyType::Ecdsa => true,
         };
