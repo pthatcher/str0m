@@ -48,9 +48,9 @@ pub enum DtlsPKeyType {
 /// Controls certificate generation options.
 #[derive(Clone, Debug)]
 pub struct DtlsCertOptions {
-    /// Set the common name for the certificate.
+    /// The common name for the certificate.
     pub common_name: String,
-    /// Set the key pair type to generate.
+    /// The type of key to generate.
     pub pkey_type: DtlsPKeyType,
 }
 

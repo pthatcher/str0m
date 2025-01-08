@@ -637,7 +637,7 @@ pub use ice_::{Candidate, CandidateKind, IceConnectionState, IceCreds};
 
 /// Additional configuration.
 pub mod config {
-    pub use super::crypto::{CryptoProvider, DtlsCert, Fingerprint};
+    pub use super::crypto::{CryptoProvider, DtlsCert, DtlsCertOptions, Fingerprint};
 }
 
 /// Low level ICE access.
