@@ -215,17 +215,21 @@ impl Drop for Certificate {
 #[cfg(test)]
 mod tests {
     use std::ffi::CStr;
-    use windows::Win32::Security::Cryptography::{szOID_ECC_PUBLIC_KEY, szOID_RSA_RSA};
+    use windows::Win32::Security::Cryptography::{
+        szOID_ECC_PUBLIC_KEY, szOID_RSA_RSA, CertNameToStrA, CERT_NAME_ISSUER_FLAG,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_X500_NAME_STR, X509_ASN_ENCODING,
+    };
 
     #[test]
     fn verify_self_signed_rsa() {
-        let cert = super::Certificate::new_self_signed(false, "cn=WebRTC").unwrap();
+        let cert = super::Certificate::new_self_signed(false, "cn=WebRTC-RSA").unwrap();
+        let cert_context = cert.context();
 
         // Verify it is self-signed.
         unsafe {
             assert_eq!(
                 CStr::from_ptr(
-                    (*(*cert.0).pCertInfo)
+                    (*(*cert_context).pCertInfo)
                         .SubjectPublicKeyInfo
                         .Algorithm
                         .pszObjId
@@ -233,23 +237,52 @@ mod tests {
                 ),
                 CStr::from_ptr(szOID_RSA_RSA.as_ptr() as *const i8)
             );
-            let subject = (*(*cert.0).pCertInfo).Subject;
-            let subject = std::slice::from_raw_parts(subject.pbData, subject.cbData as usize);
-            let issuer = (*(*cert.0).pCertInfo).Issuer;
-            let issuer = std::slice::from_raw_parts(issuer.pbData, issuer.cbData as usize);
-            assert_eq!(issuer, subject);
+
+            let subject = (*(*cert_context).pCertInfo).Subject;
+            let issuer = (*(*cert_context).pCertInfo).Issuer;
+            // Verify raw contents are equivalent.
+            assert_eq!(
+                std::slice::from_raw_parts(issuer.pbData, issuer.cbData as usize),
+                std::slice::from_raw_parts(subject.pbData, subject.cbData as usize)
+            );
+
+            let mut buffer = [0u8; 128];
+            CertNameToStrA(
+                X509_ASN_ENCODING,
+                &subject,
+                CERT_X500_NAME_STR,
+                Some(&mut buffer),
+            );
+            let subject = CStr::from_bytes_until_nul(&buffer)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!("CN=WebRTC-RSA", subject);
+
+            CertNameToStrA(
+                X509_ASN_ENCODING,
+                &issuer,
+                CERT_X500_NAME_STR,
+                Some(&mut buffer),
+            );
+            let issuer = CStr::from_bytes_until_nul(&buffer)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!("CN=WebRTC-RSA", issuer);
         }
     }
 
     #[test]
     fn verify_self_signed_ec_dsa() {
-        let cert = super::Certificate::new_self_signed(true, "cn=WebRTC").unwrap();
+        let cert = super::Certificate::new_self_signed(true, "cn=ecDsa").unwrap();
+        let cert_context = cert.context();
 
         // Verify it is self-signed.
         unsafe {
             assert_eq!(
                 CStr::from_ptr(
-                    (*(*cert.0).pCertInfo)
+                    (*(*cert_context).pCertInfo)
                         .SubjectPublicKeyInfo
                         .Algorithm
                         .pszObjId
@@ -257,11 +290,38 @@ mod tests {
                 ),
                 CStr::from_ptr(szOID_ECC_PUBLIC_KEY.as_ptr() as *const i8)
             );
-            let subject = (*(*cert.0).pCertInfo).Subject;
-            let subject = std::slice::from_raw_parts(subject.pbData, subject.cbData as usize);
-            let issuer = (*(*cert.0).pCertInfo).Issuer;
-            let issuer = std::slice::from_raw_parts(issuer.pbData, issuer.cbData as usize);
-            assert_eq!(issuer, subject);
+            let subject = (*(*cert_context).pCertInfo).Subject;
+            let issuer = (*(*cert_context).pCertInfo).Issuer;
+            // Verify raw contents are equivalent.
+            assert_eq!(
+                std::slice::from_raw_parts(issuer.pbData, issuer.cbData as usize),
+                std::slice::from_raw_parts(subject.pbData, subject.cbData as usize)
+            );
+
+            let mut buffer = [0u8; 128];
+            CertNameToStrA(
+                X509_ASN_ENCODING,
+                &subject,
+                CERT_X500_NAME_STR,
+                Some(&mut buffer),
+            );
+            let subject = CStr::from_bytes_until_nul(&buffer)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!("CN=ecDsa", subject);
+
+            CertNameToStrA(
+                X509_ASN_ENCODING,
+                &issuer,
+                CERT_X500_NAME_STR,
+                Some(&mut buffer),
+            );
+            let issuer = CStr::from_bytes_until_nul(&buffer)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!("CN=ecDsa", issuer);
         }
     }
 
