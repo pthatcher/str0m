@@ -76,7 +76,8 @@ mod ossl;
 mod wincrypto;
 
 mod dtls;
-pub use dtls::{DtlsCert, DtlsCertOptions, DtlsEvent, DtlsImpl, DtlsPKeyType};
+pub(crate) use dtls::DtlsImpl;
+pub use dtls::{DtlsCert, DtlsCertOptions, DtlsEvent, DtlsPKeyType};
 
 mod finger;
 pub use finger::Fingerprint;

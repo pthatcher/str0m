@@ -88,12 +88,12 @@ impl DtlsCert {
     ///
     /// * **openssl** (defaults to on) for crypto backed by OpenSSL.
     /// * **wincrypto** for crypto backed by windows crypto.
-    pub fn new(p: CryptoProvider, dtls_cert_option: DtlsCertOptions) -> Self {
+    pub fn new(p: CryptoProvider, dtls_cert_options: DtlsCertOptions) -> Self {
         let inner = match p {
             CryptoProvider::OpenSsl => {
                 #[cfg(feature = "openssl")]
                 {
-                    let cert = super::ossl::OsslDtlsCert::new(dtls_cert_option);
+                    let cert = super::ossl::OsslDtlsCert::new(dtls_cert_options);
                     DtlsCertInner::OpenSsl(cert)
                 }
                 #[cfg(not(feature = "openssl"))]
@@ -104,7 +104,7 @@ impl DtlsCert {
             CryptoProvider::WinCrypto => {
                 #[cfg(all(feature = "wincrypto", target_os = "windows"))]
                 {
-                    let cert = super::wincrypto::WinCryptoDtlsCert::new(dtls_cert_option);
+                    let cert = super::wincrypto::WinCryptoDtlsCert::new(dtls_cert_options);
                     DtlsCertInner::WinCrypto(cert)
                 }
                 #[cfg(not(all(feature = "wincrypto", target_os = "windows")))]

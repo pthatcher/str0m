@@ -1939,7 +1939,7 @@ impl RtcConfig {
     ///
     /// This overrides what is set in [`CryptoProvider::install_process_default()`].
     pub fn set_crypto_provider(mut self, p: CryptoProvider) -> Self {
-        if let Some(c) = &self.dtls_cert {
+        if let DtlsCertConfig::PregeneratedCert(c) = &self.dtls_cert_config {
             if p != c.crypto_provider() {
                 panic!("set_dtls_cert() locked crypto provider to: {}", p);
             }
