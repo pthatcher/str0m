@@ -39,7 +39,7 @@ pub enum DtlsEvent {
 pub enum DtlsPKeyType {
     /// Generate an RSA key pair
     /// TODO: Consider changing the default to EC-DSA which is the behavior in WebRTC since 2016.
-    /// See https://developer.chrome.com/blog/webrtc-ecdsa/ for detailed rationale.
+    /// See <https://developer.chrome.com/blog/webrtc-ecdsa/> for detailed rationale.
     #[default]
     Rsa,
     /// Generate an EC-DSA key pair using the NIST P-256 curve
