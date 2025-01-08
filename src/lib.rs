@@ -2002,9 +2002,9 @@ impl RtcConfig {
     ///
     /// ```
     /// # use str0m::RtcConfig;
-    /// # use str0m::config::{DtlsCert, CryptoProvider};
+    /// # use str0m::config::{DtlsCert, DtlsCertOptions, CryptoProvider};
     ///
-    /// let dtls_cert = DtlsCert::new(CryptoProvider::OpenSsl);
+    /// let dtls_cert = DtlsCert::new(CryptoProvider::OpenSsl, DtlsCertOptions::default());
     ///
     /// let rtc_config = RtcConfig::default()
     ///     .set_dtls_cert(dtls_cert);
