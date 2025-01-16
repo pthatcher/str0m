@@ -16,7 +16,8 @@ use super::stream::TlsStream;
 use super::CryptoError;
 
 const DTLS_CIPHERS: &str = "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH";
-const DTLS_EC_CURVE: Nid = Nid::X9_62_PRIME256V1;
+const DTLS_EC_CURVES: &str = "X25519:P-256:P-521:P-384:secp256k1";
+const DTLS_ECDH_CURVE: Nid = Nid::X9_62_PRIME256V1;
 
 pub struct OsslDtlsImpl {
     /// Certificate for the DTLS session.
@@ -135,7 +136,7 @@ pub fn dtls_create_ctx(cert: &OsslDtlsCert) -> Result<SslContext, CryptoError> {
     // it instead.
     // let method = unsafe { SslMethod::from_ptr(DTLSv1_2_method()) };
     let mut ctx = SslContextBuilder::new(SslMethod::dtls())?;
-
+    ctx.set_groups_list(DTLS_EC_CURVES);
     ctx.set_cipher_list(DTLS_CIPHERS)?;
     let srtp_profiles = {
         // Rust can't join directly to a string, need to allocate a vec first :(
@@ -171,7 +172,7 @@ pub fn dtls_ssl_create(ctx: &SslContext) -> Result<Ssl, CryptoError> {
     let mut ssl = Ssl::new(ctx)?;
     ssl.set_mtu(DATAGRAM_MTU as u32)?;
 
-    let eckey = EcKey::from_curve_name(DTLS_EC_CURVE)?;
+    let eckey = EcKey::from_curve_name(DTLS_ECDH_CURVE)?;
     ssl.set_tmp_ecdh(&eckey)?;
 
     Ok(ssl)
