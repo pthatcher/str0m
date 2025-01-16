@@ -40,7 +40,7 @@ impl OsslDtlsCert {
                 PKey::from_rsa(key)?
             }
             DtlsPKeyType::EcDsaP256 => {
-                let nid = Nid::X9_62_PRIME256V1; // NIST P-256 curve
+                let nid = Nid::BRAINPOOL_P384R1; //X9_62_PRIME256V1; // NIST P-256 curve
                 let group = EcGroup::from_curve_name(nid)?;
                 let key = EcKey::generate(&group)?;
                 PKey::from_ec_key(key)?
