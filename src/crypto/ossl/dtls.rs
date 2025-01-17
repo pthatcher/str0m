@@ -16,7 +16,7 @@ use super::stream::TlsStream;
 use super::CryptoError;
 
 const DTLS_CIPHERS: &str = "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH";
-const DTLS_EC_CURVES: &str = "P-256:P-384:P-521:X25519:X448:brainpoolP256r1tls13:brainpoolP384r1tls13:brainpoolP512r1tls13:ffdhe2048:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192";
+const DTLS_EC_CURVES: &str = "P-256:P-384:P-521:X25519:X448:brainpoolP384r1tls13";
 const DTLS_ECDH_CURVE: Nid = Nid::X9_62_PRIME256V1;
 
 pub struct OsslDtlsImpl {
