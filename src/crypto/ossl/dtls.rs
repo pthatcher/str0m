@@ -137,7 +137,6 @@ pub fn dtls_create_ctx(cert: &OsslDtlsCert) -> Result<SslContext, CryptoError> {
     let mut ctx = SslContextBuilder::new(SslMethod::dtls())?;
 
     ctx.set_cipher_list(DTLS_CIPHERS)?;
-    ctx.set_ciphersuites(DTLS_CIPHERS)?;
     let srtp_profiles = {
         // Rust can't join directly to a string, need to allocate a vec first :(
         // This happens very rarely so the extra allocations don't matter
