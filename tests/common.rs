@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use pcap_file::pcap::PcapReader;
 use str0m::change::SdpApi;
+use str0m::config::{DtlsCertOptions, DtlsPKeyType};
 use str0m::format::Codec;
 use str0m::format::PayloadParams;
 use str0m::net::Protocol;
@@ -14,7 +15,7 @@ use str0m::net::Receive;
 use str0m::rtp::ExtensionMap;
 use str0m::rtp::RtpHeader;
 use str0m::Candidate;
-use str0m::{Event, Input, Output, Rtc, RtcError};
+use str0m::{DtlsCertConfig, Event, Input, Output, Rtc, RtcConfig, RtcError};
 use tracing::info_span;
 use tracing::Span;
 
@@ -28,7 +29,17 @@ pub struct TestRtc {
 
 impl TestRtc {
     pub fn new(span: Span) -> Self {
+        RtcConfig::default();
         Self::new_with_rtc(span, Rtc::new())
+    }
+
+    pub fn new2(span: Span) -> Self {
+        let dtls_cert_config = DtlsCertConfig::Options(DtlsCertOptions {
+            common_name: "Clark Kent".into(),
+            pkey_type: DtlsPKeyType::Rsa2048,
+        });
+        let config = RtcConfig::default().set_dtls_cert_config(dtls_cert_config);
+        Self::new_with_rtc(span, config.build())
     }
 
     pub fn new_with_rtc(span: Span, rtc: Rtc) -> Self {

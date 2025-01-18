@@ -75,9 +75,12 @@ where
     }
 
     pub fn handshaken(&mut self) -> Result<&mut SslStream<S>, io::Error> {
+        println!("hsss1");
         let active = self.is_active().expect("set_active must be called");
+        println!("hsss2");
         let v = self.state.handshaken(active)?;
 
+        println!("hsss3");
         // first time we complete the handshake, we extract the keying material for SRTP.
         if !self.exported {
             let keying_mat = export_srtp_keying_material(v)?;
@@ -109,24 +112,31 @@ where
     S: io::Read + io::Write + UnwindSafe,
 {
     fn handshaken(&mut self, active: bool) -> Result<&mut SslStream<S>, io::Error> {
+        println!("hss_1");
         if let State::Established(v) = self {
+            println!("hss_2");
             return Ok(v);
         }
 
         let taken = mem::replace(self, State::Empty);
+        println!("hss_3");
 
         let result = match taken {
             State::Empty | State::Established(_) => unreachable!(),
             State::Init(ssl, stream) => {
                 if active {
-                    debug!("Connect");
+                    println!("Connect");
                     ssl.connect(stream)
                 } else {
-                    debug!("Accept");
+                    println!("Accept");
                     ssl.accept(stream)
                 }
             }
-            State::Handshaking(mid) => mid.handshake(),
+            State::Handshaking(mid) => {
+                let m = mid.handshake();
+                println!("shaking");
+                m
+            }
         };
 
         match result {
@@ -144,12 +154,12 @@ where
                     io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock")
                 }
                 HandshakeError::SetupFailure(e) => {
-                    debug!("DTLS setup failed: {:?}", e);
+                    println!("DTLS setup failed: {:?}", e);
                     io::Error::new(io::ErrorKind::InvalidInput, e)
                 }
                 HandshakeError::Failure(e) => {
                     let e = e.into_error();
-                    debug!("DTLS failure: {:?}", e);
+                    println!("DTLS failure: {:?}", e);
                     io::Error::new(io::ErrorKind::InvalidData, e)
                 }
             }),

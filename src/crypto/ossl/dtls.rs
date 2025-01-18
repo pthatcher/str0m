@@ -15,8 +15,8 @@ use super::io_buf::IoBuffer;
 use super::stream::TlsStream;
 use super::CryptoError;
 
-const DTLS_CIPHERS: &str = "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH";
-const DTLS_EC_CURVE: Nid = Nid::X9_62_PRIME256V1;
+const DTLS_CIPHERS: &str = "AESGCM:AES256";
+const DTLS_ECDH_CURVE: Nid = Nid::SECP384R1; //X9_62_PRIME256V1;
 
 pub struct OsslDtlsImpl {
     /// Certificate for the DTLS session.
@@ -30,15 +30,40 @@ pub struct OsslDtlsImpl {
 
     /// The actual openssl TLS stream.
     tls: TlsStream<IoBuffer>,
+    p: bool,
+}
+
+static SOCKET1: std::sync::OnceLock<std::net::UdpSocket> = std::sync::OnceLock::new();
+static SOCKET2: std::sync::OnceLock<std::net::UdpSocket> = std::sync::OnceLock::new();
+fn socket(p: bool) -> &'static std::net::UdpSocket {
+    let s1 = SOCKET1.get_or_init(|| {
+        let s = std::net::UdpSocket::bind(("127.0.0.1", 21337)).unwrap();
+        s.connect(("127.0.0.1", 21338)).unwrap();
+        s
+    });
+    let s2 = SOCKET2.get_or_init(|| {
+        let s = std::net::UdpSocket::bind(("127.0.0.1", 21338)).unwrap();
+        s.connect(("127.0.0.1", 21337)).unwrap();
+        s
+    });
+    if p {
+        s1
+    } else {
+        s2
+    }
 }
 
 impl OsslDtlsImpl {
     pub fn new(cert: OsslDtlsCert) -> Result<Self, super::CryptoError> {
+        let subject = format!("{:?}", cert.x509.subject_name());
+        let p = subject.contains("Clark");
+
         let context = dtls_create_ctx(&cert)?;
         let ssl = dtls_ssl_create(&context)?;
         Ok(OsslDtlsImpl {
             _cert: cert,
             _context: context,
+            p,
             tls: TlsStream::new(ssl, IoBuffer::default()),
         })
     }
@@ -54,20 +79,29 @@ impl DtlsInner for OsslDtlsImpl {
     }
 
     fn handle_receive(&mut self, m: &[u8], o: &mut VecDeque<DtlsEvent>) -> Result<(), CryptoError> {
+        println!("hr1 {:?}", m);
+        _ = socket(self.p).send(m);
         self.tls.inner_mut().set_incoming(m);
+        println!("hr2");
 
         if self.handle_handshake(o)? {
             // early return as long as we're handshaking
+            println!("hr3");
             return Ok(());
         }
 
+        println!("hr4");
         let mut buf = vec![0; 2000];
         let n = match self.tls.read(&mut buf) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                println!("hr5");
                 return Ok(());
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                println!("hr6");
+                return Err(e.into());
+            }
         };
         buf.truncate(n);
 
@@ -77,6 +111,7 @@ impl DtlsInner for OsslDtlsImpl {
     }
 
     fn poll_datagram(&mut self) -> Option<crate::net::DatagramSend> {
+        println!("poll_datagram");
         let x = self.tls.inner_mut().pop_outgoing();
         if let Some(x) = &x {
             if x.len() > DATAGRAM_MTU_WARN {
@@ -88,6 +123,7 @@ impl DtlsInner for OsslDtlsImpl {
     }
 
     fn poll_timeout(&mut self, now: Instant) -> Option<Instant> {
+        println!("poll_timeout");
         // OpenSSL has a built-in timeout of 1 second that is doubled for
         // each retry. There is a way to get direct control over the
         // timeout (using DTLS_set_timer_cb), but that function doesn't
@@ -100,6 +136,8 @@ impl DtlsInner for OsslDtlsImpl {
     }
 
     fn handle_input(&mut self, data: &[u8]) -> Result<(), CryptoError> {
+        println!("handle_input {:?}", data);
+
         Ok(self.tls.write_all(data)?)
     }
 
@@ -108,10 +146,13 @@ impl DtlsInner for OsslDtlsImpl {
     }
 
     fn handle_handshake(&mut self, output: &mut VecDeque<DtlsEvent>) -> Result<bool, CryptoError> {
+        println!("hh1");
         if self.tls.is_connected() {
             // Nice. Nothing to do.
+            println!("hh2");
             Ok(false)
         } else if self.tls.complete_handshake_until_block()? {
+            println!("hh3");
             output.push_back(DtlsEvent::Connected);
 
             let (keying_material, srtp_profile, fingerprint) = self
@@ -124,6 +165,7 @@ impl DtlsInner for OsslDtlsImpl {
             output.push_back(DtlsEvent::SrtpKeyingMaterial(keying_material, srtp_profile));
             Ok(false)
         } else {
+            println!("hh4");
             Ok(true)
         }
     }
@@ -170,9 +212,8 @@ pub fn dtls_create_ctx(cert: &OsslDtlsCert) -> Result<SslContext, CryptoError> {
 pub fn dtls_ssl_create(ctx: &SslContext) -> Result<Ssl, CryptoError> {
     let mut ssl = Ssl::new(ctx)?;
     ssl.set_mtu(DATAGRAM_MTU as u32)?;
-
-    let eckey = EcKey::from_curve_name(DTLS_EC_CURVE)?;
-    ssl.set_tmp_ecdh(&eckey)?;
+    //let eckey = EcKey::from_curve_name(DTLS_ECDH_CURVE)?;
+    //ssl.set_tmp_ecdh(&eckey)?;
 
     Ok(ssl)
 }
