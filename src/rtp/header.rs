@@ -12,7 +12,8 @@ pub struct RtpHeader {
     pub has_padding: bool,
     /// RTP packet has "RTP header extensions".
     pub has_extension: bool,
-    // pub csrc_count: usize, // "contributing source" (other ssrc)
+    /// "contributing source" (other ssrc)
+    pub csrc_count: usize,
     /// For video, this marker signifies the end of a series of packets that
     /// together form a single video frame.
     /// For audio, it marks the beginning of a talkspurt, which is a burst of
@@ -27,7 +28,8 @@ pub struct RtpHeader {
     pub timestamp: u32,
     /// Sender source identifier.
     pub ssrc: Ssrc,
-    // pub csrc: [u32; 15],
+    /// "contributing source" (other ssrc)
+    pub csrc: [u32; 15],
     /// The extension values parsed using the mapping via SDP.
     pub ext_vals: ExtensionValues,
     /// Length of header.
@@ -210,13 +212,13 @@ impl RtpHeader {
             version,
             has_padding,
             has_extension,
-            // csrc_count,
+            csrc_count,
             marker,
             payload_type,
             sequence_number,
             timestamp,
             ssrc: ssrc.into(),
-            // csrc,
+            csrc,
             ext_vals: ext,
             header_len,
         };
@@ -321,6 +323,8 @@ impl Default for RtpHeader {
             payload_type: 1.into(),
             sequence_number: 0,
             timestamp: 0,
+            csrc_count: 0,
+            csrc: [0; 15],
             ssrc: 0.into(),
             ext_vals: ExtensionValues::default(),
             header_len: 16,
@@ -559,6 +563,8 @@ mod test {
             h1,
             RtpHeader {
                 version: 2,
+                csrc_count: 0,
+                csrc: [0; 15],
                 has_padding: true,
                 has_extension: true,
                 marker: false,
@@ -587,6 +593,8 @@ mod test {
                 version: 2,
                 has_padding: true,
                 has_extension: true,
+                csrc_count: 0,
+                csrc: [0; 15],
                 marker: false,
                 payload_type: 111.into(),
                 sequence_number: 47001,
@@ -614,6 +622,8 @@ mod test {
                 has_padding: true,
                 has_extension: true,
                 marker: false,
+                csrc_count: 0,
+                csrc: [0; 15],
                 payload_type: 111.into(),
                 sequence_number: 47002,
                 timestamp: 14000,
@@ -662,6 +672,9 @@ mod test {
                 has_padding: true,
                 has_extension: true,
                 marker: false,
+                csrc_count: 0,
+                csrc: [0; 15],
+
                 payload_type: 111.into(),
                 sequence_number: 47000,
                 timestamp: 10000,
@@ -690,6 +703,9 @@ mod test {
                 marker: false,
                 payload_type: 111.into(),
                 sequence_number: 47001,
+                csrc_count: 0,
+                csrc: [0; 15],
+
                 timestamp: 12000,
                 ssrc: 777459193.into(),
                 ext_vals: ExtensionValues {
@@ -715,6 +731,8 @@ mod test {
                 has_extension: true,
                 marker: false,
                 payload_type: 111.into(),
+                csrc_count: 0,
+                csrc: [0; 15],
                 sequence_number: 47002,
                 timestamp: 14000,
                 ssrc: 777459193.into(),
