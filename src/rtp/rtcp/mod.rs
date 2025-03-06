@@ -101,7 +101,8 @@ impl Rtcp {
             let header: RtcpHeader = match buf.try_into() {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!("{}", e);
+                    error!("Failed to parse RTCP Header: {}", e);
+                    error!("{:02X?}", &buf);
                     break;
                 }
             };
@@ -126,7 +127,10 @@ impl Rtcp {
 
             match (&buf[..unpadded_length]).try_into() {
                 Ok(v) => feedback.push_back(v),
-                Err(e) => debug!("{}", e),
+                Err(e) => {
+                    error!("Unknown RTCP {}", e);
+                    error!("{:02X?}", &buf[..unpadded_length]);
+                }
             }
 
             buf = &buf[full_length..];
