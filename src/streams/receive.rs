@@ -111,6 +111,8 @@ pub struct StreamRx {
     msi: u32,
     /// MSI Cnt
     msi_cnt: u16,
+    /// MSI bool,
+    msi_pending: bool,
 }
 
 /// Holder of stats.
@@ -160,6 +162,7 @@ impl StreamRx {
             need_paused_event: false,
             pause_threshold: Duration::from_millis(1500),
             msi: 0,
+            msi_pending: false,
             msi_cnt: 0,
         }
     }
@@ -215,6 +218,7 @@ impl StreamRx {
         if msi != self.msi {
             self.msi = msi;
             self.msi_cnt += 1;
+            self.msi_pending = true;
         }
     }
 
@@ -471,13 +475,9 @@ impl StreamRx {
         sender_ssrc: Ssrc,
         feedback: &mut VecDeque<Rtcp>,
     ) {
-        let Some(kind) = self.pending_request_keyframe.take() else {
-            return;
-        };
-
         let ssrc = self.ssrc;
 
-        if self.msi != 0 {
+        if self.msi_pending && self.msi != 0 {
             feedback.push_back(Rtcp::Vsr(Vsr {
                 sender_ssrc,
                 ssrc,
@@ -485,6 +485,10 @@ impl StreamRx {
                 request_id: self.msi_cnt,
             }));
         }
+
+        let Some(kind) = self.pending_request_keyframe.take() else {
+            return;
+        };
 
         match kind {
             KeyframeRequestKind::Pli => {
