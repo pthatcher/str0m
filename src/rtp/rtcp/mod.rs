@@ -33,6 +33,9 @@ pub use nack::{Nack, NackEntry};
 mod pli;
 pub use pli::Pli;
 
+mod vsr;
+pub use vsr::Vsr;
+
 mod fir;
 pub use fir::{Fir, FirEntry};
 
@@ -88,6 +91,8 @@ pub enum Rtcp {
     Twcc(Twcc),
     /// Receiver Estimated Maximum Bitrate. Feedback to the sender about the maximum bitrate.
     Remb(Remb),
+    /// VSR
+    Vsr(Vsr),
 }
 
 impl Rtcp {
@@ -240,6 +245,7 @@ impl Rtcp {
             Rtcp::Fir(v) => v.reports.is_full(),
             Rtcp::Twcc(_) => true,
             Rtcp::Remb(_) => true,
+            Rtcp::Vsr(_) => true,
         }
     }
 
@@ -267,6 +273,7 @@ impl Rtcp {
             Rtcp::Twcc(_) => false,
             // A REMB report is never empty.
             Rtcp::Remb(_) => false,
+            Rtcp::Vsr(_) => false,
         }
     }
 
@@ -340,10 +347,11 @@ impl Rtcp {
 
             SourceDescription(_) => 2,
             Nack(_) => 3,
-            Pli(_) => 4,
-            Fir(_) => 5,
-            Twcc(_) => 6,
-            Remb(_) => 7,
+            Vsr(_) => 4,
+            Pli(_) => 5,
+            Fir(_) => 6,
+            Twcc(_) => 7,
+            Remb(_) => 8,
             ExtendedReport(_) => 10,
 
             // Goodbye last since they remove stuff.
@@ -365,6 +373,7 @@ impl RtcpPacket for Rtcp {
             Rtcp::Fir(v) => v.header(),
             Rtcp::Twcc(v) => v.header(),
             Rtcp::Remb(v) => v.header(),
+            Rtcp::Vsr(v) => v.header(),
         }
     }
 
@@ -380,6 +389,7 @@ impl RtcpPacket for Rtcp {
             Rtcp::Fir(v) => v.length_words(),
             Rtcp::Twcc(v) => v.length_words(),
             Rtcp::Remb(v) => v.length_words(),
+            Rtcp::Vsr(v) => v.length_words(),
         }
     }
 
@@ -395,6 +405,7 @@ impl RtcpPacket for Rtcp {
             Rtcp::Fir(v) => v.write_to(buf),
             Rtcp::Twcc(v) => v.write_to(buf),
             Rtcp::Remb(v) => v.write_to(buf),
+            Rtcp::Vsr(v) => v.write_to(buf),
         }
     }
 }

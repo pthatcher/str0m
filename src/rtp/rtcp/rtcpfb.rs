@@ -1,5 +1,5 @@
 use super::{DlrrItem, FirEntry, NackEntry, ReceptionReport, Remb, ReportBlock, ReportList};
-use super::{Rrtr, Rtcp, Sdes, SenderInfo, Ssrc, Twcc};
+use super::{Rrtr, Rtcp, Sdes, SenderInfo, Ssrc, Twcc, Vsr};
 
 /// Normalization of [`Rtcp`] so we can deal with one SSRC at a time.
 #[allow(clippy::large_enum_variant)]
@@ -16,6 +16,7 @@ pub enum RtcpFb {
     Fir(FirEntry),                     // rx -> tx
     Twcc(Twcc),                        // rx -> tx
     Remb(Remb),                        // rx -> tx
+    Vsr(Vsr),
 }
 
 impl RtcpFb {
@@ -72,6 +73,9 @@ impl RtcpFb {
                 Rtcp::Remb(v) => {
                     q.push(RtcpFb::Remb(v));
                 }
+                Rtcp::Vsr(v) => {
+                    q.push(RtcpFb::Vsr(v));
+                }
             }
         }
         q.into_iter()
@@ -90,6 +94,7 @@ impl RtcpFb {
             RtcpFb::Fir(v) => v.ssrc,
             RtcpFb::Twcc(v) => v.ssrc,
             RtcpFb::Remb(v) => v.ssrcs.first().map(|ssrc| (*ssrc).into()).unwrap_or(v.ssrc),
+            RtcpFb::Vsr(v) => v.ssrc,
         }
     }
 }

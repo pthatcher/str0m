@@ -2,11 +2,11 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::media::KeyframeRequestKind;
-use crate::rtp_::MidRid;
 use crate::rtp_::{
     extend_u32, Bitrate, DlrrItem, ExtendedReport, Fir, FirEntry, Frequency, MediaTime, Remb,
 };
 use crate::rtp_::{Mid, Pli, Pt, ReceiverReport};
+use crate::rtp_::{MidRid, Vsr};
 use crate::rtp_::{ReportBlock, ReportList, Rid, Rrtr, Rtcp, RtcpFb, RtpHeader, SenderInfo, SeqNo};
 use crate::rtp_::{SdesType, Ssrc};
 use crate::stats::{MediaIngressStats, StatsSnapshot};
@@ -106,6 +106,11 @@ pub struct StreamRx {
 
     /// The configured threshold before considering the lack of packets as going into paused.
     pause_threshold: Duration,
+
+    /// MSI
+    msi: u32,
+    /// MSI Cnt
+    msi_cnt: u16,
 }
 
 /// Holder of stats.
@@ -154,6 +159,8 @@ impl StreamRx {
             paused: true,
             need_paused_event: false,
             pause_threshold: Duration::from_millis(1500),
+            msi: 0,
+            msi_cnt: 0,
         }
     }
 
@@ -201,6 +208,14 @@ impl StreamRx {
     /// * kind PLI or FIR.
     pub fn request_keyframe(&mut self, kind: KeyframeRequestKind) {
         self.pending_request_keyframe = Some(kind);
+    }
+
+    /// Bah
+    pub fn set_msi(&mut self, msi: u32) {
+        if msi != self.msi {
+            self.msi = msi;
+            self.msi_cnt += 1;
+        }
     }
 
     /// Request max recv bitrate for an incoming encoded stream.
@@ -461,6 +476,15 @@ impl StreamRx {
         };
 
         let ssrc = self.ssrc;
+
+        if self.msi != 0 {
+            feedback.push_back(Rtcp::Vsr(Vsr {
+                sender_ssrc,
+                ssrc,
+                msi: self.msi,
+                request_id: self.msi_cnt,
+            }));
+        }
 
         match kind {
             KeyframeRequestKind::Pli => {
