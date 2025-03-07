@@ -216,6 +216,7 @@ impl StreamRx {
     /// Bah
     pub fn set_msi(&mut self, msi: u32) {
         if msi != self.msi {
+            error!(?msi, "Updated desired MSI!");
             self.msi = msi;
             self.msi_cnt += 1;
             self.msi_pending = true;
@@ -478,12 +479,14 @@ impl StreamRx {
         let ssrc = self.ssrc;
 
         if self.msi_pending && self.msi != 0 {
-            feedback.push_back(Rtcp::Vsr(Vsr {
+            let vsr = Rtcp::Vsr(Vsr {
                 sender_ssrc,
                 ssrc,
                 msi: self.msi,
                 request_id: self.msi_cnt,
-            }));
+            });
+            error!(?vsr, "Sending VSR!");
+            feedback.push_back(vsr);
         }
 
         let Some(kind) = self.pending_request_keyframe.take() else {

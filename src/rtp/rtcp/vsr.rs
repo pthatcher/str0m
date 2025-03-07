@@ -60,6 +60,7 @@ impl RtcpPacket for Vsr {
             0x00, 0x00, 0x00, 0x00, // -- End histogram
             0x00, 0x1f, 0xa4, 0x00, // Max pixels (4 bytes)
         ]);
+        error!("Sending VSR {:02X?}", &buf[0..100]);
         100
     }
 }
