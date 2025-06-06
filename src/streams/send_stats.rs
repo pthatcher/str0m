@@ -139,12 +139,27 @@ impl StreamTxStats {
                 rtt: self.rtt,
                 loss,
                 timestamp: now,
-                remote: self.last_rr.as_ref().map(|rr| RemoteIngressStats {
-                    jitter: rr.jitter,
-                    // We only receive 32-bit extend sequence numbers, but Str0m uses 64-bit internally,
-                    // so we'll extend with 0s.
-                    maximum_sequence_number: seq_no.create_from_partial(rr.max_seq),
-                    packets_lost: rr.packets_lost as u64,
+                remote: self.last_rr.as_ref().map(|rr| {
+                    // We only receive 32-bit extend sequence numbers, so we'll extend it to 64bits.
+                    // Since our local SeqNo should be higher than anything received in the RR, we'll
+                    // assume the RR SeqNo represents a packet within the last 2**32 packets.
+                    let maximum_sequence_number = if rr.max_seq < *seq_no as u32 {
+                        // If max_seq is less than the 32-bit partial of seq_no, then we can reuse the
+                        // upper 32-bits unchanged to generate an extended sequence number.
+                        (*seq_no & 0xffff_ffff_0000_0000) | (rr.max_seq as u64)
+                    } else {
+                        // If max_seq is not less than the 32-bit partial of seq_no, then we need to
+                        // decrement the upper 32-bits by 1 to generate an extended sequence number.
+                        ((*seq_no).wrapping_sub(0x0000_0001_0000_0000) & 0xffff_ffff_0000_0000)
+                            | (rr.max_seq as u64)
+                    }
+                    .into();
+
+                    RemoteIngressStats {
+                        jitter: rr.jitter,
+                        maximum_sequence_number,
+                        packets_lost: rr.packets_lost as u64,
+                    }
                 }),
             },
         );
