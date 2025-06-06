@@ -251,10 +251,10 @@ impl SeqNo {
     /// let seq_no: SeqNo = 0x0000_0001_0001_0000.into();
     ///
     /// // Assumes this one is from the current u32 cycle
-    /// assert_eq!(seq_no.create_from_partial(0x0000_1234), SeqNo(0x0000_0001_0001_1234));
+    /// assert_eq!(seq_no.create_from_partial(0x0000_1234), 0x0000_0001_0001_1234.into());
     ///
     /// // Assumes this one is from the previous u32 cycle
-    /// assert_eq!(seq_no.create_from_partial(0x0002_1234), SeqNo(0x0000_0000_0002_1234));
+    /// assert_eq!(seq_no.create_from_partial(0x0002_1234), 0x0000_0000_0002_1234.into());
     /// ```
     pub fn create_from_partial(&self, earlier_partial_seq_no: u32) -> Self {
         let mut upper_count = self.0 >> 32;
