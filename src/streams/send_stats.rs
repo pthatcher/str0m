@@ -1,7 +1,8 @@
 use std::time::Instant;
 
+use crate::rtp::SeqNo;
 use crate::rtp_::{extend_u16, ReceptionReport};
-use crate::stats::{MediaEgressStats, StatsSnapshot};
+use crate::stats::{MediaEgressStats, RemoteIngressStats, StatsSnapshot};
 use crate::util::value_history::ValueHistory;
 use crate::util::{calculate_rtt_ms, InstantExt};
 
@@ -31,6 +32,8 @@ pub(crate) struct StreamTxStats {
     rtt: Option<f32>,
     /// losses collecter from RR (known packets, lost ratio)
     losses: Losses,
+    /// The last reception report for the stream, if any.
+    last_rr: Option<ReceptionReport>,
 
     /// `None` if `rtx_ratio_cap` is `None`.
     pub bytes_transmitted: Option<ValueHistory<u64>>,
@@ -51,6 +54,7 @@ impl StreamTxStats {
             nacks: 0,
             rtt: None,
             losses: Losses::new(enable_stats),
+            last_rr: None,
             bytes_transmitted: Some(Default::default()),
             bytes_retransmitted: Some(Default::default()),
         }
@@ -81,6 +85,7 @@ impl StreamTxStats {
         let ntp_time = now.to_ntp_duration();
         let rtt = calculate_rtt_ms(ntp_time, r.last_sr_delay, r.last_sr_time);
         self.rtt = rtt;
+        self.last_rr = Some(r);
 
         let ext_seq = {
             let prev = self.losses.last().map(|s| s.0).unwrap_or(r.max_seq as u64);
@@ -92,7 +97,13 @@ impl StreamTxStats {
             .push((ext_seq, r.fraction_lost as f32 / u8::MAX as f32));
     }
 
-    pub(crate) fn fill(&mut self, snapshot: &mut StatsSnapshot, midrid: MidRid, now: Instant) {
+    pub(crate) fn fill(
+        &mut self,
+        snapshot: &mut StatsSnapshot,
+        midrid: MidRid,
+        seq_no: SeqNo,
+        now: Instant,
+    ) {
         if self.bytes == 0 {
             return;
         }
@@ -128,6 +139,13 @@ impl StreamTxStats {
                 rtt: self.rtt,
                 loss,
                 timestamp: now,
+                remote: self.last_rr.as_ref().map(|rr| RemoteIngressStats {
+                    jitter: rr.jitter,
+                    // We only receive 32-bit extend sequence numbers, but Str0m uses 64-bit internally,
+                    // so we'll extend with 0s.
+                    maximum_sequence_number: seq_no.create_from_partial(rr.max_seq),
+                    packets_lost: rr.packets_lost as u64,
+                }),
             },
         );
     }

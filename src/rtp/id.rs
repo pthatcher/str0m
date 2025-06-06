@@ -238,6 +238,33 @@ impl SeqNo {
     pub fn roc(&self) -> u64 {
         self.0 >> 16
     }
+
+    /// Generate a SeqNo from a u32, relative this SeqNo.
+    ///
+    /// This can be used to extend an extended sequence number from a RR (32-bit)
+    /// to a SeqNo (64-bit). The provided partial extended sequence number is assumed
+    /// to represent an earlier sequence number, within the last 2**32 sequence numbers.
+    ///
+    /// ```
+    /// # use str0m::rtp::SeqNo;
+    ///
+    /// let seq_no: SeqNo = 0x0000_0001_0001_0000.into();
+    ///
+    /// // Assumes this one is from the current u32 cycle
+    /// assert_eq!(seq_no.create_from_partial(0x0000_1234), SeqNo(0x0000_0001_0001_1234));
+    ///
+    /// // Assumes this one is from the previous u32 cycle
+    /// assert_eq!(seq_no.create_from_partial(0x0002_1234), SeqNo(0x0000_0000_0002_1234));
+    /// ```
+    pub fn create_from_partial(&self, earlier_partial_seq_no: u32) -> Self {
+        let mut upper_count = self.0 >> 32;
+        if earlier_partial_seq_no > self.0 as u32 {
+            // This should not occur in practice, but we'll make sure that
+            // we wrap backwards.
+            upper_count = upper_count.wrapping_sub(1);
+        }
+        Self((upper_count << 32) | earlier_partial_seq_no as u64)
+    }
 }
 
 impl Default for SeqNo {
