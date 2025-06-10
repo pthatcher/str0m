@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::error::PacketError;
 use crate::format::CodecConfig;
 use crate::format::PayloadParams;
 use crate::io::DATAGRAM_MAX_PACKET_SIZE;
@@ -13,23 +14,20 @@ use crate::media::MediaKind;
 use crate::packet::QueuePriority;
 use crate::packet::QueueSnapshot;
 use crate::packet::QueueState;
-use crate::rtp_::Bitrate;
-use crate::rtp_::{extend_u16, Descriptions, ReportList, Rtcp};
-use crate::rtp_::{ExtensionMap, ReceptionReport, RtpHeader};
-use crate::rtp_::{ExtensionValues, Frequency, MediaTime, Mid, NackEntry};
+use crate::rtp_::MidRid;
+use crate::rtp_::{Bitrate, Descriptions, Extension, ExtensionMap, ExtensionValues, Frequency};
+use crate::rtp_::{MediaTime, Mid, NackEntry, ReportList, Rtcp, RtpHeader};
 use crate::rtp_::{Pt, Rid, RtcpFb, SenderInfo, SenderReport, Ssrc};
 use crate::rtp_::{Sdes, SdesType, MAX_BLANK_PADDING_PAYLOAD_SIZE};
 use crate::rtp_::{SeqNo, SRTP_BLOCK_SIZE};
 use crate::session::PacketReceipt;
-use crate::stats::MediaEgressStats;
 use crate::stats::StatsSnapshot;
 use crate::util::value_history::ValueHistory;
-use crate::util::InstantExt;
-use crate::util::{already_happened, calculate_rtt_ms, not_happening};
-use crate::RtcError;
+use crate::util::{already_happened, not_happening};
 
 use super::rtx_cache::RtxCache;
 use super::send_queue::SendQueue;
+use super::send_stats::StreamTxStats;
 use super::{rr_interval, RtpPacket};
 
 /// The smallest size of padding for which we attempt to use a spurious resend. For padding
@@ -37,6 +35,8 @@ use super::{rr_interval, RtpPacket};
 const MIN_SPURIOUS_PADDING_SIZE: usize = 50;
 
 pub const DEFAULT_RTX_CACHE_DURATION: Duration = Duration::from_secs(3);
+
+pub const DEFAULT_RTX_RATIO_CAP: Option<f32> = Some(0.15f32);
 
 /// Outgoing encoded stream.
 ///
@@ -51,11 +51,8 @@ pub struct StreamTx {
     /// Identifier of a resend (RTX) stream. If we are doing resends.
     rtx: Option<Ssrc>,
 
-    /// The Media mid this stream belongs to.
-    mid: Mid,
-
-    /// The rid that might be used for this stream.
-    rid: Option<Rid>,
+    /// The Media mid and rid this stream belongs to.
+    midrid: MidRid,
 
     /// Set on first handle_timeout.
     kind: Option<MediaKind>,
@@ -102,6 +99,9 @@ pub struct StreamTx {
     /// sending spurious resends as padding.
     rtx_cache: RtxCache,
 
+    /// Determines retransmitted bytes ratio value to clear queued resends.
+    rtx_ratio_cap: Option<f32>,
+
     /// Last time we produced a SR.
     last_sender_report: Instant,
 
@@ -112,60 +112,36 @@ pub struct StreamTx {
     pending_request_remb: Option<Bitrate>,
 
     /// Statistics of outgoing data.
+    ///
+    /// Stats are use to calculate the rtx ratio also when statistics events are disabled.
     stats: StreamTxStats,
 
     // downsampled rtx ratio (value, last calculation)
     rtx_ratio: (f32, Instant),
-}
 
-/// Holder of stats.
-#[derive(Debug, Default)]
-pub(crate) struct StreamTxStats {
-    /// count of bytes sent, including retransmissions
-    /// <https://www.w3.org/TR/webrtc-stats/#dom-rtcsentrtpstreamstats-bytessent>
-    bytes: u64,
-    /// count of retransmitted bytes alone
-    bytes_resent: u64,
-    /// count of packets sent, including retransmissions
-    /// <https://www.w3.org/TR/webrtc-stats/#summary>
-    packets: u64,
-    /// count of retransmitted packets alone
-    packets_resent: u64,
-    /// count of FIR requests received
-    firs: u64,
-    /// count of PLI requests received
-    plis: u64,
-    /// count of NACKs received
-    nacks: u64,
-    /// round trip time (ms)
-    /// Can be null in case of missing or bad reports
-    rtt: Option<f32>,
-    /// losses collecter from RR (known packets, lost ratio)
-    losses: Vec<(u64, f32)>,
-    bytes_transmitted: ValueHistory<u64>,
-    bytes_retransmitted: ValueHistory<u64>,
+    // The _main_ PT to use for padding. This is main PT, since the poll_packet() loop
+    // figures out the param.resend() RTX PT using main.
+    pt_for_padding: Option<Pt>,
+
+    /// Whether a receiver report has been received for this SSRC, thus acknowledging
+    /// that the receiver has bound the Mid/Rid tuple to the SSRC and no longer
+    /// needs to be sent on every packet
+    remote_acked_ssrc: bool,
 }
 
 impl StreamTx {
-    pub(crate) fn new(ssrc: Ssrc, rtx: Option<Ssrc>, mid: Mid, rid: Option<Rid>) -> Self {
-        // https://www.rfc-editor.org/rfc/rfc3550#page-13
-        // The initial value of the sequence number SHOULD be random (unpredictable)
-        // to make known-plaintext attacks on encryption more difficult
-        let seq_no = (rand::random::<u16>() as u64).into();
-        let seq_no_rtx = (rand::random::<u16>() as u64).into();
-
+    pub(crate) fn new(ssrc: Ssrc, rtx: Option<Ssrc>, midrid: MidRid, enable_stats: bool) -> Self {
         debug!("Create StreamTx for SSRC: {}", ssrc);
 
         StreamTx {
             ssrc,
             rtx,
-            mid,
-            rid,
+            midrid,
             kind: None,
             cname: None,
             clock_rate: None,
-            seq_no,
-            seq_no_rtx,
+            seq_no: SeqNo::default(),
+            seq_no_rtx: SeqNo::default(),
             last_used: already_happened(),
             rtp_and_wallclock: None,
             send_queue: SendQueue::new(),
@@ -174,11 +150,14 @@ impl StreamTx {
             padding: 0,
             blank_packet: RtpPacket::blank(),
             rtx_cache: RtxCache::new(2000, DEFAULT_RTX_CACHE_DURATION),
+            rtx_ratio_cap: DEFAULT_RTX_RATIO_CAP,
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             pending_request_remb: None,
-            stats: StreamTxStats::default(),
+            stats: StreamTxStats::new(enable_stats),
             rtx_ratio: (0.0, already_happened()),
+            pt_for_padding: None,
+            remote_acked_ssrc: false,
         }
     }
 
@@ -196,24 +175,45 @@ impl StreamTx {
     ///
     /// In SDP this corresponds to m-line and "Media".
     pub fn mid(&self) -> Mid {
-        self.mid
+        self.midrid.mid()
     }
 
     /// Rid for this stream.
     ///
     /// This is used to separate streams with the same [`Mid`] when using simulcast.
     pub fn rid(&self) -> Option<Rid> {
-        self.rid
+        self.midrid.rid()
     }
 
     /// Configure the RTX (resend) cache.
     ///
     /// This determines how old incoming NACKs we can reply to.
     ///
-    /// The default is 1024 packets over 3 seconds.
-    pub fn set_rtx_cache(&mut self, max_packets: usize, max_age: Duration) {
+    /// `rtx_ratio_cap` determines when to clear queued resends because of too many resends,
+    /// i.e. if `tx_sum / (rtx_sum + tx_sum) > rtx_ratio_cap`. `None` disables this functionality
+    /// so all queued resends will be sent.
+    ///
+    /// The default is 1024 packets over 3 seconds and RTX cache drop ratio of 0.15.
+    pub fn set_rtx_cache(
+        &mut self,
+        max_packets: usize,
+        max_age: Duration,
+        rtx_ratio_cap: Option<f32>,
+    ) {
         // Dump old cache to avoid having to deal with resizing logic inside the cache impl.
         self.rtx_cache = RtxCache::new(max_packets, max_age);
+        if rtx_ratio_cap.is_some() {
+            self.stats
+                .bytes_transmitted
+                .get_or_insert_with(ValueHistory::default);
+            self.stats
+                .bytes_retransmitted
+                .get_or_insert_with(ValueHistory::default);
+        } else {
+            self.stats.bytes_transmitted = None;
+            self.stats.bytes_retransmitted = None;
+        }
+        self.rtx_ratio_cap = rtx_ratio_cap;
     }
 
     /// Set whether this stream is unpaced or not.
@@ -259,16 +259,20 @@ impl StreamTx {
         ext_vals: ExtensionValues,
         nackable: bool,
         payload: Vec<u8>,
-    ) -> Result<(), RtcError> {
+    ) -> Result<(), PacketError> {
         let first_call = self.rtp_and_wallclock.is_none();
 
         if first_call && seq_no.roc() > 0 {
             // TODO: make it possible to supress this.
-            warn!("First SeqNo has non-zero ROC ({}), which needs out-of-band signalling to remote peer", seq_no.roc());
+            warn!(
+                "First SeqNo has non-zero ROC ({}), which needs out-of-band signalling \
+                to remote peer",
+                seq_no.roc()
+            );
         }
 
         // This 1 in clock frequency will be fixed in poll_output.
-        let media_time = MediaTime::from_secs(time as i64);
+        let media_time = MediaTime::from_secs(time as u64);
         self.rtp_and_wallclock = Some((time, wallclock));
 
         let header = RtpHeader {
@@ -305,21 +309,22 @@ impl StreamTx {
         Ok(())
     }
 
-    fn rtx_enabled(&self) -> bool {
-        self.rtx.is_some()
+    fn padding_enabled(&self) -> bool {
+        self.rtx.is_some() && self.pt_for_padding.is_some()
     }
 
     pub(crate) fn poll_packet(
         &mut self,
         now: Instant,
         exts: &ExtensionMap,
-        twcc: &mut u64,
+        twcc: Option<&mut u64>,
         params: &[PayloadParams],
         buf: &mut Vec<u8>,
     ) -> Option<PacketReceipt> {
-        let mid = self.mid;
-        let rid = self.rid;
+        let mid = self.midrid.mid();
+        let rid = self.midrid.rid();
         let ssrc_rtx = self.rtx;
+        let remote_acked_ssrc = self.remote_acked_ssrc;
 
         let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now) {
             (next, false)
@@ -337,8 +342,23 @@ impl StreamTx {
         // TODO: Can we remove this?
         let header_ref = &mut next.pkt.header;
 
+        // <https://webrtc.googlesource.com/src/+/refs/heads/main/modules/rtp_rtcp/source/rtp_sender.cc#537>
+        // BUNDLE requires that the receiver "bind" the received SSRC to the values
+        // in the MID and/or (R)RID header extensions if present. Therefore, the
+        // sender can reduce overhead by omitting these header extensions once it
+        // knows that the receiver has "bound" the SSRC.
+        // <snip>
+        // The algorithm here is fairly simple: Always attach a MID and/or RID (if
+        // configured) to the outgoing packets until an RTCP receiver report comes
+        // back for this SSRC. That feedback indicates the receiver must have
+        // received a packet with the SSRC and header extension(s), so the sender
+        // then stops attaching the MID and RID.
+
         // This is true also for RTX.
-        header_ref.ext_vals.mid = Some(mid);
+        if !remote_acked_ssrc {
+            header_ref.ext_vals.mid = Some(mid);
+            header_ref.ext_vals.rid = rid;
+        }
 
         let pt_main = header_ref.payload_type;
 
@@ -355,14 +375,27 @@ impl StreamTx {
             return None;
         };
 
-        let mut set_pt = None;
+        let mut set_pt_for_padding = None;
         let mut set_cr = None;
 
         let mut header = match next.kind {
             NextPacketKind::Regular => {
-                // Remember PT We want to set these directly on `self` here, but can't
-                // because we already have a mutable borrow.
-                set_pt = Some(param.pt());
+                let rtx_possible = param.resend().is_some();
+
+                if rtx_possible {
+                    // Remember PT We want to set these directly on `self` here, but can't
+                    // because we already have a mutable borrow. We are using pt_main
+                    // since the above loop figuring out param needs to be correct also
+                    // for the NextPacketKind::Blank case.
+                    set_pt_for_padding = Some(pt_main);
+                } else {
+                    // If the PT we're sending on doesn't have a corresponding RTX PT,
+                    // the packet is de-facto not nackable.
+                    //
+                    // This blocks incoming NACK requests and thus ensures there are no
+                    // entries in self.retries without a RTX PT.
+                    next.pkt.nackable = false;
+                }
 
                 let clock_rate = param.spec().clock_rate;
                 set_cr = Some(clock_rate);
@@ -373,13 +406,18 @@ impl StreamTx {
                 next.pkt.time = time;
 
                 // Modify the original (and also cached) header value.
-                header_ref.ext_vals.rid = rid;
                 header_ref.ext_vals.rid_repair = None;
 
                 header_ref.clone()
             }
             NextPacketKind::Resend(_) | NextPacketKind::Blank(_) => {
-                let pt_rtx = param.resend().expect("pt_rtx resend/blank");
+                // * For the Resend case, we will not have accepted/cached the packet unless
+                //   we have a RTX PT (see logic setting next.pkt.nackable above).
+                // * For the Blank case, we will only have produced blank packets if we
+                //   got a "real" PTX RT, either via set_pt_for_padding above, or via
+                //   the on_first_timeout() further down.
+                // Either way, unwrapping this optional _should_ be correct.
+                let pt_rtx = param.resend().expect("PT for resend or blank");
 
                 // Clone header to not change the original (cached) header.
                 let mut header = header_ref.clone();
@@ -398,9 +436,17 @@ impl StreamTx {
 
         // These need to match `Extension::is_supported()` so we are sending what we are
         // declaring we support.
-        header.ext_vals.abs_send_time = Some(now);
-        header.ext_vals.transport_cc = Some(*twcc as u16);
-        *twcc += 1;
+
+        // Absolute Send Time might not be enabled for this m-line.
+        if exts.id_of(Extension::AbsoluteSendTime).is_some() {
+            header.ext_vals.abs_send_time = Some(now);
+        }
+
+        // TWCC might not be enabled for this m-line.
+        if let Some(twcc) = twcc {
+            header.ext_vals.transport_cc = Some(*twcc as u16);
+            *twcc += 1;
+        }
 
         buf.resize(DATAGRAM_MAX_PACKET_SIZE, 0);
 
@@ -470,23 +516,30 @@ impl StreamTx {
         let seq_no = next.seq_no;
         self.last_used = now;
 
+        // Padding comes in two forms, "spurious resends" of sent packets where
+        // the remote side didn't ask for a resend. The other variant are blank
+        // packets, containing nothing but zeroes. Such packets must be sent from
+        // _some_ RTX PT. A good pick is the RTX for the PT last used to send
+        // regular media data.
+        //
+        // This is set here due to borrow checker.
+        if set_pt_for_padding.is_some() && self.pt_for_padding != set_pt_for_padding {
+            self.pt_for_padding = set_pt_for_padding;
+        }
+
+        if set_cr.is_some() && self.clock_rate != set_cr {
+            self.clock_rate = set_cr;
+        }
+
         if pop_send_queue {
             // poll_packet_regular leaves the packet in the head of the send_queue
             let pkt = self
                 .send_queue
                 .pop(now)
                 .expect("head of send_queue to be there");
-            if self.rtx_enabled() {
+            if pkt.nackable {
                 self.rtx_cache.cache_sent_packet(pkt, now);
             }
-        }
-
-        // This is set here due to borrow checker.
-        if let Some(pt) = set_pt {
-            self.blank_packet.header.payload_type = pt;
-        }
-        if set_cr.is_some() && self.clock_rate != set_cr {
-            self.clock_rate = set_cr;
         }
 
         Some(PacketReceipt {
@@ -497,19 +550,16 @@ impl StreamTx {
         })
     }
 
-    fn poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
-        let ratio = self.rtx_ratio_downsampled(now);
-
-        // If we hit the cap, stop doing resends by clearing those we have queued.
-        if ratio > 0.15_f32 {
-            self.resends.clear();
-            return None;
-        }
-
-        self.do_poll_packet_resend(now)
-    }
-
     fn rtx_ratio_downsampled(&mut self, now: Instant) -> f32 {
+        assert!(
+            self.stats.bytes_transmitted.is_some(),
+            "rtx_ratio_cap must be enabled"
+        );
+        assert!(
+            self.stats.bytes_retransmitted.is_some(),
+            "rtx_ratio_cap must be enabled"
+        );
+
         let (value, ts) = self.rtx_ratio;
         if now - ts < Duration::from_millis(50) {
             // not worth re-evaluating, return the old value
@@ -517,18 +567,34 @@ impl StreamTx {
         }
 
         // bytes stats refer to the last second by default
-        let bytes_transmitted = self.stats.bytes_transmitted.sum();
-        let bytes_retransmitted = self.stats.bytes_retransmitted.sum();
+        self.stats
+            .bytes_transmitted
+            .as_mut()
+            .unwrap()
+            .purge_old(now);
+        self.stats
+            .bytes_retransmitted
+            .as_mut()
+            .unwrap()
+            .purge_old(now);
+
+        let bytes_transmitted = self.stats.bytes_transmitted.as_mut().unwrap().sum();
+        let bytes_retransmitted = self.stats.bytes_retransmitted.as_mut().unwrap().sum();
         let ratio = bytes_retransmitted as f32 / (bytes_retransmitted + bytes_transmitted) as f32;
         let ratio = if ratio.is_finite() { ratio } else { 0_f32 };
         self.rtx_ratio = (ratio, now);
         ratio
     }
 
-    fn do_poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
-        if !self.rtx_enabled() {
-            // We're not doing resends for non-RTX.
-            return None;
+    fn poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
+        if let Some(ratio_cap) = self.rtx_ratio_cap {
+            let ratio = self.rtx_ratio_downsampled(now);
+
+            // If we hit the cap, stop doing resends by clearing those we have queued.
+            if ratio > ratio_cap {
+                self.resends.clear();
+                return None;
+            }
         }
 
         let seq_no = loop {
@@ -542,9 +608,9 @@ impl StreamTx {
                 continue;
             };
 
-            if !pkt.nackable {
-                trace!("SSRC {} resend {} not nackable", self.ssrc, pkt.seq_no);
-            }
+            // Cached packets must be nackable. This is ensured before adding the
+            // entry to the self.rtx_cache.
+            assert!(pkt.nackable);
 
             break pkt.seq_no;
         };
@@ -554,7 +620,9 @@ impl StreamTx {
 
         let len = pkt.payload.len() as u64;
         self.stats.update_packet_counts(len, true);
-        self.stats.bytes_retransmitted.push(now, len);
+        if let Some(h) = &mut self.stats.bytes_retransmitted {
+            h.push(now, len);
+        }
 
         let seq_no = self.seq_no_rtx.inc();
 
@@ -577,7 +645,9 @@ impl StreamTx {
 
         let len = pkt.payload.len() as u64;
         self.stats.update_packet_counts(len, false);
-        self.stats.bytes_transmitted.push(now, len);
+        if let Some(h) = &mut self.stats.bytes_transmitted {
+            h.push(now, len)
+        }
 
         let seq_no = pkt.seq_no;
 
@@ -589,6 +659,11 @@ impl StreamTx {
     }
 
     fn poll_packet_padding(&mut self, _now: Instant) -> Option<NextPacket> {
+        if !self.padding_enabled() {
+            self.padding = 0;
+            return None;
+        }
+
         if self.padding == 0 {
             return None;
         }
@@ -622,6 +697,8 @@ impl StreamTx {
 
         let pkt = &mut self.blank_packet;
         pkt.seq_no = seq_no;
+        // Unwrap here is correct because self.padding_enabled() above checks the we got the PT set.
+        pkt.header.payload_type = self.pt_for_padding.unwrap();
 
         let len = self
             .padding
@@ -656,7 +733,11 @@ impl StreamTx {
     pub(crate) fn handle_rtcp(&mut self, now: Instant, fb: RtcpFb) {
         use RtcpFb::*;
         match fb {
-            ReceptionReport(r) => self.stats.update_with_rr(now, r),
+            ReceptionReport(r) => {
+                // Receiver has bound MidRid to SSRC
+                self.remote_acked_ssrc = true;
+                self.stats.update_with_rr(now, r)
+            }
             Nack(_, list) => {
                 self.stats.increase_nacks();
                 let entries = list.into_iter();
@@ -713,7 +794,7 @@ impl StreamTx {
     pub(crate) fn create_sr_and_update(&mut self, now: Instant, feedback: &mut VecDeque<Rtcp>) {
         let sr = self.create_sender_report(now);
 
-        debug!("Created feedback SR: {:?}", sr);
+        trace!("Created feedback SR: {:?}", sr);
         feedback.push_back(Rtcp::SenderReport(sr));
 
         if let Some(ds) = self.create_sdes() {
@@ -767,7 +848,7 @@ impl StreamTx {
         let (t_u32, w) = self.rtp_and_wallclock?;
 
         let clock_rate = self.clock_rate?;
-        let t = MediaTime::new(t_u32 as i64, clock_rate);
+        let t = MediaTime::new(t_u32 as u64, clock_rate);
 
         // Wallclock needs to be in the past.
         if w > now {
@@ -796,7 +877,7 @@ impl StreamTx {
     }
 
     pub(crate) fn visit_stats(&mut self, snapshot: &mut StatsSnapshot, now: Instant) {
-        self.stats.fill(snapshot, self.mid, self.rid, now);
+        self.stats.fill(snapshot, self.midrid, self.seq_no, now);
     }
 
     pub(crate) fn queue_state(&mut self, now: Instant) -> QueueState {
@@ -806,8 +887,8 @@ impl StreamTx {
         let unpaced = self.unpaced.unwrap_or(true);
 
         // It's only possible to use this sender for padding if RTX is enabled and
-        // we know the previous main PT.
-        let use_for_padding = self.rtx_enabled() && self.blank_packet.is_pt_set();
+        // we know a PT to use for it.
+        let use_for_padding = self.padding_enabled();
 
         let mut snapshot = self.send_queue.snapshot(now);
 
@@ -820,7 +901,7 @@ impl StreamTx {
         }
 
         QueueState {
-            mid: self.mid,
+            midrid: self.midrid,
             unpaced,
             use_for_padding,
             snapshot,
@@ -877,7 +958,7 @@ impl StreamTx {
     }
 
     pub(crate) fn generate_padding(&mut self, padding: usize) {
-        if !self.rtx_enabled() {
+        if !self.padding_enabled() {
             return;
         }
         self.padding += padding;
@@ -913,16 +994,19 @@ impl StreamTx {
         }
 
         // To allow for sending padding on a newly created StreamTx, before any regular
-        // packet has been sent, we need an PT that has RTX for any main PT. This is
+        // packet has been sent, we need any main PT that has associated RTX. This is
         // later be overwritten when we send the first regular packet.
-        if self.rtx_enabled() && !self.blank_packet.is_pt_set() {
+        if self.rtx.is_some() && self.pt_for_padding.is_none() {
             if let Some(pt) = media.first_pt_with_rtx(config) {
                 trace!(
-                    "StreamTx Mid {} blank packet PT {} before first regular packet",
-                    self.mid,
+                    "StreamTx {:?} PT {} before first regular packet",
+                    self.midrid,
                     pt
                 );
-                self.blank_packet.header.payload_type = pt;
+                self.pt_for_padding = Some(pt);
+
+                // Setting the pt_for_rtx should enable RTX.
+                assert!(self.padding_enabled());
             }
         }
     }
@@ -933,94 +1017,43 @@ impl StreamTx {
         self.resends.clear();
         self.padding = 0;
     }
-}
 
-impl StreamTxStats {
-    fn update_packet_counts(&mut self, bytes: u64, is_resend: bool) {
-        self.packets += 1;
-        self.bytes += bytes;
-        if is_resend {
-            self.bytes_resent += bytes;
-            self.packets_resent += 1;
-        }
+    /// Reset this stream to use a new SSRC and optionally a new RTX SSRC.
+    ///
+    /// This updates the SSRCs and resets all relevant internal fields.
+    pub(crate) fn reset_ssrc(&mut self, new_ssrc: Ssrc, new_rtx: Option<Ssrc>) {
+        // Update the SSRC and RTX
+        self.ssrc = new_ssrc;
+        self.rtx = new_rtx;
+
+        // Reset sequence numbers
+        self.seq_no = SeqNo::default();
+        self.seq_no_rtx = SeqNo::default();
+
+        // Reset timing related fields
+        self.last_used = already_happened();
+        self.rtp_and_wallclock = None;
+        self.last_sender_report = already_happened();
+
+        // Reset blank packet's SSRC
+        self.blank_packet.header.ssrc = new_ssrc;
+
+        // Clear any pending requests
+        self.pending_request_keyframe = None;
+        self.pending_request_remb = None;
+
+        // Reset all statistics - preserve whether stats tracking is enabled
+        let stats_enabled = self.stats.bytes_transmitted.is_some();
+        self.stats = StreamTxStats::new(stats_enabled);
+        self.rtx_ratio = (0.0, already_happened());
+        self.remote_acked_ssrc = false;
+
+        // Clear all buffers
+        self.reset_buffers();
     }
 
-    fn increase_nacks(&mut self) {
-        self.nacks += 1;
-    }
-
-    fn increase_plis(&mut self) {
-        self.plis += 1;
-    }
-
-    fn increase_firs(&mut self) {
-        self.firs += 1;
-    }
-
-    fn update_with_rr(&mut self, now: Instant, r: ReceptionReport) {
-        let ntp_time = now.to_ntp_duration();
-        let rtt = calculate_rtt_ms(ntp_time, r.last_sr_delay, r.last_sr_time);
-        self.rtt = rtt;
-
-        let ext_seq = {
-            let prev = self.losses.last().map(|s| s.0).unwrap_or(r.max_seq as u64);
-            let next = (r.max_seq & 0xffff) as u16;
-            extend_u16(Some(prev), next)
-        };
-
-        self.losses
-            .push((ext_seq, r.fraction_lost as f32 / u8::MAX as f32));
-    }
-
-    pub(crate) fn fill(
-        &mut self,
-        snapshot: &mut StatsSnapshot,
-        mid: Mid,
-        rid: Option<Rid>,
-        now: Instant,
-    ) {
-        if self.bytes == 0 {
-            return;
-        }
-
-        let key = (mid, rid);
-
-        let loss = {
-            let mut value = 0_f32;
-            let mut total_weight = 0_u64;
-
-            // just in case we received RRs out of order
-            self.losses.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-            // average known RR losses weighted by their number of packets
-            for it in self.losses.windows(2) {
-                let [prev, next] = it else { continue };
-                let weight = next.0.saturating_sub(prev.0);
-                value += next.1 * weight as f32;
-                total_weight += weight;
-            }
-
-            let result = value / total_weight as f32;
-            result.is_finite().then_some(result)
-        };
-
-        self.losses.drain(..self.losses.len().saturating_sub(1));
-
-        snapshot.egress.insert(
-            key,
-            MediaEgressStats {
-                mid,
-                rid,
-                bytes: self.bytes,
-                packets: self.packets,
-                firs: self.firs,
-                plis: self.plis,
-                nacks: self.nacks,
-                rtt: self.rtt,
-                loss,
-                timestamp: now,
-            },
-        );
+    pub(crate) fn is_midrid(&self, midrid: MidRid) -> bool {
+        midrid.special_equals(&self.midrid)
     }
 }
 

@@ -4,8 +4,7 @@
 use thiserror::Error;
 
 mod agent;
-pub(crate) use agent::{IceAgent, IceAgentEvent};
-pub use agent::{IceConnectionState, IceCreds};
+pub use agent::{IceAgent, IceAgentEvent, IceConnectionState, IceCreds};
 
 mod candidate;
 pub use candidate::{Candidate, CandidateKind};
@@ -30,12 +29,13 @@ mod test {
         let mut a1 = TestAgent::new(info_span!("L"));
         let mut a2 = TestAgent::new(info_span!("R"));
 
-        let c1 = host("1.1.1.1:9999", "udp"); // 9999 is just dropped by propagate
-        a1.add_local_candidate(c1.clone());
+        // 9999 is just dropped by propagate
+        let c1 = a1.add_host_candidate("1.1.1.1:9999");
         a2.add_remote_candidate(c1);
-        let c2 = host("2.2.2.2:1000", "udp");
-        a2.add_local_candidate(c2.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
         a1.add_remote_candidate(c2);
+
         a1.set_controlling(true);
         a2.set_controlling(false);
 
@@ -74,9 +74,9 @@ mod test {
     use std::ops::{Deref, DerefMut};
     use std::time::{Duration, Instant};
 
-    use crate::io::Protocol;
-    use crate::io::Receive;
+    use crate::io::{Protocol, StunMessage, StunPacket};
     use tracing::Span;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     pub fn sock(s: impl Into<String>) -> SocketAddr {
         let s: String = s.into();
@@ -85,6 +85,22 @@ mod test {
 
     pub fn host(s: impl Into<String>, proto: impl TryInto<Protocol>) -> Candidate {
         Candidate::host(sock(s), proto).unwrap()
+    }
+
+    pub fn srflx(
+        s: impl Into<String>,
+        base: impl Into<String>,
+        proto: impl TryInto<Protocol>,
+    ) -> Candidate {
+        Candidate::server_reflexive(sock(s), sock(base), proto).unwrap()
+    }
+
+    pub fn relay(
+        s: impl Into<String>,
+        base: impl Into<String>,
+        proto: impl TryInto<Protocol>,
+    ) -> Candidate {
+        Candidate::relayed(sock(s), sock(base), proto).unwrap()
     }
 
     /// Transform the socket to rig different test scenarios.
@@ -140,11 +156,10 @@ mod test {
         let mut a1 = TestAgent::new(info_span!("L"));
         let mut a2 = TestAgent::new(info_span!("R"));
 
-        let c1 = host("1.1.1.1:1000", "udp");
-        a1.add_local_candidate(c1.clone());
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
         a2.add_remote_candidate(c1);
-        let c2 = host("2.2.2.2:1000", "udp");
-        a2.add_local_candidate(c2.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
         a1.add_remote_candidate(c2);
 
         a1.set_controlling(true);
@@ -169,19 +184,19 @@ mod test {
         println!("{:?}", a1.events);
         println!("{:?}", a2.events);
 
-        fn assert_last_event(d: &Duration, e: &IceAgentEvent) {
+        fn assert_last_event(d: &Duration, e: &IceAgentEvent, a: &IceAgent) {
             assert_eq!(
                 *e,
                 IceAgentEvent::IceConnectionStateChange(IceConnectionState::Disconnected)
             );
-            assert!(*d > Duration::from_secs(15));
+            assert!(*d > a.ice_timeout());
         }
 
         let (d, e) = a1.events.last().unwrap();
-        assert_last_event(d, e);
+        assert_last_event(d, e, &a1);
 
         let (d, e) = a2.events.last().unwrap();
-        assert_last_event(d, e);
+        assert_last_event(d, e, &a2);
 
         assert_eq!(
             a1.stats(),
@@ -211,12 +226,12 @@ mod test {
         let mut a1 = TestAgent::new(info_span!("L"));
         let mut a2 = TestAgent::new(info_span!("R"));
 
-        let c1 = host("1.1.1.1:1000", "udp");
-        a1.add_local_candidate(c1.clone());
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
         a2.add_remote_candidate(c1);
-        let c2 = host("2.2.2.2:1000", "udp");
-        a2.add_local_candidate(c2.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
         a1.add_remote_candidate(c2);
+
         a1.set_controlling(true);
         a2.set_controlling(false);
 
@@ -250,6 +265,223 @@ mod test {
         );
     }
 
+    // str0m performs calculations on `now` internally
+    // To ensure that these never panic, we run a happy-path of `host-host` that uses a very early `Instant`.
+    #[test]
+    pub fn happy_path_very_early_timestamp() {
+        let early_now = find_earliest_now();
+
+        let mut a1 = TestAgent::new(info_span!("L"));
+        a1.time = early_now;
+        let mut a2 = TestAgent::new(info_span!("R"));
+        a2.time = early_now;
+
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
+        a2.add_remote_candidate(c1);
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
+        a1.add_remote_candidate(c2);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+    }
+
+    #[test]
+    pub fn no_respond_to_stun_request_on_invalidated_candidate() {
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
+        a2.add_remote_candidate(c1.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
+        a1.add_remote_candidate(c2);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        a1.agent.invalidate_candidate(&c1);
+
+        let timeout = a2.poll_timeout().unwrap();
+        a2.handle_timeout(timeout);
+        let transmit = a2.poll_transmit().unwrap();
+
+        assert!(a1.poll_transmit().is_none());
+
+        a1.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: sock("2.2.2.2:1000"),
+                destination: sock("1.1.1.1:1000"),
+                message: StunMessage::parse(&transmit.contents).unwrap(),
+            },
+        );
+
+        assert!(a1.poll_transmit().is_none());
+    }
+
+    #[test]
+    pub fn migrates_to_new_candidates_after_invalidation_without_timeout() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .with_test_writer()
+            .set_default();
+
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        let c1 = host("1.1.1.1:1000", "udp");
+        let c1 = a1.add_local_candidate(c1).unwrap().clone();
+        a2.add_remote_candidate(c1.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
+        a1.add_remote_candidate(c2);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        let a1_time = a1.time;
+        let a2_time = a2.time;
+        let new_sock = sock("8.8.8.8:1000");
+
+        let c3 = Candidate::host(new_sock, Protocol::Udp).unwrap();
+        let c3 = a1.add_local_candidate(c3).unwrap().clone();
+        a2.add_remote_candidate(c3);
+
+        a1.agent.invalidate_candidate(&c1);
+        a2.agent.invalidate_candidate(&c1);
+
+        loop {
+            let a1_nominated = a1.has_event(
+                |e| matches!(e, IceAgentEvent::NominatedSend { source, .. } if source == &new_sock),
+            );
+            let a2_nominated = a2.has_event(
+                |e| matches!(e, IceAgentEvent::NominatedSend { destination, .. } if destination == &new_sock)
+            );
+
+            if a1_nominated && a2_nominated {
+                break;
+            }
+
+            progress(&mut a1, &mut a2);
+        }
+
+        assert!(a1.time.duration_since(a1_time) < a1.ice_timeout());
+        assert!(a2.time.duration_since(a2_time) < a2.ice_timeout());
+    }
+
+    #[test]
+    pub fn re_adding_invalidated_local_candidate() {
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
+        a2.add_remote_candidate(c1.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
+        a1.add_remote_candidate(c2);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        a1.agent.invalidate_candidate(&c1);
+
+        // Let time pass until it disconnects.
+        loop {
+            if a1.state().is_disconnected() && a2.state().is_disconnected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        // Add back the invalidated candidate
+        a1.add_local_candidate(c1).unwrap();
+
+        // progress() fails after 100 number of polls.
+        a1.progress_count = 0;
+        a2.progress_count = 0;
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+    }
+
+    #[test]
+    pub fn re_adding_invalidated_remote_candidate() {
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
+        a2.add_remote_candidate(c1);
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
+        a1.add_remote_candidate(c2.clone());
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        a1.agent.invalidate_candidate(&c2);
+
+        // Let time pass until it disconnects.
+        loop {
+            if a1.state().is_disconnected() && a2.state().is_disconnected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        // Add back the invalidated candidate
+        a1.add_remote_candidate(c2);
+
+        // progress() fails after 100 number of polls.
+        a1.progress_count = 0;
+        a2.progress_count = 0;
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+    }
+
     #[test]
     pub fn ice_lite_no_connection() {
         let mut a1 = TestAgent::new(info_span!("L"));
@@ -258,12 +490,13 @@ mod test {
         // a1 acts as "server"
         a1.agent.set_ice_lite(true);
 
-        let c1 = host("1.1.1.1:9999", "udp"); // 9999 is just dropped by propagate
-        a1.add_local_candidate(c1.clone());
+        // 9999 is just dropped by propagate
+        let c1 = a1.add_host_candidate("1.1.1.1:9999");
         a2.add_remote_candidate(c1);
-        let c2 = host("2.2.2.2:1000", "udp");
-        a2.add_local_candidate(c2.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
         a1.add_remote_candidate(c2);
+
         a1.set_controlling(true);
         a2.set_controlling(false);
 
@@ -306,11 +539,11 @@ mod test {
         let mut a1 = TestAgent::new(info_span!("L"));
         let mut a2 = TestAgent::new(info_span!("R"));
 
-        let c1 = host("3.3.3.3:1000", "udp"); // will be rewritten to 4.4.4.4
-        a1.add_local_candidate(c1.clone());
+        // will be rewritten to 4.4.4.4
+        let c1 = a1.add_host_candidate("3.3.3.3:1000");
         a2.add_remote_candidate(c1);
-        let c2 = host("2.2.2.2:1000", "udp");
-        a2.add_local_candidate(c2.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
         a1.add_remote_candidate(c2);
 
         a1.set_controlling(true);
@@ -347,12 +580,10 @@ mod test {
     }
 
     // pub fn init_log() {
-    //     use std::env;
     //     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    //     if env::var("RUST_LOG").is_err() {
-    //         env::set_var("RUST_LOG", "trace");
-    //     }
+    //     let env_filter =
+    //         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("trace"));
 
     //     tracing_subscriber::registry()
     //         .with(fmt::layer())
@@ -367,11 +598,10 @@ mod test {
         let mut a1 = TestAgent::new(info_span!("L"));
         let mut a2 = TestAgent::new(info_span!("R"));
 
-        let c1 = host("1.1.1.1:1000", "udp");
-        a1.add_local_candidate(c1.clone());
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
         a2.add_remote_candidate(c1.clone());
-        let c2 = host("2.2.2.2:1000", "udp");
-        a2.add_local_candidate(c2.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
         a1.add_remote_candidate(c2.clone());
 
         a1.set_controlling(true);
@@ -418,11 +648,11 @@ mod test {
         let mut a1 = TestAgent::new(info_span!("L"));
         let mut a2 = TestAgent::new(info_span!("R"));
 
-        let c1 = host("3.3.3.3:9999", "udp"); // no traffic possible
-        a1.add_local_candidate(c1.clone());
+        // no traffic possible
+        let c1 = a1.add_host_candidate("3.3.3.3:9999");
         a2.add_remote_candidate(c1);
-        let c2 = host("2.2.2.2:1000", "udp");
-        a2.add_local_candidate(c2.clone());
+
+        let c2 = a2.add_host_candidate("2.2.2.2:1000");
         a1.add_remote_candidate(c2);
 
         a1.set_controlling(true);
@@ -434,7 +664,37 @@ mod test {
         }
 
         // "trickle" a possible candidate
-        a1.add_local_candidate(host("1.1.1.1:1000", "udp")); // possible
+        a1.add_host_candidate("1.1.1.1:1000");
+
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+    }
+
+    #[test]
+    pub fn candidate_pair_of_same_kind_does_not_get_nominated() {
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        let c1 = a1
+            .add_local_candidate(relay("1.1.1.1:1000", "5.6.7.8:4321", "udp"))
+            .unwrap()
+            .clone();
+        a2.add_remote_candidate(c1);
+
+        let c2 = a2
+            .add_local_candidate(srflx("4.4.4.4:1000", "3.3.3.3:1000", "udp"))
+            .unwrap()
+            .clone();
+        a1.add_remote_candidate(c2);
+        let c3 = a2.add_host_candidate("3.3.3.3:1000");
+        a1.add_remote_candidate(c3);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
 
         // loop until we're connected.
         loop {
@@ -443,6 +703,239 @@ mod test {
             }
             progress(&mut a1, &mut a2);
         }
+
+        a1.add_local_candidate(relay("1.1.1.1:1001", "5.6.7.8:4321", "udp"))
+            .unwrap();
+        a2.add_remote_candidate(relay("1.1.1.1:1001", "5.6.7.8:4321", "udp"));
+
+        loop {
+            if a2.has_event(|e| {
+                matches!(e, IceAgentEvent::DiscoveredRecv { source, .. } if source == &sock("1.1.1.1:1001"))
+            }) {
+                break;
+            }
+
+            progress(&mut a1, &mut a2);
+        }
+
+        assert!(!a1.has_event(|e| {
+            matches!(e, IceAgentEvent::NominatedSend { source, .. } if source == &sock("1.1.1.1:1001"))
+        }));
+        assert!(!a2.has_event(|e| {
+            matches!(e, IceAgentEvent::NominatedSend { destination, .. } if destination == &sock("1.1.1.1:1001"))
+        }));
+    }
+
+    #[test]
+    pub fn no_disconnect_when_replacing_pflx_with_real_candidate() {
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        // We need a 2nd pair of candidates to make sure the agent doesn't go straight into `Completed`.
+
+        // Both agents know their local candidates
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
+        let c3 = a1
+            .add_local_candidate(relay("2.2.2.2:1000", "5.6.7.8:4321", "udp"))
+            .unwrap()
+            .clone();
+
+        let c2 = a2.add_host_candidate("1.1.1.1:1001");
+        let c4 = a2
+            .add_local_candidate(relay("2.2.2.2:1001", "5.6.7.8:4321", "udp"))
+            .unwrap()
+            .clone();
+
+        // Agent 1 also learns about the remote candidates but agent 2 doesn't (imagine signalling layer being a bit slow)
+        a1.add_remote_candidate(c2);
+        a1.add_remote_candidate(c4);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        // Wait until agent 2 is connected (based on a peer-reflexive candidate)
+        loop {
+            if a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        // Candidates arrive via signalling layer
+        a2.add_remote_candidate(c1.clone());
+        a2.add_remote_candidate(c3.clone());
+
+        // Continue normal operation.
+        for _ in 0..50 {
+            progress(&mut a1, &mut a2);
+        }
+
+        // We expect to not disconnect as part of this.
+        assert!(!a2.has_event(|e| matches!(
+            e,
+            IceAgentEvent::IceConnectionStateChange(IceConnectionState::Disconnected)
+        )));
+    }
+
+    #[test]
+    pub fn identical_host_and_server_reflexive_candidates_dont_create_new_pairs_on_inbound_stun_request(
+    ) {
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        let c1 = a1.add_host_candidate("1.1.1.1:1000");
+        a2.add_remote_candidate(c1);
+        let c2 = a2
+            .add_local_candidate(srflx("2.2.2.2:1000", "2.2.2.2:1000", "udp"))
+            .unwrap()
+            .clone();
+        a1.add_remote_candidate(c2);
+        let c3 = a2.add_host_candidate("2.2.2.2:1000");
+        a1.add_remote_candidate(c3);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        // loop until we're connected.
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        // Each agent should only have a single candidate pair.
+        assert_eq!(a1.num_candidate_pairs(), 1);
+        assert_eq!(a2.num_candidate_pairs(), 1);
+    }
+
+    // In general, ICE prefers IPv6 over IPv4.
+    // However, in case our only IPv6 connectivity is via a relay that we are talking to over IPv4,
+    // we want to prefer the IPv4 code path.
+    #[test]
+    fn prefers_ipv4_ipv4_relay_candidate_over_ipv4_ipv6_controlling() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .with_test_writer()
+            .set_default();
+
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        prefer_ipv4_candidate_over_ipv6_candidate(&mut a1, &mut a2);
+    }
+
+    // In general, ICE prefers IPv6 over IPv4.
+    // However, in case our only IPv6 connectivity is via a relay that we are talking to over IPv4,
+    // we want to prefer the IPv4 code path.
+    #[test]
+    fn prefers_ipv4_ipv4_relay_candidate_over_ipv4_ipv6_controlled() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .with_test_writer()
+            .set_default();
+
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        a1.set_controlling(false);
+        a2.set_controlling(true);
+
+        prefer_ipv4_candidate_over_ipv6_candidate(&mut a1, &mut a2);
+    }
+
+    fn prefer_ipv4_candidate_over_ipv6_candidate(a1: &mut TestAgent, a2: &mut TestAgent) {
+        // Agent 1 only has IPv4 connectivity to a relay but allocates both IPv4 and IPv6 addresses.
+        // Agent 2 has no relay but has full IPv4 and IPv6 connectivity.
+        let relay_ipv4_ipv4 = a1
+            .add_local_candidate(relay("7.7.7.7:5000", "1.1.1.1:5000", "udp"))
+            .unwrap()
+            .clone();
+        let relay_ipv6_ipv4 = a1
+            .add_local_candidate(relay("[::7]:5000", "1.1.1.1:5000", "udp"))
+            .unwrap()
+            .clone();
+        a2.add_remote_candidate(relay_ipv4_ipv4);
+        a2.add_remote_candidate(relay_ipv6_ipv4);
+
+        let host_ipv4 = a2.add_host_candidate("5.5.5.5:3000");
+        let host_ipv6 = a2.add_host_candidate("[::2]:3000");
+        a1.add_remote_candidate(host_ipv4);
+        a1.add_remote_candidate(host_ipv6);
+
+        // loop until we're connected.
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(a1, a2);
+        }
+
+        assert!(a1.has_event(|e| {
+                    matches!(e, IceAgentEvent::NominatedSend { source, destination, .. } if source == &sock("7.7.7.7:5000") && destination == &sock("5.5.5.5:3000"))
+                }));
+        assert!(a2.has_event(|e| {
+                    matches!(e, IceAgentEvent::NominatedSend { source, destination, .. } if source == &sock("5.5.5.5:3000") && destination == &sock("7.7.7.7:5000"))
+                }));
+    }
+
+    #[test]
+    fn changed_timing_config_takes_effect_immediately() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("trace")
+            .with_test_writer()
+            .set_default();
+
+        const IDLE_RTO: Duration = Duration::from_secs(60);
+        const NORMAL_RTO: Duration = Duration::from_secs(3);
+
+        let mut a1 = TestAgent::new(info_span!("L"));
+        let mut a2 = TestAgent::new(info_span!("R"));
+
+        let c1 = host("1.1.1.1:1000", "udp");
+        a1.add_local_candidate(c1.clone());
+        a2.add_remote_candidate(c1);
+
+        let c2 = host("2.2.2.2:1000", "udp");
+        a2.add_local_candidate(c2.clone());
+        a1.add_remote_candidate(c2);
+
+        a1.set_controlling(true);
+        a2.set_controlling(false);
+
+        // loop until we're connected.
+        loop {
+            if a1.state().is_connected() && a2.state().is_connected() {
+                break;
+            }
+            progress(&mut a1, &mut a2);
+        }
+
+        // Move to "idle" mode
+        a1.set_initial_stun_rto(IDLE_RTO);
+        a1.set_max_stun_rto(IDLE_RTO);
+        a2.set_initial_stun_rto(IDLE_RTO);
+        a2.set_max_stun_rto(IDLE_RTO);
+
+        // Spin for a bit
+        for _ in 0..10 {
+            progress(&mut a1, &mut a2);
+        }
+
+        // This is a bit of a hack because we use "insider" knowledge here
+        // that the next timeout is in fact `IDLE_RTO` away.
+        let now = a1.poll_timeout().unwrap() - IDLE_RTO;
+
+        a1.set_initial_stun_rto(NORMAL_RTO);
+        a1.set_max_stun_rto(NORMAL_RTO);
+
+        let timeout_after = a1.poll_timeout().unwrap();
+
+        // After applying the new timeout, it should only be `NORMAL_RTO` away.
+        assert_eq!(timeout_after, now + NORMAL_RTO);
     }
 
     pub struct TestAgent {
@@ -468,6 +961,17 @@ mod test {
                 drop_sent_packets: false,
             }
         }
+
+        fn add_host_candidate(&mut self, addr: &str) -> Candidate {
+            self.agent
+                .add_local_candidate(host(addr, "udp"))
+                .unwrap()
+                .clone()
+        }
+
+        fn has_event(&self, predicate: impl Fn(&IceAgentEvent) -> bool) -> bool {
+            self.events.iter().any(|(_, e)| predicate(e))
+        }
     }
 
     pub fn progress(a1: &mut TestAgent, a2: &mut TestAgent) {
@@ -483,18 +987,22 @@ mod test {
         }
 
         if let Some(trans) = f.span.in_scope(|| f.agent.poll_transmit()) {
-            let mut receive = Receive::try_from(&trans).unwrap();
+            let message =
+                StunMessage::parse(&trans.contents).expect("IceAgent to only emit StunMessages");
 
             // rewrite receive with test transforms, and potentially drop the packet.
-            if let Some((source, destination)) = transform(receive.source, receive.destination) {
-                receive.source = source;
-                receive.destination = destination;
-
+            if let Some((source, destination)) = transform(trans.source, trans.destination) {
                 if f.drop_sent_packets {
                     // drop packet
                     t.span.in_scope(|| t.agent.handle_timeout(t.time));
                 } else {
-                    t.span.in_scope(|| t.agent.handle_receive(t.time, receive));
+                    let packet = StunPacket {
+                        proto: trans.proto,
+                        source,
+                        destination,
+                        message,
+                    };
+                    t.span.in_scope(|| t.agent.handle_packet(t.time, packet));
                 }
             } else {
                 // drop packet
@@ -536,5 +1044,27 @@ mod test {
         fn deref_mut(&mut self) -> &mut Self::Target {
             &mut self.agent
         }
+    }
+
+    /// Performs a binary search for the earliest possible `Instant`.
+    fn find_earliest_now() -> Instant {
+        const ONE_YEAR: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+        let mut now = Instant::now();
+        let mut step = ONE_YEAR;
+
+        while step > Duration::from_secs(1) {
+            match now.checked_sub(step) {
+                Some(earlier) => {
+                    now = earlier;
+                    step *= 2; // Increase step-count to accelerate finding the earliest possible `Instant`.
+                }
+                None => {
+                    step /= 2; // Decrease step-count to narrow down on the earliest possible `Instant`.
+                }
+            }
+        }
+
+        now
     }
 }

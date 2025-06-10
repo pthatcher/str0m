@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::rtp_::Bitrate;
 
-use super::BandwithUsage;
+use super::BandwidthUsage;
 
 // Recommended values from https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02#section-5
 /// Smoothing factor applied to moving stats for observed bitrates when we are in the decreasing
@@ -76,7 +76,7 @@ impl RateControl {
             self.averaged_observed_bitrate
                 .average
                 .map(|avg| avg.to_string())
-                .unwrap_or_else(|| "".to_string())
+                .unwrap_or_default()
         );
 
         match self.state {
@@ -109,7 +109,7 @@ impl RateControl {
             self.averaged_observed_bitrate.reset();
         }
 
-        let since_last_update = (now - last_estimate_update);
+        let since_last_update = now - last_estimate_update;
         assert!(since_last_update >= Duration::ZERO);
         let near_convergence = self.is_near_convergence();
 
@@ -158,6 +158,7 @@ impl RateControl {
         self.averaged_observed_bitrate
             .update(observed_bitrate.as_f64());
 
+        #[allow(unused)]
         if let Some(observed_average) = self.averaged_observed_bitrate.average {
             crate::packet::bwe::macros::log_rate_control_observed_bitrate!(
                 observed_bitrate.as_u64(),
@@ -242,12 +243,12 @@ impl State {
     }
 }
 
-impl From<BandwithUsage> for Signal {
-    fn from(value: BandwithUsage) -> Self {
+impl From<BandwidthUsage> for Signal {
+    fn from(value: BandwidthUsage) -> Self {
         match value {
-            BandwithUsage::Overuse => Signal::Overuse,
-            BandwithUsage::Normal => Signal::Normal,
-            BandwithUsage::Underuse => Signal::Underuse,
+            BandwidthUsage::Overuse => Signal::Overuse,
+            BandwidthUsage::Normal => Signal::Normal,
+            BandwidthUsage::Underuse => Signal::Underuse,
         }
     }
 }
@@ -274,7 +275,7 @@ impl fmt::Display for Signal {
 
 /// Exponential moving average
 #[derive(Debug)]
-struct MovingAverage {
+pub struct MovingAverage {
     smoothing_factor: f64,
     average: Option<f64>,
     variance: f64,
@@ -282,7 +283,7 @@ struct MovingAverage {
 }
 
 impl MovingAverage {
-    fn new(smoothing_factor: f64) -> Self {
+    pub fn new(smoothing_factor: f64) -> Self {
         Self {
             smoothing_factor,
             average: None,
@@ -318,7 +319,7 @@ impl MovingAverage {
         self.average.map(|avg| avg - num_std * self.std)
     }
 
-    fn update(&mut self, value: f64) {
+    pub fn update(&mut self, value: f64) {
         let average = match self.average {
             Some(average) => {
                 let delta = value - average;
@@ -359,7 +360,8 @@ mod test {
 
         #[test]
         fn test_state_transitions() {
-            // Tests based on the table in https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02#section-5
+            // Tests based on the table in
+            // https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02#section-5
 
             // Hold
             let hold = State::Hold;
@@ -392,7 +394,6 @@ mod test {
 
         #[test]
         fn test_initial_estimate() {
-            let now = Instant::now();
             let rate_controller = make_control(100_000);
 
             assert_eq!(rate_controller.estimated_bitrate().as_u64(), 100_000);
@@ -461,8 +462,10 @@ mod test {
 
             rate_controller.update(Signal::Overuse, 90_000.into(), None, now + duration_ms(500));
             assert_eq!(
-                rate_controller.estimated_bitrate().as_u64(), 76_500,
-                "When overuse is detected we should reduce the estimate to 85% of the obeserved rate immediately"
+                rate_controller.estimated_bitrate().as_u64(),
+                76_500,
+                "When overuse is detected we should reduce the estimate to \
+                85% of the obeserved rate immediately"
             );
         }
 

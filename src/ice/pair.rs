@@ -2,16 +2,13 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::io::{stun_resend_delay, STUN_MAX_RETRANS};
-use crate::io::{Id, TransId, STUN_MAX_RTO_MILLIS};
+use crate::io::{Id, StunTiming, TransId, DEFAULT_MAX_RETRANSMITS};
 use crate::Candidate;
-
-const MIN_TIMEOUT: Duration = Duration::from_millis(STUN_MAX_RTO_MILLIS);
+use crate::Pii;
 
 // When running ice-lite we need a cutoff when we consider the remote definitely gone.
 const RECENT_BINDING_REQUEST: Duration = Duration::from_secs(15);
 
-#[derive(Default)]
 /// A pair of candidates, local and remote, in the ice agent.
 pub struct CandidatePair {
     id: PairId,
@@ -35,7 +32,8 @@ pub struct CandidatePair {
 
     /// Record of the latest STUN messages we've tried using this pair.
     ///
-    /// This list will never grow beyond STUN_MAX_RETRANS + 1
+    /// This list will usually not grow beyond [`DEFAULT_MAX_RETRANSMITS`] * 2
+    /// unless the user configures a very large retransmission counter.
     binding_attempts: VecDeque<BindingAttempt>,
 
     /// The next time we are to do a binding attempt, cached, since we
@@ -43,10 +41,10 @@ pub struct CandidatePair {
     cached_next_attempt_time: Option<Instant>,
 
     /// Number of remote binding requests we seen for this pair.
-    pub(crate) remote_binding_requests: u64,
+    remote_binding_requests: u64,
 
     /// Last remote binding request.
-    pub(crate) remote_binding_request_time: Option<Instant>,
+    remote_binding_request_time: Option<Instant>,
 
     /// State of nomination for this candidate pair.
     nomination_state: NominationState,
@@ -121,8 +119,14 @@ impl CandidatePair {
             local_idx,
             remote_idx,
             prio,
-            binding_attempts: VecDeque::with_capacity(STUN_MAX_RETRANS + 1),
-            ..Default::default()
+            binding_attempts: VecDeque::with_capacity(DEFAULT_MAX_RETRANSMITS * 2),
+            id: Default::default(),
+            valid_idx: Default::default(),
+            state: Default::default(),
+            cached_next_attempt_time: Default::default(),
+            remote_binding_requests: Default::default(),
+            remote_binding_request_time: Default::default(),
+            nomination_state: Default::default(),
         }
     }
 
@@ -196,22 +200,34 @@ impl CandidatePair {
         assert!(self.nomination_state == NominationState::None);
         if force_success {
             self.nomination_state = NominationState::Success;
-            debug!("Force success nominated pair {:?}", self);
+            debug!("Force success nominated pair {:?}", Pii(&self));
         } else {
             self.nomination_state = NominationState::Nominated;
-            debug!("Nominated pair: {:?}", self);
+            debug!("Nominated pair: {:?}", Pii(&self));
+        }
+    }
+
+    pub fn copy_nominated_and_success_state(&mut self, other: &CandidatePair) {
+        match other.nomination_state {
+            NominationState::Nominated | NominationState::Success => {
+                self.nomination_state = other.nomination_state;
+            }
+            // None is the default, no need to copy
+            NominationState::None => {}
+            // Attempt can't be copied because we don't have sent binding requests in the new pair.
+            NominationState::Attempt => {}
         }
     }
 
     /// Records a new binding request attempt.
     ///
     /// Returns the transaction id to use in the STUN message.
-    pub fn new_attempt(&mut self, now: Instant) -> TransId {
+    pub fn new_attempt(&mut self, now: Instant, timing_config: &StunTiming) -> TransId {
         // calculate a new time
         self.cached_next_attempt_time = None;
 
         if matches!(self.nomination_state, NominationState::Nominated) {
-            debug!("Nominated attempt STUN binding: {:?}", self);
+            debug!("Nominated attempt STUN binding: {:?}", Pii(&self));
             self.nomination_state = NominationState::Attempt;
         }
 
@@ -224,8 +240,8 @@ impl CandidatePair {
 
         self.binding_attempts.push_back(attempt);
 
-        // Never keep more than STUN_MAX_RETRANS attempts.
-        while self.binding_attempts.len() > STUN_MAX_RETRANS {
+        // Never keep more than the maximum allowed retransmits.
+        while self.binding_attempts.len() > timing_config.max_retransmits() {
             self.binding_attempts.pop_front();
         }
 
@@ -268,7 +284,7 @@ impl CandidatePair {
 
         if attempt.nominated && self.nomination_state == NominationState::Attempt {
             self.nomination_state = NominationState::Success;
-            debug!("Nomination success: {:?}", self);
+            debug!("Nomination success: {:?}", Pii(&self));
         }
 
         if self.state == CheckState::InProgress {
@@ -307,32 +323,33 @@ impl CandidatePair {
     /// When we should do the next retry.
     ///
     /// Returns `None` if we are not to attempt this pair anymore.
-    pub fn next_binding_attempt(&mut self, now: Instant) -> Instant {
+    pub fn next_binding_attempt(&mut self, now: Instant, timing_config: &StunTiming) -> Instant {
         if let Some(cached) = self.cached_next_attempt_time {
             return cached;
         }
 
         let next = if matches!(self.nomination_state, NominationState::Nominated) {
             // Cheating a bit to make the nomination "skip the queue".
-            now.checked_sub(Duration::from_secs(60)).unwrap()
+            // Must handle underflow gracefully, machine may be running for < 60s.
+            now.checked_sub(Duration::from_secs(60)).unwrap_or(now)
         } else if let Some(last) = self.last_attempt_time() {
             // When we have unanswered for longer than STUN_MAX_RTO_MILLIS / 2, start
             // checking more often.
             let unanswered_count = self
                 .unanswered()
-                .filter(|(_, since)| now - *since > Duration::from_millis(STUN_MAX_RTO_MILLIS) / 2)
+                .filter(|(_, since)| now - *since > timing_config.max_rto() / 2)
                 .map(|(count, _)| count);
 
             let send_count = unanswered_count.unwrap_or(self.binding_attempts.len());
 
-            last + stun_resend_delay(send_count)
+            last + timing_config.stun_resend_delay(send_count)
         } else {
             // No previous attempt, do next retry straight away.
             now
         };
 
         // At least do a check at this time.
-        let min = now + MIN_TIMEOUT;
+        let min = now + timing_config.max_rto();
 
         let at_least = next.min(min);
 
@@ -345,17 +362,19 @@ impl CandidatePair {
     /// Tells if this candidate pair is still possible to use for connectivity.
     ///
     /// Returns `false` if the candidate has failed.
-    pub fn is_still_possible(&self, now: Instant) -> bool {
+    pub fn is_still_possible(&self, now: Instant, timing_config: &StunTiming) -> bool {
         let attempts = self.binding_attempts.len();
         let unanswered = self.unanswered().map(|b| b.0).unwrap_or(0);
 
-        if attempts < STUN_MAX_RETRANS || unanswered < STUN_MAX_RETRANS {
+        if attempts < timing_config.max_retransmits()
+            || unanswered < timing_config.max_retransmits()
+        {
             true
         } else {
             // check to see if we are still waiting for the last attempt
             // this unwrap is fine because unanswered count > 0
             let last = self.last_attempt_time().unwrap();
-            let cutoff = last + stun_resend_delay(STUN_MAX_RETRANS);
+            let cutoff = last + timing_config.stun_last_resend_delay();
             now < cutoff
         }
     }
@@ -363,6 +382,18 @@ impl CandidatePair {
     pub(crate) fn copy_remote_binding_requests(&mut self, other: &CandidatePair) {
         self.remote_binding_requests = other.remote_binding_requests;
         self.remote_binding_request_time = other.remote_binding_request_time;
+    }
+
+    pub(crate) fn reset_cached_next_attempt_time(&mut self) {
+        self.cached_next_attempt_time = None;
+    }
+
+    #[cfg(test)]
+    pub fn remote_binding_requests(&self) -> (u64, Option<Instant>) {
+        (
+            self.remote_binding_requests,
+            self.remote_binding_request_time,
+        )
     }
 }
 

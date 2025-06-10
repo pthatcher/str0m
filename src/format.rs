@@ -11,7 +11,7 @@ use crate::sdp::FormatParam;
 
 // These really don't belong anywhere, but I guess they're kind of related
 // to codecs etc.
-pub use crate::packet::{CodecExtra, Vp8CodecExtra, Vp9CodecExtra};
+pub use crate::packet::{CodecExtra, H264CodecExtra, Vp8CodecExtra, Vp9CodecExtra};
 
 /// Session config for all codecs.
 #[derive(Debug, Clone, Default)]
@@ -138,6 +138,12 @@ pub struct FormatParams {
     /// Specifies that the decoder can do Opus in-band FEC
     pub use_inband_fec: Option<bool>,
 
+    /// Opus specific parameter.
+    ///
+    /// Specifies that the decoder prefers DTX (Discontinuous Transmission) such that
+    /// the packet rate is greatly lowered during periods of silence.
+    pub use_dtx: Option<bool>,
+
     /// Whether h264 sending media encoded at a different level in the offerer-to-answerer
     /// direction than the level in the answerer-to-offerer direction, is allowed.
     pub level_asymmetry_allowed: Option<bool>,
@@ -158,6 +164,35 @@ pub struct FormatParams {
 
     /// VP9 profile id.
     pub profile_id: Option<u32>,
+
+    /// AV1 profile.
+    ///
+    /// Indicates the highest AV1 profile that may have been used to generate
+    /// the bitstream or that the receiver supports. The range of possible values
+    /// is identical to the seq_profile syntax element specified in AV1. If the
+    /// parameter is not present, it MUST be inferred to be 0 (“Main” profile).
+    ///
+    /// 0  8-bit or 10-bit 4:2:0
+    /// 1  8-bit or 10-bit 4:4:4
+    /// 2  8-bit or 10-bit 4:2:2
+    /// 2  12-bit          4:2:0, 4:2:2, 4:4:4
+    pub profile: Option<u8>,
+
+    /// AV1 level-idx.
+    ///
+    /// Indicates the highest AV1 level that may have been used to generate the
+    /// bitstream or that the receiver supports. The range of possible values
+    /// is identical to the seq_level_idx syntax element specified in AV1. If
+    /// the parameter is not present, it MUST be inferred to be 5 (level 3.1).
+    pub level_idx: Option<u8>,
+
+    /// AV1 tier.
+    ///
+    /// Indicates the highest tier that may have been used to generate the  bitstream
+    /// or that the receiver supports. The range of possible values is identical
+    /// to the seq_tier syntax element specified in AV1. If the parameter is not
+    /// present, the tier MUST be inferred to be 0.
+    pub tier: Option<u8>,
 }
 
 impl PayloadParams {
@@ -288,6 +323,14 @@ impl PayloadParams {
             return Self::match_h264_score(c0, c1);
         }
 
+        if c0.codec == Codec::Vp9 {
+            return Self::match_vp9_score(c0, c1);
+        }
+
+        if c0.codec == Codec::Av1 {
+            return Self::match_av1_score(c0, c1);
+        }
+
         // TODO: Fuzzy matching for any other audio codecs
         // TODO: Fuzzy matching for video
 
@@ -313,7 +356,57 @@ impl PayloadParams {
             score = score.saturating_sub(2);
         }
 
+        // If neither value is specified both sides should assume DTX is not used as this is
+        // the default.
+        let either_dtx_specified = c0.format.use_dtx.is_some() || c1.format.use_dtx.is_some();
+        if either_dtx_specified && c0.format.use_dtx != c1.format.use_dtx {
+            score = score.saturating_sub(4);
+        }
+
         score
+    }
+
+    fn match_vp9_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
+        // Default profile_id is 0. https://datatracker.ietf.org/doc/html/draft-ietf-payload-vp9-16#section-6
+        let c0_profile_id = c0.format.profile_id.unwrap_or(0);
+        let c1_profile_id = c1.format.profile_id.unwrap_or(0);
+
+        if c0_profile_id != c1_profile_id {
+            return None;
+        }
+
+        Some(100)
+    }
+
+    fn match_av1_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
+        // TODO: consider media direction for a proper less or equal matching
+        // The AV1 stream sent by either the offerer or the answerer MUST be
+        // encoded with a profile, level and tier, lesser or equal to the values
+        // of the level-idx, profile and tier declared in the SDP by the receiving
+        // agent.
+        // https://aomediacodec.github.io/av1-rtp-spec/#723-usage-with-the-sdp-offeranswer-model
+
+        // Default values: profile = 0, level-idx = 5, tier = 0
+        // https://aomediacodec.github.io/av1-rtp-spec/#72-sdp-parameters
+        let c0_profile = c0.format.profile.unwrap_or(0);
+        let c1_profile = c1.format.profile.unwrap_or(0);
+        if c0_profile != c1_profile {
+            return None;
+        }
+
+        let c0_level_idx = c0.format.level_idx.unwrap_or(5);
+        let c1_level_idx = c1.format.level_idx.unwrap_or(5);
+        if c0_level_idx != c1_level_idx {
+            return None;
+        }
+
+        let c0_tier = c0.format.tier.unwrap_or(0);
+        let c1_tier = c1.format.tier.unwrap_or(0);
+        if c0_tier != c1_tier {
+            return None;
+        }
+
+        Some(100)
     }
 
     fn match_h264_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
@@ -389,12 +482,6 @@ impl PayloadParams {
                 claimed.assert_claim_once(rtx);
             }
         }
-    }
-
-    /// Exposed for integration tests.
-    #[doc(hidden)]
-    pub fn is_locked(&self) -> bool {
-        self.locked
     }
 }
 
@@ -678,7 +765,8 @@ impl CodecConfig {
             // indistinguishable from RTP payload types 79 with the marker bit set
             80..=95,
             77..=78,
-            // reserved because RTCP packet types 200–204 would otherwise be indistinguishable from RTP payload types 72–76
+            // reserved because RTCP packet types 200–204 would otherwise be indistinguishable
+            // from RTP payload types 72–76
             // 72..77,
             // lol range.
             35..=71,
@@ -696,7 +784,7 @@ impl CodecConfig {
                     panic!("Exhausted all PT ranges, inconsistent PayloadParam state");
                 };
 
-                info!("Reassigned PT {} => {}", p.pt, pt);
+                debug!("Reassigned PT {} => {}", p.pt, pt);
                 p.pt = pt;
 
                 claimed.assert_claim_once(pt);
@@ -712,7 +800,7 @@ impl CodecConfig {
                     panic!("Exhausted all PT ranges, inconsistent PayloadParam state");
                 };
 
-                info!("Reassigned RTX PT {:?} => {:?}", p.resend, rtx);
+                debug!("Reassigned RTX PT {:?} => {:?}", p.resend, rtx);
                 p.resend = Some(rtx);
 
                 claimed.assert_claim_once(rtx);
@@ -784,10 +872,14 @@ impl FormatParams {
         match param {
             MinPTime(v) => self.min_p_time = Some(*v),
             UseInbandFec(v) => self.use_inband_fec = Some(*v),
+            UseDtx(v) => self.use_dtx = Some(*v),
             LevelAsymmetryAllowed(v) => self.level_asymmetry_allowed = Some(*v),
             PacketizationMode(v) => self.packetization_mode = Some(*v),
             ProfileLevelId(v) => self.profile_level_id = Some(*v),
             ProfileId(v) => self.profile_id = Some(*v),
+            Profile(v) => self.profile = Some(*v),
+            LevelIdx(v) => self.level_idx = Some(*v),
+            Tier(v) => self.tier = Some(*v),
             Apt(_) => {}
             Unknown => {}
         }
@@ -803,6 +895,9 @@ impl FormatParams {
         if let Some(v) = self.use_inband_fec {
             r.push(UseInbandFec(v));
         }
+        if let Some(v) = self.use_dtx {
+            r.push(UseDtx(v));
+        }
         if let Some(v) = self.level_asymmetry_allowed {
             r.push(LevelAsymmetryAllowed(v));
         }
@@ -814,6 +909,15 @@ impl FormatParams {
         }
         if let Some(v) = self.profile_id {
             r.push(ProfileId(v));
+        }
+        if let Some(v) = self.profile {
+            r.push(Profile(v));
+        }
+        if let Some(v) = self.level_idx {
+            r.push(LevelIdx(v));
+        }
+        if let Some(v) = self.tier {
+            r.push(Tier(v));
         }
 
         r
@@ -842,7 +946,7 @@ impl Codec {
     /// Tells if codec is video.
     pub fn is_video(&self) -> bool {
         use Codec::*;
-        matches!(self, H264 | Vp8 | Vp9 | Av1)
+        matches!(self, H265 | H264 | Vp8 | Vp9 | Av1)
     }
 
     /// Audio/Video.
@@ -917,12 +1021,10 @@ mod test {
             clock_rate: Frequency::NINETY_KHZ,
             channels: None,
             format: FormatParams {
-                min_p_time: None,
-                use_inband_fec: None,
                 level_asymmetry_allowed,
                 packetization_mode,
                 profile_level_id,
-                profile_id: None, // VP8
+                ..Default::default()
             },
         }
     }
@@ -953,7 +1055,9 @@ mod test {
             c1: h264_codec_spec(None, None, Some(0x42B00A)),
             must_match: true,
             msg:
-                "0x424000 and 0x42B00A should match because they are both the baseline subprofile and the level idc of 0x42F01F will be adjusted to Level1B because the constraint set 3 flag is set"
+                "0x424000 and 0x42B00A should match because they are both the baseline subprofile \
+                and the level idc of 0x42F01F will be adjusted to Level1B because the constraint \
+                set 3 flag is set"
         }];
 
         for Case {

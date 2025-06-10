@@ -1,4 +1,5 @@
 mod common;
+use common::init_crypto_default;
 use common::init_log;
 use common::negotiate;
 use common::TestRtc;
@@ -18,6 +19,7 @@ use tracing::Span;
 #[test]
 pub fn change_default_pt() {
     init_log();
+    init_crypto_default();
 
     // First proposed PT is 100, R side adjusts its default from 102 -> 100
     let (l, r) = with_params(
@@ -30,16 +32,17 @@ pub fn change_default_pt() {
 
     // Test left side.
     assert_eq!(&[opus(100)], &**l.codec_config());
-    assert!(l.codec_config()[0].is_locked());
+    assert!(l.codec_config()[0]._is_locked());
 
     // Test right side.
     assert_eq!(&[opus(100)], &**r.codec_config());
-    assert!(r.codec_config()[0].is_locked());
+    assert!(r.codec_config()[0]._is_locked());
 }
 
 #[test]
 pub fn answer_change_order() {
     init_log();
+    init_crypto_default();
 
     // First proposed PT are 100/102, but R side has a different order.
     let (l, r) = with_params(
@@ -50,11 +53,11 @@ pub fn answer_change_order() {
         &[h264(96), vp8(98)],
     );
 
-    let mid = l.mids()[0];
+    let mid = l._mids()[0];
 
     // Test left side.
     assert_eq!(&[vp8(100), h264(102)], &**l.codec_config());
-    assert!(l.codec_config().iter().all(|p| p.is_locked()));
+    assert!(l.codec_config().iter().all(|p| p._is_locked()));
     assert_eq!(
         l.media(mid).unwrap().remote_pts(),
         // R side has expressed its preference order, but amended the PT to match the OFFER.
@@ -63,7 +66,7 @@ pub fn answer_change_order() {
 
     // Test right side.
     assert_eq!(&[h264(102), vp8(100)], &**r.codec_config());
-    assert!(r.codec_config().iter().all(|p| p.is_locked()));
+    assert!(r.codec_config().iter().all(|p| p._is_locked()));
     assert_eq!(
         r.media(mid).unwrap().remote_pts(),
         // OFFER straight up.
@@ -74,6 +77,7 @@ pub fn answer_change_order() {
 #[test]
 pub fn answer_narrow() {
     init_log();
+    init_crypto_default();
 
     // First proposed PT are 100/102, the R side removes unsupported ones.
     let (l, r) = with_params(
@@ -84,14 +88,14 @@ pub fn answer_narrow() {
         &[h264(96)],
     );
 
-    let mid = l.mids()[0];
+    let mid = l._mids()[0];
 
     // Test left side.
     assert_eq!(&[vp8(100), h264(102)], &**l.codec_config());
     assert_eq!(
         l.codec_config()
             .iter()
-            .map(|p| p.is_locked())
+            .map(|p| p._is_locked())
             .collect::<Vec<_>>(),
         // VP8 is not locked, H264 is
         vec![false, true]
@@ -104,7 +108,7 @@ pub fn answer_narrow() {
 
     // Test right side. The PT of h264 is updated with what L OFFERed.
     assert_eq!(&[h264(102)], &**r.codec_config());
-    assert!(r.codec_config().iter().all(|p| p.is_locked()));
+    assert!(r.codec_config().iter().all(|p| p._is_locked()));
     assert_eq!(
         r.media(mid).unwrap().remote_pts(),
         // OFFER straight up.
@@ -115,6 +119,7 @@ pub fn answer_narrow() {
 #[test]
 pub fn answer_no_match() {
     init_log();
+    init_crypto_default();
 
     // L has one codec, and that is not matched by R. This should disable the m-line.
     let (l, r) = with_params(
@@ -125,17 +130,17 @@ pub fn answer_no_match() {
         &[h264(96)],
     );
 
-    let mid = l.mids()[0];
+    let mid = l._mids()[0];
 
     // Test left side. Nothing has changed. The codec is not locked.
     assert_eq!(&[vp8(100)], &**l.codec_config());
-    assert!(!l.codec_config()[0].is_locked());
+    assert!(!l.codec_config()[0]._is_locked());
     // No remote PTs.
     assert_eq!(l.media(mid).unwrap().remote_pts(), &[]);
 
     // Test right side. Nothing has changed. The codec is not locked.
     assert_eq!(&[h264(96)], &**r.codec_config());
-    assert!(!r.codec_config()[0].is_locked());
+    assert!(!r.codec_config()[0]._is_locked());
     // No remote PTs.
     assert_eq!(r.media(mid).unwrap().remote_pts(), &[]);
 
@@ -145,6 +150,7 @@ pub fn answer_no_match() {
 #[test]
 pub fn answer_different_pt_to_offer() {
     init_log();
+    init_crypto_default();
 
     // This test case checks a scenario happening with Firefox.
     // 1. SDP -> FF: OFFER to sendonly VP8 PT 96.
@@ -166,7 +172,7 @@ pub fn answer_different_pt_to_offer() {
     assert_eq!(&[vp8(96)], &**r.codec_config());
 
     let mut change = r.sdp_api();
-    change.add_media(MediaKind::Video, Direction::SendOnly, None, None);
+    change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
     let (offer, _pending) = change.apply().unwrap();
 
     let sdp = offer.to_sdp_string();
@@ -213,6 +219,7 @@ pub fn answer_different_pt_to_offer() {
 #[test]
 fn answer_remaps() {
     init_log();
+    init_crypto_default();
 
     use Extension::*;
 
@@ -226,10 +233,10 @@ fn answer_remaps() {
     // This negotiates a video track.
     let (l, r) = with_exts(exts_l, exts_r);
 
-    let v_l: Vec<_> = l.exts().iter_video().collect();
-    let v_r: Vec<_> = r.exts().iter_video().collect();
-    let a_l: Vec<_> = l.exts().iter_audio().collect();
-    let a_r: Vec<_> = r.exts().iter_audio().collect();
+    let v_l: Vec<_> = l._exts().iter_video().collect();
+    let v_r: Vec<_> = r._exts().iter_video().collect();
+    let a_l: Vec<_> = l._exts().iter_audio().collect();
+    let a_r: Vec<_> = r._exts().iter_audio().collect();
 
     // L locks 3 and changes it from 14
     // R keeps 3 and changes it from 14.
@@ -265,6 +272,7 @@ fn answer_remaps() {
 #[test]
 fn offers_unsupported_extension() {
     init_log();
+    init_crypto_default();
 
     use Extension::*;
 
@@ -282,15 +290,15 @@ fn offers_unsupported_extension() {
     let (l, r) = with_exts(exts_l, exts_r);
 
     assert_eq!(
-        l.exts().iter_video().collect::<Vec<_>>(),
+        l._exts().iter_video().collect::<Vec<_>>(),
         vec![(3, &VideoOrientation), (8, &ColorSpace)]
     );
     assert_eq!(
-        r.exts().iter_video().collect::<Vec<_>>(),
+        r._exts().iter_video().collect::<Vec<_>>(),
         vec![(3, &VideoOrientation)]
     );
 
-    let mid = l.mids()[0];
+    let mid = l._mids()[0];
     let m_l = l.media(mid).unwrap();
     let m_r = r.media(mid).unwrap();
 
@@ -310,6 +318,8 @@ fn offers_unsupported_extension() {
 #[test]
 fn non_media_creator_cannot_change_inactive_to_recvonly() {
     init_log();
+    init_crypto_default();
+
     let (mut l, mut r) = (
         TestRtc::new_with_rtc(
             info_span!("L"),
@@ -322,9 +332,9 @@ fn non_media_creator_cannot_change_inactive_to_recvonly() {
     );
 
     negotiate(&mut l, &mut r, |change| {
-        change.add_media(MediaKind::Video, Direction::Inactive, None, None);
+        change.add_media(MediaKind::Video, Direction::Inactive, None, None, None);
     });
-    let mid = r.mids()[0];
+    let mid = r._mids()[0];
     let m_r = r.media(mid).unwrap();
     assert_eq!(m_r.direction(), Direction::Inactive);
 
@@ -343,6 +353,8 @@ fn non_media_creator_cannot_change_inactive_to_recvonly() {
 #[test]
 fn media_creator_can_change_inactive_to_recvonly() {
     init_log();
+    init_crypto_default();
+
     let (mut l, mut r) = (
         TestRtc::new_with_rtc(
             info_span!("L"),
@@ -355,9 +367,9 @@ fn media_creator_can_change_inactive_to_recvonly() {
     );
 
     negotiate(&mut l, &mut r, |change| {
-        change.add_media(MediaKind::Video, Direction::Inactive, None, None);
+        change.add_media(MediaKind::Video, Direction::Inactive, None, None, None);
     });
-    let mid = r.mids()[0];
+    let mid = r._mids()[0];
     let m_r = r.media(mid).unwrap();
     assert_eq!(m_r.direction(), Direction::Inactive);
 
@@ -388,7 +400,7 @@ fn with_params(
         .unwrap_or(MediaKind::Audio);
 
     negotiate(&mut l, &mut r, |change| {
-        change.add_media(kind, Direction::SendRecv, None, None);
+        change.add_media(kind, Direction::SendRecv, None, None, None);
     });
 
     (l, r)
@@ -399,7 +411,7 @@ fn with_exts(exts_l: ExtensionMap, exts_r: ExtensionMap) -> (TestRtc, TestRtc) {
     let mut r = build_exts(info_span!("R"), exts_r);
 
     negotiate(&mut l, &mut r, |change| {
-        change.add_media(MediaKind::Video, Direction::SendRecv, None, None);
+        change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None);
     });
 
     (l, r)

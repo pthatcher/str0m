@@ -2,13 +2,14 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::media::KeyframeRequestKind;
-use crate::rtp_::{
-    extend_u32, Bitrate, DlrrItem, ExtendedReport, Fir, FirEntry, Frequency, MediaTime, Remb,
-};
+use crate::rtp_::MidRid;
+use crate::rtp_::{extend_u32, Bitrate, DlrrItem, ExtendedReport};
+use crate::rtp_::{Fir, FirEntry, Frequency, MediaTime, Remb};
 use crate::rtp_::{Mid, Pli, Pt, ReceiverReport};
-use crate::rtp_::{ReportBlock, ReportList, Rid, Rrtr, Rtcp, RtcpFb, RtpHeader, SenderInfo, SeqNo};
+use crate::rtp_::{ReportBlock, ReportList, Rid, Rrtr, Rtcp};
+use crate::rtp_::{RtcpFb, RtpHeader, SenderInfo, SeqNo};
 use crate::rtp_::{SdesType, Ssrc};
-use crate::stats::{MediaIngressStats, StatsSnapshot};
+use crate::stats::{MediaIngressStats, RemoteEgressStats, StatsSnapshot};
 use crate::util::InstantExt;
 use crate::util::{already_happened, calculate_rtt_ms};
 
@@ -35,11 +36,8 @@ pub struct StreamRx {
     /// of changing SSRC (for FF).
     previous_ssrc: Option<Ssrc>,
 
-    /// The Media mid this stream belongs to.
-    mid: Mid,
-
-    /// The rid that might be used for this stream.
-    rid: Option<Rid>,
+    /// The Media mid/rid this stream belongs to.
+    midrid: MidRid,
 
     /// Incoming CNAME in Sdes reports.
     cname: Option<String>,
@@ -130,15 +128,14 @@ pub(crate) struct StreamRxStats {
 }
 
 impl StreamRx {
-    pub(crate) fn new(ssrc: Ssrc, mid: Mid, rid: Option<Rid>, suppress_nack: bool) -> Self {
+    pub(crate) fn new(ssrc: Ssrc, midrid: MidRid, suppress_nack: bool) -> Self {
         debug!("Create StreamRx for SSRC: {}", ssrc);
 
         StreamRx {
             ssrc,
             rtx: None,
             previous_ssrc: None,
-            mid,
-            rid,
+            midrid,
             cname: None,
             suppress_nack,
             last_used: already_happened(),
@@ -174,14 +171,14 @@ impl StreamRx {
     ///
     /// In SDP this corresponds to m-line and "Media".
     pub fn mid(&self) -> Mid {
-        self.mid
+        self.midrid.mid()
     }
 
     /// Rid for this stream.
     ///
     /// This is used to separate streams with the same [`Mid`] when using simulcast.
     pub fn rid(&self) -> Option<Rid> {
-        self.rid
+        self.midrid.rid()
     }
 
     /// CNAME as sent by remote peer in a Sdes.
@@ -196,6 +193,13 @@ impl StreamRx {
     /// This event is emitted when no packet have received for this duration.
     pub fn set_pause_threshold(&mut self, t: Duration) {
         self.pause_threshold = t;
+    }
+
+    /// The last time we received a packet.
+    ///
+    /// Resets if the SSRC changes.
+    pub fn last_time(&self) -> Option<MediaTime> {
+        self.last_time
     }
 
     /// Request a keyframe for an incoming encoded stream.
@@ -265,7 +269,7 @@ impl StreamRx {
     fn set_sender_info(&mut self, now: Instant, mut info: SenderInfo) {
         // Extend the incoming time given our knowledge of last time.
         let extended = {
-            let prev = self.sender_info.map(|(_, sr)| sr.rtp_time.numer() as u64);
+            let prev = self.sender_info.map(|(_, sr)| sr.rtp_time.numer());
             let r_u32 = info.rtp_time.numer() as u32;
             extend_u32(prev, r_u32)
         };
@@ -278,7 +282,7 @@ impl StreamRx {
             .unwrap_or(Frequency::SECONDS);
 
         // Clock rate is that of the last received packet.
-        info.rtp_time = MediaTime::new(extended as i64, clock_rate);
+        info.rtp_time = MediaTime::new(extended, clock_rate);
 
         self.sender_info = Some((now, info));
     }
@@ -312,21 +316,12 @@ impl StreamRx {
         self.need_paused_event = true;
     }
 
-    pub(crate) fn update(
+    pub(crate) fn extend_seq(
         &mut self,
-        now: Instant,
         header: &RtpHeader,
-        clock_rate: Frequency,
         is_repair: bool,
-    ) -> RegisterUpdateReceipt {
-        self.last_used = now;
-
-        if self.paused {
-            self.paused = false;
-            self.need_paused_event = true;
-        }
-        self.check_paused_at = Some(now + self.pause_threshold);
-
+        max_seq_lookup: impl Fn(Ssrc) -> Option<SeqNo>,
+    ) -> SeqNo {
         // Select reference to register to use depending on RTX or not. The RTX has a separate
         // sequence number series to the main register.
         let register_ref = if is_repair {
@@ -335,7 +330,8 @@ impl StreamRx {
             &mut self.register
         };
 
-        let register = register_ref.get_or_insert_with(ReceiverRegister::new);
+        let register =
+            register_ref.get_or_insert_with(|| ReceiverRegister::new(max_seq_lookup(header.ssrc)));
 
         // If the user has called `reset_seq_no`, this is the time to handle it, but only
         // if the incoming packet is for main (not repair).
@@ -347,24 +343,82 @@ impl StreamRx {
             }
         }
 
-        let seq_no = if let Some(reset_seq_no) = reset_seq_no {
+        if let Some(reset_seq_no) = reset_seq_no {
             reset_seq_no
         } else {
             header.sequence_number(register.max_seq())
+        }
+    }
+
+    pub(crate) fn is_new_packet(&self, is_repair: bool, seq_no: SeqNo) -> bool {
+        let register_ref = if is_repair {
+            self.register_rtx.as_ref()
+        } else {
+            self.register.as_ref()
         };
+
+        // Unwrap is OK because we always call extend_seq() for the same is_repair flag beforehand
+        register_ref.unwrap().accepts(seq_no)
+    }
+
+    pub(crate) fn update_register(
+        &mut self,
+        now: Instant,
+        header: &RtpHeader,
+        clock_rate: Frequency,
+        is_repair: bool,
+        seq_no: SeqNo,
+    ) -> RegisterUpdateReceipt {
+        self.last_used = now;
+
+        if self.paused {
+            self.paused = false;
+            self.need_paused_event = true;
+        }
+        self.check_paused_at = Some(now + self.pause_threshold);
+
+        let register_ref = if is_repair {
+            &mut self.register_rtx
+        } else {
+            &mut self.register
+        };
+
+        // Unwrap is OK because we always call extend_seq() for the same is_repair flag beforehand
+        let register = register_ref.as_mut().unwrap();
 
         let is_new_packet = register.update(seq_no, now, header.timestamp, clock_rate.get());
 
-        let previous_time = self.last_time.map(|t| t.numer() as u64);
-        let time_u32 = extend_u32(previous_time, header.timestamp);
-        let time = MediaTime::new(time_u32 as i64, clock_rate);
+        // Get the previous time for comparison
+        let previous_time = self.last_time.map(|t| t.numer());
+
+        // Calculate the extended timestamp
+        let mut time_u32 = extend_u32(previous_time, header.timestamp);
+
+        if self.paused && previous_time.is_some() && time_u32 < previous_time.unwrap() {
+            // In 32-bit RTP timestamps, adding 2^31 (MAX/2) flips to the other half of timestamp space
+            // This forces extend_u32 to produce a value in the next cycle
+            const HALF_CYCLE: u32 = 1u32 << 31;
+            let adjusted_ts = header.timestamp.wrapping_add(HALF_CYCLE);
+
+            // Recalculate extended timestamp with adjusted value
+            let adjusted_time_u32 = extend_u32(previous_time, adjusted_ts);
+
+            // If this adjusted timestamp moves time forward, use it
+            if adjusted_time_u32 > previous_time.unwrap() {
+                time_u32 = adjusted_time_u32;
+            } else {
+                // Fallback
+                time_u32 = header.timestamp as u64;
+            }
+        }
+
+        let time = MediaTime::new(time_u32, clock_rate);
 
         if !is_repair {
             self.last_time = Some(time);
         }
 
         RegisterUpdateReceipt {
-            seq_no,
             time,
             is_new_packet,
         }
@@ -378,7 +432,7 @@ impl StreamRx {
         data: Vec<u8>,
         seq_no: SeqNo,
         time: MediaTime,
-    ) -> Option<RtpPacket> {
+    ) -> RtpPacket {
         trace!("Handle RTP: {:?}", header);
 
         let need_clock_rate = self.last_clock_rate.map(|(pt, _)| pt) != Some(header.payload_type);
@@ -404,7 +458,7 @@ impl StreamRx {
         self.stats.bytes += packet.payload.len() as u64;
         self.stats.packets += 1;
 
-        Some(packet)
+        packet
     }
 
     pub(crate) fn un_rtx(&self, header: &mut RtpHeader, data: &mut Vec<u8>, pt: Pt) {
@@ -499,9 +553,11 @@ impl StreamRx {
 
         let xr = self.create_extended_receiver_report(now);
 
-        debug!(
-            "Created feedback RR/XR ({:?}/{:?}): {:?} {:?}",
-            self.mid, self.rid, rr, xr
+        trace!(
+            "Created feedback RR/XR ({:?}): {:?} {:?}",
+            self.midrid,
+            rr,
+            xr
         );
         feedback.push_back(Rtcp::ReceiverReport(rr));
         feedback.push_back(Rtcp::ExtendedReport(xr));
@@ -559,7 +615,7 @@ impl StreamRx {
         }
     }
 
-    fn nack_enabled(&self) -> bool {
+    pub(crate) fn nack_enabled(&self) -> bool {
         // Deliberately don't look at RTX is_some() here, since when using dynamic SSRC, we might need
         // to send NACK before discovering the remote RTX.
         !self.suppress_nack
@@ -580,7 +636,7 @@ impl StreamRx {
             nack.sender_ssrc = sender_ssrc;
             nack.ssrc = self.ssrc;
 
-            debug!("Created feedback NACK: {:?}", nack);
+            trace!("Created feedback NACK: {:?}", nack);
             feedback.push_back(Rtcp::Nack(nack));
             self.stats.nacks += 1;
         }
@@ -589,7 +645,8 @@ impl StreamRx {
     }
 
     pub(crate) fn visit_stats(&mut self, snapshot: &mut StatsSnapshot, now: Instant) {
-        self.stats.fill(snapshot, self.mid, self.rid, now);
+        self.stats
+            .fill(snapshot, self.midrid, self.sender_info.as_ref(), now);
     }
 
     pub(crate) fn poll_paused(&mut self) -> Option<StreamPaused> {
@@ -599,48 +656,64 @@ impl StreamRx {
 
         self.need_paused_event = false;
 
-        info!(
-            "{} StreamRx with mid: {} rid: {:?} and SSRC: {}",
+        debug!(
+            "{} StreamRx with {:?} and SSRC: {}",
             if self.paused { "Paused" } else { "Unpaused" },
-            self.mid,
-            self.rid,
+            self.midrid,
             self.ssrc
         );
 
         Some(StreamPaused {
             ssrc: self.ssrc,
-            mid: self.mid,
-            rid: self.rid,
+            mid: self.midrid.mid(),
+            rid: self.midrid.rid(),
             paused: self.paused,
         })
     }
 
-    pub(crate) fn reset_buffers(&mut self) {
+    pub(crate) fn reset_buffers(&mut self, max_seq_lookup: impl Fn(Ssrc) -> Option<SeqNo>) {
         if let Some(r) = &mut self.register {
-            r.clear();
+            r.clear(max_seq_lookup(self.ssrc));
         }
 
         if let Some(r) = &mut self.register_rtx {
-            r.clear();
+            r.clear(self.rtx.and_then(max_seq_lookup));
         }
         self.pending_request_keyframe = None;
     }
 
-    pub(crate) fn change_ssrc(&mut self, ssrc: Ssrc) {
+    #[must_use]
+    pub(crate) fn change_ssrc(&mut self, ssrc: Ssrc) -> bool {
+        // Avoid flapping
         if ssrc == self.ssrc || Some(ssrc) == self.previous_ssrc {
-            return;
+            return false;
         }
 
-        info!(
-            "Change main SSRC: {} -> {} mid: {} rid: {:?}",
-            self.ssrc, ssrc, self.mid, self.rid
+        debug!(
+            "Change main SSRC: {} -> {} {:?}",
+            self.ssrc, ssrc, self.midrid
         );
 
         // Remember which was the previous in case a stray packet turns up
         // so do we don't go "backwards".
         self.previous_ssrc = Some(self.ssrc);
         self.ssrc = ssrc;
+
+        // Reset all SSRC-specific state
         self.register = None;
+        self.last_time = None;
+        self.last_clock_rate = None;
+        self.sender_info = None;
+        self.last_receiver_report = already_happened();
+        self.fir_seq_no = 0;
+        self.pending_request_keyframe = None;
+        self.pending_request_remb = None;
+        self.reset_roc = None;
+
+        // Note: We don't reset the RTX register here, as the RTX SSRC is managed separately
+        // via maybe_reset_rtx() and is not directly tied to the main SSRC change.
+
+        true
     }
 
     pub(crate) fn maybe_reset_rtx(&mut self, rtx: Ssrc) {
@@ -649,9 +722,9 @@ impl StreamRx {
                 return;
             }
 
-            info!(
-                "Change RTX SSRC {} -> {} for main SSRC: {} mid: {} rid: {:?}",
-                current, rtx, self.ssrc, self.mid, self.rid
+            debug!(
+                "Change RTX SSRC {} -> {} for main SSRC: {} {:?}",
+                current, rtx, self.ssrc, self.midrid
             );
         } else {
             debug!("SSRC {} associated with RTX: {}", self.ssrc, rtx);
@@ -679,6 +752,10 @@ impl StreamRx {
         self.register_rtx = None;
         self.reset_roc = Some(roc);
     }
+
+    pub(crate) fn is_midrid(&self, midrid: MidRid) -> bool {
+        midrid.special_equals(&self.midrid)
+    }
 }
 
 impl StreamRxStats {
@@ -689,18 +766,17 @@ impl StreamRxStats {
     pub(crate) fn fill(
         &mut self,
         snapshot: &mut StatsSnapshot,
-        mid: Mid,
-        rid: Option<Rid>,
+        midrid: MidRid,
+        sender_info: Option<&(Instant, SenderInfo)>,
         now: Instant,
     ) {
         if self.bytes == 0 {
             return;
         }
 
-        let key = (mid, rid);
         let stats = MediaIngressStats {
-            mid,
-            rid,
+            mid: midrid.mid(),
+            rid: midrid.rid(),
             bytes: self.bytes,
             packets: self.packets,
             firs: self.firs,
@@ -709,6 +785,10 @@ impl StreamRxStats {
             rtt: self.rtt,
             loss: self.loss,
             timestamp: now,
+            remote: sender_info.map(|(_, sender_info)| RemoteEgressStats {
+                bytes: sender_info.sender_octet_count as u64,
+                packets: sender_info.sender_packet_count as u64,
+            }),
         };
 
         // Several SSRCs can back a given (mid, rid) tuple. For example, Firefox creates new SSRCs
@@ -717,7 +797,7 @@ impl StreamRxStats {
         // the SSRCs that have been used.
         snapshot
             .ingress
-            .entry(key)
+            .entry(midrid)
             .and_modify(|s| s.merge_by_mid_rid(&stats))
             .or_insert(stats);
     }
@@ -725,7 +805,6 @@ impl StreamRxStats {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RegisterUpdateReceipt {
-    pub seq_no: SeqNo,
     pub time: MediaTime,
     pub is_new_packet: bool,
 }

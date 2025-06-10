@@ -1,5 +1,4 @@
 #![allow(clippy::type_complexity)]
-#![allow(unused)]
 
 use std::fmt;
 use std::panic::UnwindSafe;
@@ -12,6 +11,7 @@ mod g7xx;
 use g7xx::{G711Packetizer, G722Packetizer};
 
 mod h264;
+pub use h264::H264CodecExtra;
 use h264::{H264Depacketizer, H264Packetizer};
 
 mod h264_profile;
@@ -35,8 +35,10 @@ mod null;
 use null::{NullDepacketizer, NullPacketizer};
 
 mod buffer_rx;
-pub(crate) use buffer_rx::{Depacketized, DepacketizingBuffer, RtpMeta};
-mod vp8_contiguity;
+pub(crate) use buffer_rx::{DepacketizingBuffer, RtpMeta};
+mod contiguity;
+mod contiguity_vp8;
+mod contiguity_vp9;
 
 mod payload;
 pub(crate) use payload::Payloader;
@@ -89,6 +91,8 @@ pub enum CodecExtra {
     Vp8(Vp8CodecExtra),
     /// Codec extra parameters for VP9.
     Vp9(Vp9CodecExtra),
+    /// Codec extra parameters for H264.
+    H264(H264CodecExtra),
 }
 
 /// Depacketizes an RTP payload.
@@ -139,8 +143,8 @@ pub enum PacketError {
 /// Helper to replace Bytes. Provides get_u8 and get_u16 over some buffer of bytes.
 pub(crate) trait BitRead {
     fn remaining(&self) -> usize;
-    fn get_u8(&mut self) -> u8;
-    fn get_u16(&mut self) -> u16;
+    fn get_u8(&mut self) -> Option<u8>;
+    fn get_u16(&mut self) -> Option<u16>;
 }
 
 impl BitRead for (&[u8], usize) {
@@ -150,9 +154,9 @@ impl BitRead for (&[u8], usize) {
     }
 
     #[inline(always)]
-    fn get_u8(&mut self) -> u8 {
-        if self.remaining() == 0 {
-            panic!("Too few bits left");
+    fn get_u8(&mut self) -> Option<u8> {
+        if self.remaining() < 8 {
+            return None;
         }
 
         let offs = self.1 / 8;
@@ -166,17 +170,22 @@ impl BitRead for (&[u8], usize) {
             n |= self.0[offs + 1] >> (8 - shift)
         }
 
-        n
+        Some(n)
     }
 
-    fn get_u16(&mut self) -> u16 {
-        u16::from_be_bytes([self.get_u8(), self.get_u8()])
+    fn get_u16(&mut self) -> Option<u16> {
+        if self.remaining() < 16 {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.get_u8()?, self.get_u8()?]))
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum CodecPacketizer {
+    #[allow(unused)]
     G711(G711Packetizer),
+    #[allow(unused)]
     G722(G722Packetizer),
     H264(H264Packetizer),
     // H265() TODO
@@ -184,6 +193,7 @@ pub(crate) enum CodecPacketizer {
     Vp8(Vp8Packetizer),
     Vp9(Vp9Packetizer),
     Null(NullPacketizer),
+    #[allow(unused)]
     Boxed(Box<dyn Packetizer + Send + Sync + UnwindSafe>),
 }
 
@@ -195,6 +205,7 @@ pub(crate) enum CodecDepacketizer {
     Vp8(Vp8Depacketizer),
     Vp9(Vp9Depacketizer),
     Null(NullDepacketizer),
+    #[allow(unused)]
     Boxed(Box<dyn Depacketizer + Send + Sync + UnwindSafe>),
 }
 
@@ -210,7 +221,6 @@ impl From<Codec> for CodecPacketizer {
             Codec::Null => CodecPacketizer::Null(NullPacketizer),
             Codec::Rtx => panic!("Cant instantiate packetizer for RTX codec"),
             Codec::Unknown => panic!("Cant instantiate packetizer for unknown codec"),
-            _ => panic!("Cant instantiate packetizer for unhandled codec"),
         }
     }
 }
@@ -227,7 +237,6 @@ impl From<Codec> for CodecDepacketizer {
             Codec::Null => CodecDepacketizer::Null(NullDepacketizer),
             Codec::Rtx => panic!("Cant instantiate depacketizer for RTX codec"),
             Codec::Unknown => panic!("Cant instantiate depacketizer for unknown codec"),
-            _ => panic!("Cant instantiate packetizer for unhandled codec"),
         }
     }
 }

@@ -59,12 +59,32 @@ pub struct MediaChanged {
 /// The [full spec][1] covers many cases that are not used by simple simulcast.
 ///
 /// [1]: https://datatracker.ietf.org/doc/html/draft-ietf-mmusic-sdp-simulcast-14
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Simulcast {
     /// The RID used for sending simulcast.
     pub send: Vec<Rid>,
     /// The RID used for receiving simulcast.
     pub recv: Vec<Rid>,
+}
+
+impl Simulcast {
+    pub(crate) fn into_sdp(self) -> SdpSimulcast {
+        SdpSimulcast {
+            send: crate::sdp::SimulcastGroups(
+                self.send
+                    .into_iter()
+                    .map(|r| crate::sdp::RestrictionId::new_active(r.to_string()))
+                    .collect(),
+            ),
+            recv: crate::sdp::SimulcastGroups(
+                self.recv
+                    .into_iter()
+                    .map(|r| crate::sdp::RestrictionId::new_active(r.to_string()))
+                    .collect(),
+            ),
+            is_munged: false,
+        }
+    }
 }
 
 /// Video or audio data from the remote peer.
@@ -90,14 +110,15 @@ pub struct MediaData {
     /// Parameters for the codec. This is used to match incoming PT to outgoing PT.
     pub params: PayloadParams,
 
-    /// The RTP media time of this packet. Media time is described as a nominator/denominator
-    /// quantity. The nominator is the timestamp field from the RTP header, the denominator
+    /// The RTP media time of this packet. Media time is described as a numerator/denominator
+    /// quantity. The numerator is the timestamp field from the RTP header, the denominator
     /// depends on whether this is an audio or video packet.
     ///
-    /// For audio the timebase is 48kHz for video it is 90kHz.
+    /// For audio the timebase is often 48kHz for video it is 90kHz.
     pub time: MediaTime,
 
-    /// The time of the [`Input::Receive`][crate::Input::Receive] of the first packet that caused this MediaData.
+    /// The time of the [`Input::Receive`][crate::Input::Receive] of the first packet
+    /// that caused this MediaData.
     ///
     /// In simple SFU setups this can be used as wallclock for [`Writer::write`][crate::media::Writer].
     pub network_time: Instant,
@@ -131,6 +152,12 @@ pub struct MediaData {
     ///
     /// If no Sender Report(SR) has been received this is [`None`].
     pub last_sender_info: Option<SenderInfo>,
+
+    /// First packet of a talkspurt, that is the first packet after a silence period during
+    /// which packets have not been transmitted contiguously.
+    ///
+    /// For audio only when dtx or silence suppression is enabled.
+    pub audio_start_of_talk_spurt: bool,
 }
 
 /// Details for an incoming a keyframe request (PLI or FIR).

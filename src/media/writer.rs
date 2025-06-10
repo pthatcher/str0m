@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crate::format::PayloadParams;
+use crate::rtp_::MidRid;
 use crate::rtp_::VideoOrientation;
 use crate::session::Session;
 use crate::RtcError;
@@ -17,6 +18,7 @@ pub struct Writer<'a> {
     session: &'a mut Session,
     mid: Mid,
     rid: Option<Rid>,
+    start_of_talkspurt: Option<bool>,
     ext_vals: ExtensionValues,
 }
 
@@ -29,6 +31,7 @@ impl<'a> Writer<'a> {
             session,
             mid,
             rid: None,
+            start_of_talkspurt: None,
             ext_vals: ExtensionValues::default(),
         }
     }
@@ -77,10 +80,28 @@ impl<'a> Writer<'a> {
         self
     }
 
+    /// First packet of a talkspurt, that is the first packet after a silence period during
+    /// which packets have not been transmitted contiguously.
+    ///
+    /// For audio only when dtx or silence suppression is enabled.
+    /// This will set the marker bit in the RTP header.
+    pub fn start_of_talkspurt(mut self, start_of_talkspurt: bool) -> Self {
+        self.start_of_talkspurt = Some(start_of_talkspurt);
+        self
+    }
+
     /// Add video orientation. This can be used by a player on the receiver end to decide
     /// whether the video requires to be rotated to show correctly.
     pub fn video_orientation(mut self, o: VideoOrientation) -> Self {
         self.ext_vals.video_orientation = Some(o);
+        self
+    }
+
+    /// Set the minimum and maximum playout delay values. This can be used by a player
+    /// on the receiver end to determine the size of the jitter buffer.
+    pub fn playout_delay(mut self, min: MediaTime, max: MediaTime) -> Self {
+        self.ext_vals.play_delay_min = Some(min);
+        self.ext_vals.play_delay_max = Some(max);
         self
     }
 
@@ -120,7 +141,7 @@ impl<'a> Writer<'a> {
         }
 
         if let Some(rid) = self.rid {
-            if !media.rids_rx().expects(rid) && media.rids_rx().is_specific() {
+            if !media.rids_tx().contains(rid) {
                 return Err(RtcError::UnknownRid(rid));
             }
         }
@@ -142,6 +163,7 @@ impl<'a> Writer<'a> {
             wallclock,
             rtp_time,
             data,
+            start_of_talk_spurt: self.start_of_talkspurt.unwrap_or(false),
             ext_vals: self.ext_vals,
         };
 
@@ -196,10 +218,12 @@ impl<'a> Writer<'a> {
             return Err(RtcError::NotReceivingDirection);
         }
 
+        let midrid = MidRid(self.mid, rid);
+
         let stream = self
             .session
             .streams
-            .rx_by_mid_rid(self.mid, rid)
+            .stream_rx_by_midrid(midrid, false)
             .ok_or_else(|| RtcError::NoReceiverSource(rid))?;
 
         stream.request_keyframe(kind);

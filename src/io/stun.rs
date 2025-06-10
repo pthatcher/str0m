@@ -5,53 +5,92 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crc::{Crc, CRC_32_ISO_HDLC};
-use rand::random;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// Consult libwebrtc for default values here.
-pub const STUN_INITIAL_RTO_MILLIS: u64 = 250;
-pub const STUN_MAX_RETRANS: usize = 9;
-pub const STUN_MAX_RTO_MILLIS: u64 = 3000;
-pub const STUN_TIMEOUT: Duration = Duration::from_secs(40); // the above algo gives us 39_750
+pub(crate) const DEFAULT_MAX_RETRANSMITS: usize = 9;
 
-/// Calculate the send delay given how many times we tried.
-///
-// Technically RTO should be calculated as per https://datatracker.ietf.org/doc/html/rfc2988, and
-// modified by https://datatracker.ietf.org/doc/html/rfc5389#section-7.2.1,
-// but chrome does it like this. https://webrtc.googlesource.com/src/+/refs/heads/main/p2p/base/stun_request.cc
-pub fn stun_resend_delay(send_count: usize) -> Duration {
-    if send_count == 0 {
-        return Duration::ZERO;
-    }
-
-    let retrans = (send_count - 1).min(STUN_MAX_RETRANS);
-
-    let rto = STUN_INITIAL_RTO_MILLIS << retrans;
-    let capped = rto.min(STUN_MAX_RTO_MILLIS);
-
-    Duration::from_millis(capped)
+#[derive(Debug)] // Purposely not `Clone` / `Copy` to ensure we always use the latest one everywhere.
+pub struct StunTiming {
+    pub(crate) initial_rto: Duration,
+    pub(crate) max_retransmits: usize,
+    pub(crate) max_rto: Duration,
 }
 
+impl StunTiming {
+    /// Calculate the ICE timeout.
+    pub fn timeout(&self) -> Duration {
+        (0..=self.max_retransmits)
+            .map(|n| self.stun_resend_delay(n))
+            .sum::<Duration>()
+    }
+
+    /// Calculate the send delay given how many times we tried.
+    ///
+    // Technically RTO should be calculated as per https://datatracker.ietf.org/doc/html/rfc2988, and
+    // modified by https://datatracker.ietf.org/doc/html/rfc5389#section-7.2.1,
+    // but chrome does it like this.
+    // https://webrtc.googlesource.com/src/+/refs/heads/main/p2p/base/stun_request.cc
+    pub fn stun_resend_delay(&self, send_count: usize) -> Duration {
+        if send_count == 0 {
+            return Duration::ZERO;
+        }
+
+        let retrans = (send_count - 1).min(self.max_retransmits);
+
+        let rto = self.initial_rto.as_millis() << retrans;
+        let capped = rto.min(self.max_rto.as_millis());
+
+        Duration::from_millis(capped as u64)
+    }
+
+    pub fn stun_last_resend_delay(&self) -> Duration {
+        self.stun_resend_delay(self.max_retransmits)
+    }
+
+    pub fn max_retransmits(&self) -> usize {
+        self.max_retransmits
+    }
+
+    pub fn max_rto(&self) -> Duration {
+        self.max_rto
+    }
+}
+
+// Consult libwebrtc for default values here.
+impl Default for StunTiming {
+    fn default() -> Self {
+        Self {
+            initial_rto: Duration::from_millis(250),
+            max_retransmits: DEFAULT_MAX_RETRANSMITS,
+            // libwebrtc uses 8000 here but we want faster detection of gone peers.
+            max_rto: Duration::from_millis(3000),
+        }
+    }
+}
+
+/// Possible errors when handling STUN messages.
 #[derive(Debug, Error)]
 pub enum StunError {
+    /// A STUN message could not be parsed.
     #[error("STUN parse error: {0}")]
     Parse(String),
 
+    /// An IO error occurred while handling a STUN message.
     #[error("STUN io: {0}")]
     Io(#[from] io::Error),
-
-    #[error("STUN error: {0}")]
-    Other(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// STUN transaction ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransId([u8; 12]);
 
 impl TransId {
+    /// A new random transaction id.
     pub fn new() -> Self {
         let mut t = [0_u8; 12];
         for v in &mut t {
-            *v = random();
+            *v = NonCryptographicRng::u8();
         }
         TransId(t)
     }
@@ -63,18 +102,27 @@ impl TransId {
     }
 }
 
-#[derive(Clone)]
+/// Represents a STUN message as fit for our purposes.
+///
+/// STUN is a very flexible protocol.
+/// This implementations only provides what we need for our ICE implementation.
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct StunMessage<'a> {
     method: Method,
     class: Class,
     trans_id: TransId,
-    attrs: Vec<Attribute<'a>>,
+    attrs: Attributes<'a>,
     integrity: &'a [u8],
     integrity_len: u16,
 }
 
 impl<'a> StunMessage<'a> {
+    /// Parse a STUN message from a slice of bytes.
     pub fn parse(buf: &[u8]) -> Result<StunMessage, StunError> {
+        if buf.len() < 4 {
+            return Err(StunError::Parse("Buffer too short".into()));
+        }
+
         let typ = (buf[0] as u16 & 0b0011_1111) << 8 | buf[1] as u16;
         let len = (buf[2] as u16) << 8 | buf[3] as u16;
         if len & 0b0000_0011 > 0 {
@@ -97,31 +145,47 @@ impl<'a> StunMessage<'a> {
 
         let mut message_integrity_offset = 0;
 
-        let attrs = Attribute::parse(&buf[20..], trans_id, &mut message_integrity_offset)?;
-
-        // message-integrity only includes the length up until and including
-        // the message-integrity attribute.
-        if message_integrity_offset == 0 {
-            return Err(StunError::Parse("No message integrity in incoming".into()));
-        }
+        let attrs = Attributes::parse(&buf[20..], trans_id, &mut message_integrity_offset)?;
 
         // length including message integrity attribute
-        let integrity_len = (message_integrity_offset + 4 + 20) as u16;
+        let (integrity_len, integrity) = if message_integrity_offset > 0 {
+            let integrity_len = (message_integrity_offset + 4 + 20) as u16;
 
-        // password as key is called "short-term credentials"
-        // buffer from beginning including header (+20) to where message-integrity starts.
-        let integrity = &buf[0..(message_integrity_offset + 20)];
+            // password as key is called "short-term credentials"
+            // buffer from beginning including header (+20) to where message-integrity starts.
+            let integrity = &buf[0..(message_integrity_offset + 20)];
+
+            (integrity_len, integrity)
+        } else {
+            (0_u16, [].as_slice())
+        };
 
         if method == Method::Binding && class == Class::Success {
-            if attrs.mapped_address().is_none() {
+            // // message-integrity only includes the length up until and including
+            // // the message-integrity attribute.
+            if message_integrity_offset == 0 {
+                return Err(StunError::Parse(
+                    "No message integrity in incoming STUN binding reply".into(),
+                ));
+            }
+
+            if attrs.xor_mapped_address.is_none() {
                 return Err(StunError::Parse("STUN packet missing mapped addr".into()));
             }
         } else if method == Method::Binding && class == Class::Request {
+            // // message-integrity only includes the length up until and including
+            // // the message-integrity attribute.
+            if message_integrity_offset == 0 {
+                return Err(StunError::Parse(
+                    "No message integrity in incoming STUN binding request".into(),
+                ));
+            }
+
             if attrs.split_username().is_none() {
                 return Err(StunError::Parse("STUN packet missing username".into()));
             }
-            if attrs.prio().is_none() {
-                return Err(StunError::Parse("STUN packet missing mapped addr".into()));
+            if attrs.priority.is_none() {
+                return Err(StunError::Parse("STUN packet missing priority".into()));
             }
         }
 
@@ -135,23 +199,144 @@ impl<'a> StunMessage<'a> {
         })
     }
 
+    pub(crate) fn method(&self) -> Method {
+        self.method
+    }
+
+    pub(crate) fn class(&self) -> Class {
+        self.class
+    }
+
+    /// Whether this STUN message is a BINDING request.
     pub fn is_binding_request(&self) -> bool {
         self.method == Method::Binding && self.class == Class::Request
     }
 
-    pub fn is_response(&self) -> bool {
-        matches!(self.class, Class::Success | Class::Failure)
-    }
-
+    /// Whether this STUN message is a _successful_ BINDING response.
+    ///
+    /// STUN binding requests are very simple, they just return the observed address.
+    /// As such, they cannot actually fail which is why we don't have `is_failed_binding_response`.
     pub fn is_successful_binding_response(&self) -> bool {
         self.method == Method::Binding && self.class == Class::Success
     }
 
+    /// Whether this STUN message is an ALLOCATE request (TURN).
+    pub fn is_allocate_request(&self) -> bool {
+        self.method == Method::Allocate && self.class == Class::Request
+    }
+
+    /// Whether this STUN message is a CREATE_PERMISSION request (TURN).
+    pub fn is_create_permission_request(&self) -> bool {
+        self.method == Method::CreatePermission && self.class == Class::Request
+    }
+
+    /// Whether this STUN message is a CHANNEL_BIND request (TURN).
+    pub fn is_channel_bind_request(&self) -> bool {
+        self.method == Method::ChannelBind && self.class == Class::Request
+    }
+
+    /// Whether this STUN message is a REFRESH request (TURN).
+    pub fn is_refresh_request(&self) -> bool {
+        self.method == Method::Refresh && self.class == Class::Request
+    }
+
+    /// Whether this STUN message is a SEND indication (TURN).
+    pub fn is_send_indication(&self) -> bool {
+        self.method == Method::Send && self.class == Class::Indication
+    }
+
+    /// The transaction ID of this STUN message.
     pub fn trans_id(&self) -> TransId {
         self.trans_id
     }
 
-    pub fn binding_request(
+    /// Returns the value of the USERNAME attribute, if present.
+    pub fn username(&self) -> Option<&'a str> {
+        self.attrs.username
+    }
+
+    /// If present, splits the value of the USERNAME attribute into local and remote (separated by `:`).
+    pub fn split_username(&self) -> Option<(&str, &str)> {
+        self.attrs.split_username()
+    }
+
+    /// Returns the value of the XOR-MAPPED-ADDRESS attribute, if present.
+    pub fn mapped_address(&self) -> Option<SocketAddr> {
+        self.attrs.xor_mapped_address
+    }
+
+    /// Returns the value of the PRIORITY attribute (ICE), if present.
+    pub fn prio(&self) -> Option<u32> {
+        self.attrs.priority
+    }
+
+    /// Returns whether the USE-CANDIDATE attribute (ICE) is present.
+    pub fn use_candidate(&self) -> bool {
+        self.attrs.use_candidate
+    }
+
+    /// Returns the value of the ERROR_CODE attribute, if present.
+    pub fn error_code(&self) -> Option<(u16, &'a str)> {
+        self.attrs.error_code
+    }
+
+    /// Returns the value of the CHANNEL_NUMBER attribute (TURN), if present.
+    pub fn channel_number(&self) -> Option<u16> {
+        self.attrs.channel_number
+    }
+
+    /// Returns the value of the LIFETIME attribute (TURN), if present.
+    pub fn lifetime(&self) -> Option<u32> {
+        self.attrs.lifetime
+    }
+
+    /// Returns the value of the XOR_PEER_ADDRESS attribute (TURN), if present.
+    pub fn xor_peer_address(&self) -> Option<SocketAddr> {
+        self.attrs.xor_peer_address
+    }
+
+    /// Returns the value of the DATA attribute (TURN), if present.
+    pub fn data(&self) -> Option<&'a [u8]> {
+        self.attrs.data
+    }
+
+    /// Returns the value of the REALM attribute, if present.
+    pub fn realm(&self) -> Option<&'a str> {
+        self.attrs.realm
+    }
+
+    /// Returns the value of the NONCE attribute, if present.
+    pub fn nonce(&self) -> Option<&'a str> {
+        self.attrs.nonce
+    }
+
+    /// Returns the value of the XOR_RELAYED_ADDRESS attribute (TURN), if present.
+    pub fn xor_relayed_address(&self) -> Option<SocketAddr> {
+        self.attrs.xor_relayed_address
+    }
+
+    /// Returns the value of the SOFTWARE attribute, if present.
+    pub fn software(&self) -> Option<&'a str> {
+        self.attrs.software
+    }
+
+    /// Returns the value of the ICE_CONTROLLED attribute (ICE), if present.
+    pub fn ice_controlled(&self) -> Option<u64> {
+        self.attrs.ice_controlled
+    }
+
+    /// Returns the value of the ICE_CONTROLLING attribute (ICE), if present.
+    pub fn ice_controlling(&self) -> Option<u64> {
+        self.attrs.ice_controlling
+    }
+
+    /// Returns the value of the NETWORK_COST attribute (ICE), if present.
+    pub fn network_cost(&self) -> Option<(u16, u16)> {
+        self.attrs.network_cost
+    }
+
+    /// Constructs a new BINDING request using the provided data.
+    pub(crate) fn binding_request(
         username: &'a str,
         trans_id: TransId,
         controlling: bool,
@@ -159,134 +344,133 @@ impl<'a> StunMessage<'a> {
         prio: u32,
         use_candidate: bool,
     ) -> Self {
-        let mut m = StunMessage {
-            class: Class::Request,
-            method: Method::Binding,
-            trans_id,
-            attrs: vec![
-                Attribute::Username(username),
-                if controlling {
-                    Attribute::IceControlling(control_tie_breaker)
-                } else {
-                    Attribute::IceControlled(control_tie_breaker)
-                },
-                Attribute::Priority(prio),
-            ],
-            integrity: &[],
-            integrity_len: 0,
-        };
+        let mut builder = StunMessageBuilder::new()
+            .binding()
+            .request()
+            .username(username)
+            .prio(prio);
 
         if use_candidate {
-            m.attrs.push(Attribute::UseCandidate);
+            builder = builder.use_candidate();
         }
 
-        m.attrs.push(Attribute::MessageIntegrityMark);
-        m.attrs.push(Attribute::FingerprintMark);
-
-        m
-    }
-
-    pub fn reply(trans_id: TransId, mapped_address: SocketAddr) -> StunMessage<'a> {
-        StunMessage {
-            class: Class::Success,
-            method: Method::Binding,
-            trans_id,
-            attrs: vec![
-                Attribute::XorMappedAddress(mapped_address),
-                Attribute::MessageIntegrityMark,
-                Attribute::FingerprintMark,
-            ],
-            integrity: &[],
-            integrity_len: 0,
+        if controlling {
+            builder = builder.ice_controlling(control_tie_breaker);
+        } else {
+            builder = builder.ice_controlled(control_tie_breaker);
         }
+
+        builder.build(trans_id)
     }
 
-    pub fn split_username(&self) -> Option<(&str, &str)> {
-        self.attrs.split_username()
+    /// Constructs a new STUN BINDING success reply using the builder.
+    pub(crate) fn binding_reply(trans_id: TransId, mapped_address: SocketAddr) -> StunMessage<'a> {
+        StunMessageBuilder::new()
+            .binding()
+            .success()
+            .xor_mapped_address(mapped_address)
+            .build(trans_id)
     }
 
-    pub fn mapped_address(&self) -> Option<SocketAddr> {
-        self.attrs.mapped_address()
-    }
+    /// Verify the integrity of this message against the provided password.
+    #[must_use]
+    pub fn verify(&self, password: &[u8]) -> bool {
+        if let Some(integ) = self.attrs.message_integrity {
+            let comp = crate::crypto::sha1_hmac(
+                password,
+                &[
+                    &self.integrity[..2],
+                    &[(self.integrity_len >> 8) as u8, self.integrity_len as u8],
+                    &self.integrity[4..],
+                ],
+            );
 
-    pub fn prio(&self) -> Option<u32> {
-        self.attrs.prio()
-    }
-
-    pub fn use_candidate(&self) -> bool {
-        self.attrs.use_candidate()
-    }
-
-    pub fn check_integrity(&self, password: &str) -> bool {
-        if let Some(integ) = self.attrs.message_integrity() {
-            let sha1: Sha1 = password.as_bytes().into();
-            let comp = sha1.hmac(&[
-                &self.integrity[..2],
-                &[(self.integrity_len >> 8) as u8, self.integrity_len as u8],
-                &self.integrity[4..],
-            ]);
             comp == integ
         } else {
             false
         }
     }
 
-    pub fn to_bytes(&self, password: &str, buf: &mut [u8]) -> Result<usize, StunError> {
-        self.do_to_bytes(password, buf)
-            .map_err(|e| StunError::Other(format!("io write: {e:?}")))
-    }
+    /// Serialize this message into the provided buffer, returning the final length of the message.
+    ///
+    /// The provided password is used to authenticate the message if provided, otherwise no
+    /// `MESSAGE-INTEGRITY` attribute will be present.
+    pub fn to_bytes(self, password: Option<&[u8]>, buf: &mut [u8]) -> Result<usize, StunError> {
+        const MSG_HEADER_LEN: usize = 20;
+        const MSG_INTEGRITY_LEN: usize = 20;
+        const FPRINT_LEN: usize = 4;
+        const ATTR_TLV_LENGTH: usize = 4;
 
-    fn do_to_bytes(&self, password: &str, buf: &mut [u8]) -> Result<usize, io::Error> {
-        let attr_len = self.attrs.iter().fold(0, |p, a| p + a.padded_len());
-        let msg_len = 20 + attr_len;
+        let include_message_integrity = password.is_some();
+        let message_integrity_len = if include_message_integrity {
+            MSG_INTEGRITY_LEN + ATTR_TLV_LENGTH
+        } else {
+            0
+        };
+
+        let attr_len =
+            self.attrs.padded_len() + message_integrity_len + FPRINT_LEN + ATTR_TLV_LENGTH;
 
         let mut buf = io::Cursor::new(buf);
 
-        let typ = self.class.to_u16() | self.method.to_u16();
-        buf.write_all(&typ.to_be_bytes())?;
-
-        // -8 for fingerprint
-        buf.write_all(&((attr_len - 8) as u16).to_be_bytes())?;
-        buf.write_all(MAGIC)?;
-        buf.write_all(&self.trans_id.0)?;
-
-        let mut i_off = 0;
-        let mut f_off = 0;
-
+        // Message header
         {
-            let mut off = 20; // attribute start
-            for a in &self.attrs {
-                a.to_bytes(&mut buf, &self.trans_id.0)?;
-                if let Attribute::MessageIntegrityMark = a {
-                    i_off = off;
-                }
-                if let Attribute::FingerprintMark = a {
-                    f_off = off;
-                }
-                off += a.padded_len();
-            }
+            let typ = self.class.to_u16() | self.method.to_u16();
+            buf.write_all(&typ.to_be_bytes())?;
+
+            // -8 for fingerprint
+            buf.write_all(&((attr_len - 8) as u16).to_be_bytes())?;
+            buf.write_all(MAGIC)?;
+            buf.write_all(&self.trans_id.0)?;
         }
+
+        // Custom attributes
+        self.attrs.to_bytes(&mut buf, &self.trans_id.0)?;
+
+        if include_message_integrity {
+            // Message integrity
+            buf.write_all(&Attributes::MESSAGE_INTEGRITY.to_be_bytes())?;
+            buf.write_all(&(MSG_INTEGRITY_LEN as u16).to_be_bytes())?;
+            buf.write_all(&[0; MSG_INTEGRITY_LEN])?; // placeholder
+        }
+        let integrity_value_offset = MSG_HEADER_LEN + self.attrs.padded_len() + ATTR_TLV_LENGTH;
+
+        // Fingerprint
+        buf.write_all(&Attributes::FINGERPRINT.to_be_bytes())?;
+        buf.write_all(&(FPRINT_LEN as u16).to_be_bytes())?;
+        buf.write_all(&[0; FPRINT_LEN])?; // placeholder
+        let fingerprint_value_offest = integrity_value_offset + message_integrity_len;
 
         let buf = buf.into_inner();
 
-        let sha1: Sha1 = password.as_bytes().into();
-        let hmac = sha1.hmac(&[&buf[0..i_off]]);
-        buf[i_off + 4..(i_off + 4 + 20)].copy_from_slice(&hmac);
+        if let Some(password) = password {
+            // Compute and fill in message integrity
+            let hmac = crate::crypto::sha1_hmac(
+                password,
+                &[&buf[0..(integrity_value_offset - ATTR_TLV_LENGTH)]],
+            );
+            buf[integrity_value_offset..(integrity_value_offset + MSG_INTEGRITY_LEN)]
+                .copy_from_slice(&hmac);
+        }
 
-        // fill in correct length
+        // Fill in total message length
         buf[2..4].copy_from_slice(&(attr_len as u16).to_be_bytes());
 
-        let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&buf[0..f_off]) ^ 0x5354_554e;
-        buf[f_off + 4..(f_off + 4 + 4)].copy_from_slice(&crc.to_be_bytes());
+        // Compute and fill in fingerprint
+        let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC)
+            .checksum(&buf[0..(fingerprint_value_offest - ATTR_TLV_LENGTH)])
+            ^ 0x5354_554e;
+        buf[fingerprint_value_offest..(fingerprint_value_offest + FPRINT_LEN)]
+            .copy_from_slice(&crc.to_be_bytes());
 
-        Ok(msg_len)
+        Ok(MSG_HEADER_LEN + attr_len)
     }
 }
 
 const MAGIC: &[u8] = &[0x21, 0x12, 0xA4, 0x42];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Class {
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum Class {
     Request,
     Indication,
     Success,
@@ -318,9 +502,16 @@ impl Class {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Method {
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum Method {
     Binding,
+    // TURN specific
+    Allocate,
+    Refresh,
+    Send,
+    Data,
+    CreatePermission,
+    ChannelBind,
     Unknown,
 }
 
@@ -329,190 +520,348 @@ impl Method {
         use Method::*;
         match typ & 0b0011_1110_1110_1111 {
             0b0000_0000_0000_0001 => Binding,
+            0b0000_0000_0000_0011 => Allocate,
+            0b0000_0000_0000_0100 => Refresh,
+            0b0000_0000_0000_0110 => Send,
+            0b0000_0000_0000_0111 => Data,
+            0b0000_0000_0000_1000 => CreatePermission,
+            0b0000_0000_0000_1001 => ChannelBind,
             _ => Unknown,
         }
     }
 
+    #[rustfmt::skip]
     fn to_u16(self) -> u16 {
         use Method::*;
         match self {
-            Binding => 0b0000_0000_0000_0001,
+            Binding          => 0b0000_0000_0000_0001,
+            Allocate         => 0b0000_0000_0000_0011,
+            Refresh          => 0b0000_0000_0000_0100,
+            Send             => 0b0000_0000_0000_0110,
+            Data             => 0b0000_0000_0000_0111,
+            CreatePermission => 0b0000_0000_0000_1000,
+            ChannelBind      => 0b0000_0000_0000_1001,
             _ => panic!("Unknown method"),
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub enum Attribute<'a> {
-    MappedAddress,                // TODO
-    Username(&'a str),            // < 128 utf8 chars
-    MessageIntegrity(&'a [u8]),   // 20 bytes sha-1
-    MessageIntegrityMark,         // 20 bytes sha-1
-    ErrorCode(u16, &'a str),      // 300-699 and reason phrase < 128 utf8 chars
-    UnknownAttributes,            // TODO
-    Realm(&'a str),               // < 128 utf8 chars
-    Nonce(&'a str),               // < 128 utf8 chars
-    XorMappedAddress(SocketAddr), // 0x0020
-    Software(&'a str),
-    AlternateServer,  // TODO
-    Fingerprint(u32), // crc32
-    FingerprintMark,  // crc32
-    // https://tools.ietf.org/html/rfc8445
-    Priority(u32),       // 0x0024
-    UseCandidate,        // 0x0025
-    IceControlled(u64),  // 0x8029
-    IceControlling(u64), // 0x802a
-    // https://tools.ietf.org/html/draft-thatcher-ice-network-cost-00
-    NetworkCost(u16, u16), // 0xc057
-    Unknown(u16),
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[rustfmt::skip]
+pub struct Attributes<'a> {
+    username: Option<&'a str>,               // < 128 utf8 chars
+    message_integrity: Option<&'a [u8]>,     // 20 bytes sha-1
+    error_code: Option<(u16, &'a str)>,      // 300-699 and reason phrase < 128 utf8 chars
+    channel_number: Option<u16>,             // 0x000C https://tools.ietf.org/html/rfc5766#section-14.1
+    lifetime: Option<u32>,                   // 0x000D https://tools.ietf.org/html/rfc5766#section-14.2
+    xor_peer_address: Option<SocketAddr>,    // 0x0012
+    data: Option<&'a [u8]>,                  // 0x0013
+    realm: Option<&'a str>,                  // < 128 utf8 chars, 0x0014
+    nonce: Option<&'a str>,                  // < 128 utf8 chars, 0x0015
+    xor_relayed_address: Option<SocketAddr>, // 0x0016
+    xor_mapped_address: Option<SocketAddr>,  // 0x0020
+    software: Option<&'a str>,               // 0x0022
+    fingerprint: Option<u32>,                // crc32
+    priority: Option<u32>,                   // 0x0024 https://tools.ietf.org/html/rfc8445
+    use_candidate: bool,                     // 0x0025
+    ice_controlled: Option<u64>,             // 0x8029
+    ice_controlling: Option<u64>,            // 0x802a
+    network_cost: Option<(u16, u16)>,        // 0xc057 https://tools.ietf.org/html/draft-thatcher-ice-network-cost-00
 }
 
-trait Attributes<'a> {
-    fn username(&self) -> Option<&'a str>;
-    fn split_username(&self) -> Option<(&'a str, &'a str)>;
-    fn mapped_address(&self) -> Option<SocketAddr>;
-    fn prio(&self) -> Option<u32>;
-    fn use_candidate(&self) -> bool;
-    fn message_integrity(&self) -> Option<&'a [u8]>;
-}
+impl<'a> fmt::Debug for Attributes<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let debug_struct = &mut f.debug_struct("Attributes");
 
-impl<'a> Attributes<'a> for Vec<Attribute<'a>> {
-    fn username(&self) -> Option<&'a str> {
-        for a in self {
-            if let Attribute::Username(v) = a {
-                return Some(v);
-            }
+        if let Some(value) = self.username {
+            debug_struct.field("username", &value);
         }
-        None
-    }
+        if let Some(value) = self.message_integrity {
+            debug_struct.field("message_integrity", &value);
+        }
+        if let Some(value) = self.error_code {
+            debug_struct.field("error_code", &value);
+        }
+        if let Some(value) = self.channel_number {
+            debug_struct.field("channel_number", &value);
+        }
+        if let Some(value) = self.lifetime {
+            debug_struct.field("lifetime", &value);
+        }
+        if let Some(value) = self.xor_peer_address {
+            debug_struct.field("xor_peer_address", &value);
+        }
+        if let Some(value) = self.data {
+            debug_struct.field("data", &value);
+        }
+        if let Some(value) = self.realm {
+            debug_struct.field("realm", &value);
+        }
+        if let Some(value) = self.nonce {
+            debug_struct.field("nonce", &value);
+        }
+        if let Some(value) = self.xor_relayed_address {
+            debug_struct.field("xor_relayed_address", &value);
+        }
+        if let Some(value) = self.xor_mapped_address {
+            debug_struct.field("xor_mapped_address", &value);
+        }
+        if let Some(value) = self.software {
+            debug_struct.field("software", &value);
+        }
+        if let Some(value) = self.fingerprint {
+            debug_struct.field("fingerprint", &value);
+        }
+        if let Some(value) = self.priority {
+            debug_struct.field("priority", &value);
+        }
+        if self.use_candidate {
+            debug_struct.field("use_candidate", &true);
+        }
+        if let Some(value) = self.ice_controlled {
+            debug_struct.field("ice_controlled", &value);
+        }
+        if let Some(value) = self.ice_controlling {
+            debug_struct.field("ice_controlling", &value);
+        }
+        if let Some(value) = self.network_cost {
+            debug_struct.field("network_cost", &value);
+        }
 
+        debug_struct.finish()
+    }
+}
+
+impl<'a> Attributes<'a> {
     fn split_username(&self) -> Option<(&'a str, &'a str)> {
         // usernames are on the form gfNK:062g where
         // gfNK is my local sdp ice username and
         // 062g is the remote.
-        if let Some(v) = self.username() {
-            let idx = v.find(':');
-            if let Some(idx) = idx {
-                if idx + 1 < v.len() {
-                    let local = &v[..idx];
-                    let remote = &v[(idx + 1)..];
-                    return Some((local, remote));
-                }
-            }
-        }
-        None
-    }
 
-    fn mapped_address(&self) -> Option<SocketAddr> {
-        for a in self {
-            if let Attribute::XorMappedAddress(v) = a {
-                return Some(*v);
-            }
-        }
-        None
-    }
+        let v = self.username?;
+        let idx = v.find(':')?;
 
-    fn prio(&self) -> Option<u32> {
-        for a in self {
-            if let Attribute::Priority(v) = a {
-                return Some(*v);
-            }
+        if idx + 1 >= v.len() {
+            return None;
         }
-        None
-    }
 
-    fn use_candidate(&self) -> bool {
-        self.iter().any(|a| matches!(a, Attribute::UseCandidate))
-    }
+        let local = &v[..idx];
+        let remote = &v[(idx + 1)..];
 
-    fn message_integrity(&self) -> Option<&'a [u8]> {
-        for a in self {
-            if let Attribute::MessageIntegrity(v) = a {
-                return Some(v);
-            }
-        }
-        None
+        Some((local, remote))
     }
 }
 
 use std::{io, str};
 
-use super::Sha1;
+use crate::util::NonCryptographicRng;
 
-impl<'a> Attribute<'a> {
+const PAD: [u8; 4] = [0, 0, 0, 0];
+impl<'a> Attributes<'a> {
+    const ALTERNATE_SERVER: u16 = 0x8023;
+    const FINGERPRINT: u16 = 0x8028;
+    const ICE_CONTROLLED: u16 = 0x8029;
+    const ICE_CONTROLLING: u16 = 0x802a;
+
+    const MAPPED_ADDRESS: u16 = 0x0001;
+    const USERNAME: u16 = 0x0006;
+    const MESSAGE_INTEGRITY: u16 = 0x0008;
+    const ERROR_CODE: u16 = 0x0009;
+    const UNKNOWN_ATTRIBUTES: u16 = 0x000a;
+    const CHANNEL_NUMBER: u16 = 0x000c;
+    const LIFETIME: u16 = 0x000d;
+    const XOR_PEER_ADDRESS: u16 = 0x0012;
+    const DATA: u16 = 0x0013;
+    const REALM: u16 = 0x0014;
+    const NONCE: u16 = 0x0015;
+    const XOR_RELAYED_ADDRESS: u16 = 0x0016;
+    const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+    const SOFTWARE: u16 = 0x0022;
+    const PRIORITY: u16 = 0x0024;
+    const USE_CANDIDATE: u16 = 0x0025;
+
+    const NETWORK_COST: u16 = 0xc057;
+
     fn padded_len(&self) -> usize {
-        use Attribute::*;
-        4 + match self {
-            Username(v) => {
-                let pad = 4 - (v.as_bytes().len() % 4) % 4;
-                v.len() + pad
-            }
-            IceControlled(_) => 8,
-            IceControlling(_) => 8,
-            MessageIntegrityMark => 20,
-            FingerprintMark => 4,
-            Priority(_) => 4,
-            XorMappedAddress(v) => {
-                if v.is_ipv4() {
-                    8
-                } else {
-                    20
-                }
-            }
-            UseCandidate => 0,
-            _ => panic!("No length for: {self:?}"),
-        }
+        const ATTR_TLV_LENGTH: usize = 4;
+
+        let username = self
+            .username
+            .map(|v| ATTR_TLV_LENGTH + v.len() + calculate_pad(v.len()))
+            .unwrap_or_default();
+        let ice_controlled = self
+            .ice_controlled
+            .map(|_| ATTR_TLV_LENGTH + 8)
+            .unwrap_or_default();
+        let ice_controlling = self
+            .ice_controlling
+            .map(|_| ATTR_TLV_LENGTH + 8)
+            .unwrap_or_default();
+        let priority = self
+            .priority
+            .map(|p| ATTR_TLV_LENGTH + p.to_le_bytes().len())
+            .unwrap_or_default();
+        let address = self
+            .xor_mapped_address
+            .map(|a| ATTR_TLV_LENGTH + if a.is_ipv4() { 8 } else { 20 })
+            .unwrap_or_default();
+        let use_candidate = if self.use_candidate {
+            ATTR_TLV_LENGTH
+        } else {
+            0
+        };
+        let xor_peer_address = self
+            .xor_peer_address
+            .map(|a| ATTR_TLV_LENGTH + if a.is_ipv4() { 8 } else { 20 })
+            .unwrap_or_default();
+        let xor_relayed_address = self
+            .xor_relayed_address
+            .map(|a| ATTR_TLV_LENGTH + if a.is_ipv4() { 8 } else { 20 })
+            .unwrap_or_default();
+        let data = self
+            .data
+            .map(|d| ATTR_TLV_LENGTH + d.len() + calculate_pad(d.len()))
+            .unwrap_or_default();
+        let channel_number = self
+            .channel_number
+            .map(|_| ATTR_TLV_LENGTH + 4)
+            .unwrap_or_default();
+        let lifetime = self
+            .lifetime
+            .map(|_| ATTR_TLV_LENGTH + 4)
+            .unwrap_or_default();
+        let realm = self
+            .realm
+            .map(|v| ATTR_TLV_LENGTH + v.len() + calculate_pad(v.len()))
+            .unwrap_or_default();
+        let nonce = self
+            .nonce
+            .map(|v| ATTR_TLV_LENGTH + v.len() + calculate_pad(v.len()))
+            .unwrap_or_default();
+        let error_code = self
+            .error_code
+            .map(|(_, reason)| ATTR_TLV_LENGTH + 4 + reason.len() + calculate_pad(reason.len()))
+            .unwrap_or_default();
+
+        username
+            + ice_controlled
+            + ice_controlling
+            + priority
+            + address
+            + use_candidate
+            + xor_peer_address
+            + xor_relayed_address
+            + data
+            + channel_number
+            + lifetime
+            + realm
+            + nonce
+            + error_code
     }
 
-    fn to_bytes(&self, vec: &mut dyn Write, trans_id: &[u8]) -> io::Result<()> {
-        use Attribute::*;
-        match self {
-            Username(v) => {
-                vec.write_all(&0x0006_u16.to_be_bytes())?;
-                vec.write_all(&(v.as_bytes().len() as u16).to_be_bytes())?;
-                vec.write_all(v.as_bytes())?;
-                let pad = 4 - (v.as_bytes().len() % 4) % 4;
-                for _ in 0..pad {
-                    vec.write_all(&[0])?;
-                }
+    fn to_bytes(self, out: &mut dyn Write, trans_id: &[u8]) -> io::Result<()> {
+        if let Some(v) = self.username {
+            out.write_all(&Self::USERNAME.to_be_bytes())?;
+            encode_str(Self::USERNAME, v, out)?;
+            let pad = calculate_pad(v.len());
+            out.write_all(&PAD[0..pad])?;
+        }
+        if let Some(v) = self.ice_controlled {
+            out.write_all(&Self::ICE_CONTROLLED.to_be_bytes())?;
+            out.write_all(&8_u16.to_be_bytes())?;
+            out.write_all(&v.to_be_bytes())?;
+        }
+        if let Some(v) = self.ice_controlling {
+            out.write_all(&Self::ICE_CONTROLLING.to_be_bytes())?;
+            out.write_all(&8_u16.to_be_bytes())?;
+            out.write_all(&v.to_be_bytes())?;
+        }
+        if let Some(v) = self.priority {
+            out.write_all(&Self::PRIORITY.to_be_bytes())?;
+            out.write_all(&4_u16.to_be_bytes())?;
+            out.write_all(&v.to_be_bytes())?;
+        }
+        if let Some(v) = self.xor_mapped_address {
+            let mut buf = [0_u8; 20];
+            let len = encode_xor(v, &mut buf, trans_id);
+            out.write_all(&Self::XOR_MAPPED_ADDRESS.to_be_bytes())?;
+            out.write_all(&((len as u16).to_be_bytes()))?;
+            out.write_all(&buf[0..len])?;
+        }
+        if self.use_candidate {
+            out.write_all(&Self::USE_CANDIDATE.to_be_bytes())?;
+            out.write_all(&0_u16.to_be_bytes())?;
+        }
+        if let Some(d) = self.data {
+            if d.len() > u16::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Data attribute too long, max 65535 bytes",
+                ));
             }
-            IceControlled(v) => {
-                vec.write_all(&0x8029_u16.to_be_bytes())?;
-                vec.write_all(&8_u16.to_be_bytes())?;
-                vec.write_all(&v.to_be_bytes())?;
-            }
-            IceControlling(v) => {
-                vec.write_all(&0x802a_u16.to_be_bytes())?;
-                vec.write_all(&8_u16.to_be_bytes())?;
-                vec.write_all(&v.to_be_bytes())?;
-            }
-            MessageIntegrityMark => {
-                vec.write_all(&0x0008_u16.to_be_bytes())?;
-                vec.write_all(&20_u16.to_be_bytes())?;
-                vec.write_all(&[0; 20])?; // filled in later
-            }
-            FingerprintMark => {
-                vec.write_all(&0x8028_u16.to_be_bytes())?;
-                vec.write_all(&4_u16.to_be_bytes())?;
-                vec.write_all(&[0; 4])?; // filled in later
-            }
-            Priority(v) => {
-                vec.write_all(&0x0024_u16.to_be_bytes())?;
-                vec.write_all(&4_u16.to_be_bytes())?;
-                vec.write_all(&v.to_be_bytes())?;
-            }
-            XorMappedAddress(v) => {
-                let mut buf = [0_u8; 20];
-                let len = encode_xor(*v, &mut buf, trans_id);
-                vec.write_all(&0x0020_u16.to_be_bytes())?;
-                vec.write_all(&((len as u16).to_be_bytes()))?;
-                vec.write_all(&buf[0..len])?;
-            }
-            UseCandidate => {
-                vec.write_all(&0x0025_u16.to_be_bytes())?;
-                vec.write_all(&0_u16.to_be_bytes())?;
-            }
-            _ => panic!("Can't write bytes for: {self:?}"),
+
+            out.write_all(&Self::DATA.to_be_bytes())?;
+            out.write_all(&(d.len() as u16).to_be_bytes())?;
+            out.write_all(d)?;
+
+            let pad = calculate_pad(d.len());
+            out.write_all(&PAD[0..pad])?;
+        }
+        if let Some(v) = self.xor_relayed_address {
+            let mut buf = [0_u8; 20];
+            let len = encode_xor(v, &mut buf, trans_id);
+            out.write_all(&Self::XOR_RELAYED_ADDRESS.to_be_bytes())?;
+            out.write_all(&((len as u16).to_be_bytes()))?;
+            out.write_all(&buf[0..len])?;
+        }
+        if let Some(v) = self.xor_peer_address {
+            let mut buf = [0_u8; 20];
+            let len = encode_xor(v, &mut buf, trans_id);
+            out.write_all(&Self::XOR_PEER_ADDRESS.to_be_bytes())?;
+            out.write_all(&((len as u16).to_be_bytes()))?;
+            out.write_all(&buf[0..len])?;
+        }
+        if let Some(v) = self.channel_number {
+            out.write_all(&Self::CHANNEL_NUMBER.to_be_bytes())?;
+            out.write_all(&4_u16.to_be_bytes())?;
+            out.write_all(&v.to_be_bytes())?;
+            // RFU bytes
+            out.write_all(&[0, 0])?;
+        }
+        if let Some(v) = self.lifetime {
+            out.write_all(&Self::LIFETIME.to_be_bytes())?;
+            out.write_all(&4_u16.to_be_bytes())?;
+            out.write_all(&v.to_be_bytes())?;
+        }
+        if let Some(v) = self.realm {
+            out.write_all(&Self::REALM.to_be_bytes())?;
+            encode_str(Self::REALM, v, out)?;
+            let pad = calculate_pad(v.len());
+            out.write_all(&PAD[0..pad])?;
+        }
+        if let Some(v) = self.nonce {
+            out.write_all(&Self::NONCE.to_be_bytes())?;
+            encode_str(Self::NONCE, v, out)?;
+            let pad = calculate_pad(v.len());
+            out.write_all(&PAD[0..pad])?;
+        }
+        if let Some((code, reason)) = self.error_code {
+            out.write_all(&Self::ERROR_CODE.to_be_bytes())?;
+            // Length
+            out.write_all(&(4_u16 + reason.len() as u16).to_be_bytes())?;
+            // Reserved 16 bits
+            out.write_all(&((0_u16).to_be_bytes()))?;
+            // Reserved 5 high bits, class 3 bits
+            out.write_all(&((0x7_u8 & (code / 100) as u8).to_be_bytes()))?;
+            // code 8 bits
+            out.write_all(&(((code % 100) as u8).to_be_bytes()))?;
+            // Total written 8 bytes 4 byte aligned
+            encode_str_no_len(Self::ERROR_CODE, reason, out)?;
+
+            // Need to ensure padding is correct only with respect to reason since the
+            // prior length was 4 byte aligned.
+            let pad = calculate_pad(reason.len());
+            out.write_all(&PAD[0..pad])?;
         }
 
         Ok(())
@@ -522,8 +871,9 @@ impl<'a> Attribute<'a> {
         mut buf: &'a [u8],
         trans_id: TransId,
         msg_integrity_off: &mut usize,
-    ) -> Result<Vec<Attribute<'a>>, StunError> {
-        let mut ret = vec![];
+    ) -> Result<Attributes<'a>, StunError> {
+        let mut attributes = Attributes::default();
+
         let mut off = 0;
         // With the exception of the FINGERPRINT
         //    attribute, which appears after MESSAGE-INTEGRITY, agents MUST ignore
@@ -533,8 +883,8 @@ impl<'a> Attribute<'a> {
             if buf.is_empty() {
                 break;
             }
-            let typ = (buf[0] as u16) << 8 | buf[1] as u16;
-            let len = (buf[2] as usize) << 8 | buf[3] as usize;
+            let typ = u16::from_le_bytes([buf[1], buf[0]]);
+            let len = u16::from_le_bytes([buf[3], buf[2]]) as usize;
             // trace!(
             //     "STUN attribute typ 0x{:04x?} len {}: {:02x?}",
             //     typ,
@@ -548,16 +898,15 @@ impl<'a> Attribute<'a> {
                     buf.len() - 4,
                 )));
             }
-            if !ignore_rest || typ == 0x8028 {
+            if !ignore_rest || typ == Self::FINGERPRINT {
                 match typ {
-                    0x0001 => {
+                    Self::MAPPED_ADDRESS => {
                         warn!("STUN got MappedAddress");
-                        ret.push(Attribute::MappedAddress);
                     }
-                    0x0006 => {
-                        ret.push(Attribute::Username(decode_str(typ, &buf[4..], len)?));
+                    Self::USERNAME => {
+                        attributes.username = Some(decode_str(typ, &buf[4..], len)?);
                     }
-                    0x0008 => {
+                    Self::MESSAGE_INTEGRITY => {
                         if len != 20 {
                             return Err(StunError::Parse(
                                 "Expected message integrity to have length 20".into(),
@@ -567,9 +916,9 @@ impl<'a> Attribute<'a> {
                         // integrity attribute.
                         *msg_integrity_off = off;
                         ignore_rest = true;
-                        ret.push(Attribute::MessageIntegrity(&buf[4..24]));
+                        attributes.message_integrity = Some(&buf[4..24]);
                     }
-                    0x0009 => {
+                    Self::ERROR_CODE => {
                         if buf[4] != 0 || buf[5] != 0 || buf[6] & 0b1111_1000 != 0 {
                             return Err(StunError::Parse("Expected 0 at top of error code".into()));
                         }
@@ -580,54 +929,80 @@ impl<'a> Attribute<'a> {
                             )));
                         }
                         let code = class + (buf[7] % 100) as u16;
-                        ret.push(Attribute::ErrorCode(
-                            code,
-                            decode_str(typ, &buf[8..], len - 4)?,
-                        ));
+                        attributes.error_code = Some((code, decode_str(typ, &buf[8..], len - 4)?));
                     }
-                    0x000a => {
+                    Self::CHANNEL_NUMBER => {
+                        if len != 4 {
+                            return Err(StunError::Parse(format!(
+                                "Channel number that isn't 4 in length, was {}",
+                                len
+                            )));
+                        }
+                        let bytes = [buf[4], buf[5]];
+                        let channel = u16::from_be_bytes(bytes);
+                        // Channel numbers must be between 0x4000 and 0x7FFF inclusive
+                        // https://tools.ietf.org/html/rfc5766#section-2.5
+                        if !(0x4000..=0x7FFF).contains(&channel) {
+                            return Err(StunError::Parse(format!(
+                                "Channel number {channel} is not in valid range 0x4000-0x7FFF"
+                            )));
+                        }
+                        attributes.channel_number = Some(channel);
+                    }
+                    Self::LIFETIME => {
+                        if len != 4 {
+                            return Err(StunError::Parse("Lifetime that isn't 4 in length".into()));
+                        }
+                        let bytes = [buf[4], buf[5], buf[6], buf[7]];
+                        attributes.lifetime = Some(u32::from_be_bytes(bytes));
+                    }
+                    Self::UNKNOWN_ATTRIBUTES => {
                         warn!("STUN got UnknownAttributes");
-                        ret.push(Attribute::UnknownAttributes);
                     }
-                    0x0014 => {
-                        ret.push(Attribute::Realm(decode_str(typ, &buf[4..], len)?));
+                    Self::XOR_PEER_ADDRESS => {
+                        attributes.xor_peer_address = Some(decode_xor(&buf[4..], trans_id)?)
                     }
-                    0x0015 => {
-                        ret.push(Attribute::Nonce(decode_str(typ, &buf[4..], len)?));
+                    Self::DATA => {
+                        attributes.data = Some(&buf[4..len + 4]);
                     }
-                    0x0020 => {
-                        ret.push(Attribute::XorMappedAddress(decode_xor(
-                            &buf[4..],
-                            trans_id,
-                        )?));
+                    Self::REALM => {
+                        attributes.realm = Some(decode_str(typ, &buf[4..], len)?);
                     }
-                    0x0022 => {
-                        ret.push(Attribute::Software(decode_str(typ, &buf[4..], len)?));
+                    Self::NONCE => {
+                        attributes.nonce = Some(decode_str(typ, &buf[4..], len)?);
                     }
-                    0x0024 => {
+                    Self::XOR_RELAYED_ADDRESS => {
+                        attributes.xor_relayed_address = Some(decode_xor(&buf[4..], trans_id)?);
+                    }
+                    Self::XOR_MAPPED_ADDRESS => {
+                        attributes.xor_mapped_address = Some(decode_xor(&buf[4..], trans_id)?);
+                    }
+                    Self::SOFTWARE => {
+                        attributes.software = Some(decode_str(typ, &buf[4..], len)?);
+                    }
+                    Self::PRIORITY => {
                         if len != 4 {
                             return Err(StunError::Parse("Priority that isnt 4 in length".into()));
                         }
                         let bytes = [buf[4], buf[5], buf[6], buf[7]];
-                        ret.push(Attribute::Priority(u32::from_be_bytes(bytes)));
+                        attributes.priority = Some(u32::from_be_bytes(bytes));
                     }
-                    0x0025 => {
+                    Self::USE_CANDIDATE => {
                         if len != 0 {
                             return Err(StunError::Parse(
                                 "UseCandidate that isnt 0 in length".into(),
                             ));
                         }
-                        ret.push(Attribute::UseCandidate);
+                        attributes.use_candidate = true;
                     }
-                    0x8023 => {
+                    Self::ALTERNATE_SERVER => {
                         warn!("STUN got AlternateServer");
-                        ret.push(Attribute::AlternateServer);
                     }
-                    0x8028 => {
+                    Self::FINGERPRINT => {
                         let bytes = [buf[4], buf[5], buf[6], buf[7]];
-                        ret.push(Attribute::Fingerprint(u32::from_be_bytes(bytes)));
+                        attributes.fingerprint = Some(u32::from_be_bytes(bytes));
                     }
-                    0x8029 => {
+                    Self::ICE_CONTROLLED => {
                         if len != 8 {
                             return Err(StunError::Parse(
                                 "IceControlled that isnt 8 in length".into(),
@@ -635,9 +1010,9 @@ impl<'a> Attribute<'a> {
                         }
                         let mut bytes = [0_u8; 8];
                         bytes.copy_from_slice(&buf[4..(4 + 8)]);
-                        ret.push(Attribute::IceControlled(u64::from_be_bytes(bytes)));
+                        attributes.ice_controlled = Some(u64::from_be_bytes(bytes));
                     }
-                    0x802a => {
+                    Self::ICE_CONTROLLING => {
                         if len != 8 {
                             return Err(StunError::Parse(
                                 "IceControlling that isnt 8 in length".into(),
@@ -645,30 +1020,49 @@ impl<'a> Attribute<'a> {
                         }
                         let mut bytes = [0_u8; 8];
                         bytes.copy_from_slice(&buf[4..(4 + 8)]);
-                        ret.push(Attribute::IceControlling(u64::from_be_bytes(bytes)));
+                        attributes.ice_controlling = Some(u64::from_be_bytes(bytes));
                     }
-                    0xc057 => {
+                    Self::NETWORK_COST => {
                         if len != 4 {
                             warn!("NetworkCost that isnt 4 in length");
                         } else {
                             let net_id = (buf[4] as u16) << 8 | buf[5] as u16;
                             let cost = (buf[6] as u16) << 8 | buf[7] as u16;
-                            ret.push(Attribute::NetworkCost(net_id, cost));
+                            attributes.network_cost = Some((net_id, cost));
                         }
                     }
-                    _ => {
-                        ret.push(Attribute::Unknown(typ));
-                    }
+                    _ => {}
                 }
             }
             // attributes are on even 32 bit boundaries
-            let pad = (4 - (len % 4)) % 4;
+            let pad = calculate_pad(len);
             let pad_len = len + pad;
             buf = &buf[(4 + pad_len)..];
             off += 4 + pad_len;
         }
-        Ok(ret)
+        Ok(attributes)
     }
+}
+
+fn calculate_pad(len: usize) -> usize {
+    (4 - (len % 4)) % 4
+}
+
+fn encode_str(typ: u16, s: &str, out: &mut dyn Write) -> io::Result<()> {
+    out.write_all(&(s.len() as u16).to_be_bytes())?;
+
+    encode_str_no_len(typ, s, out)
+}
+
+fn encode_str_no_len(typ: u16, s: &str, out: &mut dyn Write) -> io::Result<()> {
+    if s.len() > 128 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("0x{typ:04x?} too long str len: {}", s.len()),
+        ));
+    }
+    out.write_all(s.as_bytes())?;
+    Ok(())
 }
 
 fn decode_str(typ: u16, buf: &[u8], len: usize) -> Result<&str, StunError> {
@@ -749,34 +1143,248 @@ impl<'a> fmt::Debug for StunMessage<'a> {
     }
 }
 
-impl<'a> fmt::Debug for Attribute<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MappedAddress => write!(f, "MappedAddress"),
-            Self::Username(arg0) => f.debug_tuple("Username").field(arg0).finish(),
-            Self::MessageIntegrity(_) => f.debug_tuple("MessageIntegrity(_)").finish(),
-            Self::MessageIntegrityMark => write!(f, "MessageIntegrityMark"),
-            Self::ErrorCode(arg0, arg1) => {
-                f.debug_tuple("ErrorCode").field(arg0).field(arg1).finish()
+pub use builder::Builder as StunMessageBuilder;
+
+mod builder {
+    use super::{Attributes, Class, Method, StunMessage, TransId};
+    use std::net::SocketAddr;
+
+    /// Type state representing a builder where the STUN method has not yet been set.
+    #[doc(hidden)]
+    #[derive(Default, Debug, Clone)]
+    pub struct NoMethod;
+
+    /// Type state representing a builder where the STUN method has been set, but the class has not.
+    #[doc(hidden)]
+    #[derive(Debug, Clone)]
+    pub struct HasMethod {
+        method: Method,
+    }
+
+    /// Type state representing a builder where both the STUN method and class have been set.
+    /// Attributes can now be added.
+    #[doc(hidden)]
+    #[derive(Debug, Clone)]
+    pub struct HasClass {
+        method: Method,
+        class: Class,
+    }
+
+    /// A type-state builder for creating [`StunMessage`] instances.
+    ///
+    /// This builder guides the user through the required steps:
+    /// 1. Set the STUN method (e.g., `binding()`, `allocate()`).
+    /// 2. Set the STUN class (e.g., `request()`, `success()`).
+    /// 3. Optionally set attributes (e.g., `username()`, `priority()`).
+    /// 4. Call `build()` with a [`TransId`].
+    #[derive(Default, Debug, Clone)]
+    pub struct Builder<'a, State> {
+        attrs: Attributes<'a>,
+        state: State,
+    }
+
+    impl<'a> Builder<'a, NoMethod> {
+        /// Creates a new STUN message builder, starting in the initial state
+        /// where the method needs to be set.
+        pub fn new() -> Self {
+            Builder {
+                attrs: Attributes::default(),
+                state: NoMethod,
             }
-            Self::UnknownAttributes => write!(f, "UnknownAttributes"),
-            Self::Realm(arg0) => f.debug_tuple("Realm").field(arg0).finish(),
-            Self::Nonce(arg0) => f.debug_tuple("Nonce").field(arg0).finish(),
-            Self::XorMappedAddress(arg0) => f.debug_tuple("XorMappedAddress").field(arg0).finish(),
-            Self::Software(arg0) => f.debug_tuple("Software").field(arg0).finish(),
-            Self::AlternateServer => write!(f, "AlternateServer"),
-            Self::Fingerprint(arg0) => f.debug_tuple("Fingerprint").field(arg0).finish(),
-            Self::FingerprintMark => write!(f, "FingerprintMark"),
-            Self::Priority(arg0) => f.debug_tuple("Priority").field(arg0).finish(),
-            Self::UseCandidate => write!(f, "UseCandidate"),
-            Self::IceControlled(arg0) => f.debug_tuple("IceControlled").field(arg0).finish(),
-            Self::IceControlling(arg0) => f.debug_tuple("IceControlling").field(arg0).finish(),
-            Self::NetworkCost(arg0, arg1) => f
-                .debug_tuple("NetworkCost")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::Unknown(arg0) => f.debug_tuple("Unknown").field(arg0).finish(),
+        }
+    }
+
+    // Method Setters (Transition from NoMethod to HasMethod) ---
+    impl<'a> Builder<'a, NoMethod> {
+        fn set_method(self, method: Method) -> Builder<'a, HasMethod> {
+            Builder {
+                attrs: self.attrs,
+                state: HasMethod { method },
+            }
+        }
+
+        /// Sets the STUN method to BINDING.
+        pub fn binding(self) -> Builder<'a, HasMethod> {
+            self.set_method(Method::Binding)
+        }
+
+        /// Sets the STUN method to ALLOCATE (TURN).
+        pub fn allocate(self) -> Builder<'a, HasMethod> {
+            self.set_method(Method::Allocate)
+        }
+
+        /// Sets the STUN method to REFRESH (TURN).
+        pub fn refresh(self) -> Builder<'a, HasMethod> {
+            self.set_method(Method::Refresh)
+        }
+
+        /// Sets the STUN method to SEND (TURN).
+        pub fn send(self) -> Builder<'a, HasMethod> {
+            self.set_method(Method::Send)
+        }
+
+        /// Sets the STUN method to DATA (TURN).
+        pub fn data(self) -> Builder<'a, HasMethod> {
+            self.set_method(Method::Data)
+        }
+
+        /// Sets the STUN method to CREATE_PERMISSION (TURN).
+        pub fn create_permission(self) -> Builder<'a, HasMethod> {
+            self.set_method(Method::CreatePermission)
+        }
+
+        /// Sets the STUN method to CHANNEL_BIND (TURN).
+        pub fn channel_bind(self) -> Builder<'a, HasMethod> {
+            self.set_method(Method::ChannelBind)
+        }
+    }
+
+    // Class Setters (Transition from HasMethod to HasClass) ---
+    impl<'a> Builder<'a, HasMethod> {
+        fn set_class(self, class: Class) -> Builder<'a, HasClass> {
+            Builder {
+                attrs: self.attrs,
+                state: HasClass {
+                    method: self.state.method,
+                    class,
+                },
+            }
+        }
+
+        /// Sets the STUN class to Request.
+        pub fn request(self) -> Builder<'a, HasClass> {
+            self.set_class(Class::Request)
+        }
+
+        /// Sets the STUN class to Indication.
+        pub fn indication(self) -> Builder<'a, HasClass> {
+            self.set_class(Class::Indication)
+        }
+
+        /// Sets the STUN class to Success Response.
+        pub fn success(self) -> Builder<'a, HasClass> {
+            self.set_class(Class::Success)
+        }
+
+        /// Sets the STUN class to Error Response.
+        pub fn failure(self) -> Builder<'a, HasClass> {
+            self.set_class(Class::Failure)
+        }
+    }
+
+    // Attribute Setters (Only on HasClass state) ---
+    impl<'a> Builder<'a, HasClass> {
+        /// Sets the USERNAME attribute.
+        pub fn username(mut self, username: &'a str) -> Self {
+            self.attrs.username = Some(username);
+            self
+        }
+
+        /// Sets the ERROR_CODE attribute.
+        pub fn error_code(mut self, code: u16, reason: &'a str) -> Self {
+            self.attrs.error_code = Some((code, reason));
+            self
+        }
+
+        /// Sets the CHANNEL_NUMBER attribute (TURN).
+        pub fn channel_number(mut self, number: u16) -> Self {
+            self.attrs.channel_number = Some(number);
+            self
+        }
+
+        /// Sets the LIFETIME attribute (TURN).
+        pub fn lifetime(mut self, lifetime: u32) -> Self {
+            self.attrs.lifetime = Some(lifetime);
+            self
+        }
+
+        /// Sets the XOR_PEER_ADDRESS attribute (TURN).
+        pub fn xor_peer_address(mut self, addr: SocketAddr) -> Self {
+            self.attrs.xor_peer_address = Some(addr);
+            self
+        }
+
+        /// Sets the DATA attribute (TURN).
+        pub fn data(mut self, data: &'a [u8]) -> Self {
+            self.attrs.data = Some(data);
+            self
+        }
+
+        /// Sets the REALM attribute.
+        pub fn realm(mut self, realm: &'a str) -> Self {
+            self.attrs.realm = Some(realm);
+            self
+        }
+
+        /// Sets the NONCE attribute.
+        pub fn nonce(mut self, nonce: &'a str) -> Self {
+            self.attrs.nonce = Some(nonce);
+            self
+        }
+
+        /// Sets the XOR_RELAYED_ADDRESS attribute (TURN).
+        pub fn xor_relayed_address(mut self, addr: SocketAddr) -> Self {
+            self.attrs.xor_relayed_address = Some(addr);
+            self
+        }
+
+        /// Sets the XOR_MAPPED_ADDRESS attribute.
+        pub fn xor_mapped_address(mut self, addr: SocketAddr) -> Self {
+            self.attrs.xor_mapped_address = Some(addr);
+            self
+        }
+
+        /// Sets the SOFTWARE attribute.
+        pub fn software(mut self, software: &'a str) -> Self {
+            self.attrs.software = Some(software);
+            self
+        }
+
+        /// Sets the PRIORITY attribute (ICE).
+        pub fn prio(mut self, prio: u32) -> Self {
+            self.attrs.priority = Some(prio);
+            self
+        }
+
+        /// Adds the USE_CANDIDATE attribute (ICE).
+        pub fn use_candidate(mut self) -> Self {
+            self.attrs.use_candidate = true;
+            self
+        }
+
+        /// Sets the ICE_CONTROLLED attribute (ICE).
+        pub fn ice_controlled(mut self, tie_breaker: u64) -> Self {
+            self.attrs.ice_controlled = Some(tie_breaker);
+            self
+        }
+
+        /// Sets the ICE_CONTROLLING attribute (ICE).
+        pub fn ice_controlling(mut self, tie_breaker: u64) -> Self {
+            self.attrs.ice_controlling = Some(tie_breaker);
+            self
+        }
+
+        /// Sets the NETWORK_COST attribute (ICE).
+        pub fn network_cost(mut self, net_id: u16, cost: u16) -> Self {
+            self.attrs.network_cost = Some((net_id, cost));
+            self
+        }
+
+        /// Builds the final [`StunMessage`].
+        ///
+        /// This method consumes the builder and requires a transaction ID.
+        /// Note that `MESSAGE_INTEGRITY` and `FINGERPRINT` attributes are not
+        /// added here; they are calculated and added during serialization in
+        /// [`StunMessage::to_bytes()`].
+        pub fn build(self, trans_id: TransId) -> StunMessage<'a> {
+            StunMessage {
+                method: self.state.method,
+                class: self.state.class,
+                trans_id,
+                attrs: self.attrs,
+                integrity: &[],   // Calculated during serialization
+                integrity_len: 0, // Calculated during serialization
+            }
         }
     }
 }
@@ -784,6 +1392,7 @@ impl<'a> fmt::Debug for Attribute<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     #[test]
     fn parse_stun_message() {
@@ -800,6 +1409,421 @@ mod test {
 
         let packet = PACKET.to_vec();
         let message = StunMessage::parse(&packet).unwrap();
-        assert!(message.check_integrity("xJcE9AQAR7kczUDVOXRUCl"));
+        assert!(message.verify(b"xJcE9AQAR7kczUDVOXRUCl"));
+    }
+
+    #[test]
+    fn minimal_debug_print() {
+        let attrs = Attributes {
+            username: Some("foo"),
+            ..Default::default()
+        };
+
+        let dbg_print = format!("{attrs:?}");
+
+        assert_eq!(dbg_print, r#"Attributes { username: "foo" }"#);
+    }
+
+    // README: IF YOU NEED TO ADJUST THIS TEST BECAUSE YOU ADDED AN ATTRIBUTE,
+    // MAKE SURE TO ADJUST THE `fmt::Debug` impl.
+    #[test]
+    fn all_attributes_are_printed() {
+        let attrs = Attributes {
+            username: Some("foo"),
+            message_integrity: Some(b"0000"),
+            error_code: Some((401, "Unauthorized")),
+            channel_number: Some(0x4000),
+            lifetime: Some(3600),
+            xor_peer_address: Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
+            data: Some(&[0xDE, 0xAD, 0xBE, 0xEF]),
+            realm: Some("baz"),
+            nonce: Some("abcd"),
+            xor_relayed_address: Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
+            xor_mapped_address: Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
+            software: Some("str0m"),
+            fingerprint: Some(9999),
+            priority: Some(1),
+            use_candidate: true,
+            ice_controlled: Some(10),
+            ice_controlling: Some(100),
+            network_cost: Some((10, 10)),
+        };
+
+        let dbg_print = format!("{attrs:?}");
+
+        assert_eq!(
+            dbg_print,
+            r#"Attributes { username: "foo", message_integrity: [48, 48, 48, 48], error_code: (401, "Unauthorized"), channel_number: 16384, lifetime: 3600, xor_peer_address: 127.0.0.1:0, data: [222, 173, 190, 239], realm: "baz", nonce: "abcd", xor_relayed_address: 127.0.0.1:0, xor_mapped_address: 127.0.0.1:0, software: "str0m", fingerprint: 9999, priority: 1, use_candidate: true, ice_controlled: 10, ice_controlling: 100, network_cost: (10, 10) }"#
+        );
+    }
+
+    #[test]
+    fn test_username_4_bytes_no_padding() {
+        let attrs = Attributes {
+            username: Some("abcd"),
+            ..Default::default()
+        };
+        let mut buf = vec![];
+        let trans_id = TransId::new();
+        attrs
+            .to_bytes(&mut buf, &trans_id.0)
+            .expect("To serialize attributes");
+        assert_eq!(
+            buf.len(),
+            8,
+            "A 4 byte username attribute should be 8 bytes, 4 for TVL and 4 for the username"
+        );
+    }
+
+    #[test]
+    fn parse_zero_length_buffer() {
+        let result = StunMessage::parse(&[]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_allocate_request() {
+        let trans_id = TransId::new();
+        let message = StunMessage {
+            method: Method::Allocate,
+            class: Class::Request,
+            trans_id,
+            attrs: Attributes {
+                username: Some("user"),
+                realm: Some("example.org"),
+                nonce: Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"),
+                lifetime: Some(3600),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(Some(b"password"), &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::Allocate);
+        assert_eq!(parsed.class, Class::Request);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.username, Some("user"));
+        assert_eq!(parsed.attrs.realm, Some("example.org"));
+        assert_eq!(
+            parsed.attrs.nonce,
+            Some("dcd98b7102dd2f0e8b11d0f600bfb0c093")
+        );
+        assert_eq!(parsed.attrs.lifetime, Some(3600));
+        assert!(parsed.verify(b"password"));
+    }
+
+    #[test]
+    fn parse_allocate_response() {
+        let trans_id = TransId::new();
+        let relayed_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234));
+        let message = StunMessage {
+            method: Method::Allocate,
+            class: Class::Success,
+            trans_id,
+            attrs: Attributes {
+                xor_relayed_address: Some(relayed_addr),
+                lifetime: Some(1800),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(Some(b"password"), &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::Allocate);
+        assert_eq!(parsed.class, Class::Success);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.xor_relayed_address, Some(relayed_addr));
+        assert_eq!(parsed.attrs.lifetime, Some(1800));
+        assert!(parsed.verify(b"password"));
+    }
+
+    #[test]
+    fn parse_allocate_failure_no_integrity() {
+        let trans_id = TransId::new();
+        let message = StunMessage {
+            method: Method::Allocate,
+            class: Class::Failure,
+            trans_id,
+            attrs: Attributes {
+                error_code: Some((401, "Unauthorized")),
+                realm: Some("example.org"),
+                nonce: Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(None, &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::Allocate);
+        assert_eq!(parsed.class, Class::Failure);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.error_code, Some((401, "Unauthorized")));
+        assert_eq!(parsed.attrs.realm, Some("example.org"));
+        assert_eq!(
+            parsed.attrs.nonce,
+            Some("dcd98b7102dd2f0e8b11d0f600bfb0c093")
+        );
+    }
+
+    #[test]
+    fn parse_send_request() {
+        // Data length of 3 bytes (0xDEADBE) requires 1 byte of padding
+        let trans_id = TransId::new();
+        let message = StunMessage {
+            method: Method::Send,
+            class: Class::Indication,
+            trans_id,
+            attrs: Attributes {
+                username: Some("user"),
+                realm: Some("example.org"),
+                nonce: Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"),
+                // Data length of 3 bytes (0xDEADBE) requires 1 byte of padding
+                data: Some(&[0xDE, 0xAD, 0xBE]),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(Some(b"password"), &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::Send);
+        assert_eq!(parsed.class, Class::Indication);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.username, Some("user"));
+        assert_eq!(parsed.attrs.realm, Some("example.org"));
+        assert_eq!(
+            parsed.attrs.nonce,
+            Some("dcd98b7102dd2f0e8b11d0f600bfb0c093")
+        );
+        assert_eq!(parsed.attrs.data, Some(&[0xDE, 0xAD, 0xBE][..]));
+        assert!(parsed.verify(b"password"));
+    }
+
+    #[test]
+    fn parse_data_indication() {
+        // Data length of 5 bytes (0xDEADBEEF00) requires 3 bytes of padding
+        let trans_id = TransId::new();
+        let message = StunMessage {
+            method: Method::Data,
+            class: Class::Indication,
+            trans_id,
+            attrs: Attributes {
+                data: Some(&[0xDE, 0xAD, 0xBE, 0xEF, 0xF7]),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(Some(b"password"), &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::Data);
+        assert_eq!(parsed.class, Class::Indication);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.data, Some(&[0xDE, 0xAD, 0xBE, 0xEF, 0xF7][..]));
+        assert!(parsed.verify(b"password"));
+    }
+
+    #[test]
+    fn parse_refresh_request() {
+        let trans_id = TransId::new();
+        let message = StunMessage {
+            method: Method::Refresh,
+            class: Class::Request,
+            trans_id,
+            attrs: Attributes {
+                username: Some("user"),
+                realm: Some("example.org"),
+                nonce: Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"),
+                lifetime: Some(600),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(Some(b"password"), &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::Refresh);
+        assert_eq!(parsed.class, Class::Request);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.username, Some("user"));
+        assert_eq!(parsed.attrs.realm, Some("example.org"));
+        assert_eq!(
+            parsed.attrs.nonce,
+            Some("dcd98b7102dd2f0e8b11d0f600bfb0c093")
+        );
+        assert_eq!(parsed.attrs.lifetime, Some(600));
+        assert!(parsed.verify(b"password"));
+    }
+
+    #[test]
+    fn parse_create_permission_request() {
+        let trans_id = TransId::new();
+        let peer_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 8080));
+        let message = StunMessage {
+            method: Method::CreatePermission,
+            class: Class::Request,
+            trans_id,
+            attrs: Attributes {
+                username: Some("user"),
+                realm: Some("example.org"),
+                nonce: Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"),
+                xor_peer_address: Some(peer_addr),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(Some(b"password"), &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::CreatePermission);
+        assert_eq!(parsed.class, Class::Request);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.username, Some("user"));
+        assert_eq!(parsed.attrs.realm, Some("example.org"));
+        assert_eq!(
+            parsed.attrs.nonce,
+            Some("dcd98b7102dd2f0e8b11d0f600bfb0c093")
+        );
+        assert_eq!(parsed.attrs.xor_peer_address, Some(peer_addr));
+        assert!(parsed.verify(b"password"));
+    }
+
+    #[test]
+    fn parse_channel_bind_request() {
+        let trans_id = TransId::new();
+        let peer_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 8080));
+        let message = StunMessage {
+            method: Method::ChannelBind,
+            class: Class::Request,
+            trans_id,
+            attrs: Attributes {
+                username: Some("user"),
+                realm: Some("example.org"),
+                nonce: Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"),
+                channel_number: Some(0x4000),
+                xor_peer_address: Some(peer_addr),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message.to_bytes(Some(b"password"), &mut buf).unwrap();
+        let serialized = &buf[..len];
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert_eq!(parsed.method, Method::ChannelBind);
+        assert_eq!(parsed.class, Class::Request);
+        assert_eq!(parsed.trans_id, trans_id);
+        assert_eq!(parsed.attrs.username, Some("user"));
+        assert_eq!(parsed.attrs.realm, Some("example.org"));
+        assert_eq!(
+            parsed.attrs.nonce,
+            Some("dcd98b7102dd2f0e8b11d0f600bfb0c093")
+        );
+        assert_eq!(parsed.attrs.channel_number, Some(0x4000));
+        assert_eq!(parsed.attrs.xor_peer_address, Some(peer_addr));
+        assert!(parsed.verify(b"password"));
+    }
+
+    #[test]
+    fn build_stun_binding_request_with_attrs() {
+        let trans_id = TransId::new();
+        let username = "test:user";
+        let tie_breaker = 1234567890;
+        let prio = 9876;
+
+        let message = StunMessageBuilder::new()
+            .binding()
+            .request()
+            .username(username)
+            .prio(prio)
+            .ice_controlling(tie_breaker)
+            .use_candidate()
+            .build(trans_id);
+
+        assert_eq!(message.method(), Method::Binding);
+        assert_eq!(message.class(), Class::Request);
+        assert_eq!(message.trans_id(), trans_id);
+        assert_eq!(message.attrs.username, Some(username));
+        assert_eq!(message.attrs.priority, Some(prio));
+        assert_eq!(message.attrs.ice_controlling, Some(tie_breaker));
+        assert!(message.attrs.use_candidate);
+        assert!(message.attrs.ice_controlled.is_none()); // Ensure others aren't set
+    }
+
+    #[test]
+    fn build_stun_binding_success_with_attrs() {
+        let trans_id = TransId::new();
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 5678));
+
+        let message = StunMessageBuilder::new()
+            .binding()
+            .success()
+            .xor_mapped_address(addr)
+            .build(trans_id);
+
+        assert_eq!(message.method(), Method::Binding);
+        assert_eq!(message.class(), Class::Success);
+        assert_eq!(message.trans_id(), trans_id);
+        assert_eq!(message.attrs.xor_mapped_address, Some(addr));
+    }
+
+    #[test]
+    fn build_stun_data_indication_with_attrs() {
+        let trans_id = TransId::new();
+        let data_payload: &[u8] = &[0xca, 0xfe, 0xba, 0xbe];
+
+        let message = StunMessageBuilder::new()
+            .data()
+            .indication()
+            .data(data_payload)
+            .build(trans_id);
+
+        assert_eq!(message.method(), Method::Data);
+        assert_eq!(message.class(), Class::Indication);
+        assert_eq!(message.trans_id(), trans_id);
+        assert_eq!(message.attrs.data, Some(data_payload));
     }
 }

@@ -129,7 +129,7 @@ enum StreamEntryState {
 }
 
 /// (Low level) configuration for a data channel.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChannelConfig {
     /// The label to use for the user to identify the channel.
     pub label: String,
@@ -144,6 +144,18 @@ pub struct ChannelConfig {
     ///
     /// Defaults to ""
     pub protocol: String,
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            label: Default::default(),
+            ordered: true,
+            reliability: Default::default(),
+            negotiated: Default::default(),
+            protocol: Default::default(),
+        }
+    }
 }
 
 /// Reliability setting of a data channel.
@@ -232,7 +244,7 @@ impl RtcSctp {
         self.last_now = now;
 
         if client {
-            info!("New local association");
+            debug!("New local association");
             let (handle, assoc) = self
                 .endpoint
                 .connect(ClientConfig::default(), self.fake_addr)
@@ -370,7 +382,13 @@ impl RtcSctp {
 
         match event {
             DatagramEvent::NewAssociation(a) => {
-                info!("New remote association");
+                // In slow or unreliable networks from browsers (use 3g or slow 4g) settings.
+                // The browser resends a new associations and str0m would override the previously
+                // acked association. Webrtc should use only 1 association.
+                if self.assoc.is_some() {
+                    return;
+                }
+                debug!("New remote association");
                 // Remote side initiated the association
                 self.assoc = Some(a);
                 self.handle = handle;
@@ -446,9 +464,7 @@ impl RtcSctp {
             return None;
         }
 
-        let Some(assoc) = &mut self.assoc else {
-            return None;
-        };
+        let assoc = self.assoc.as_mut()?;
 
         while let Some(e) = assoc.poll() {
             if let Event::Connected = e {
@@ -475,7 +491,7 @@ impl RtcSctp {
                             StreamEntryState::AwaitConfig,
                             "closed",
                         );
-                        info!("Stream {} closed", id);
+                        debug!("Stream {} closed", id);
                         entry.do_close = true;
                     }
                     _ => {}
@@ -492,7 +508,7 @@ impl RtcSctp {
             let want_open = entry.state == StreamEntryState::AwaitOpen;
 
             if want_open {
-                info!("Open stream {}", entry.id);
+                debug!("Open stream {}", entry.id);
                 match assoc.open_stream(entry.id, PayloadProtocolIdentifier::Unknown) {
                     Ok(mut s) => {
                         if !entry.configure_reliability(&mut s) {
@@ -694,7 +710,7 @@ fn transmit_to_vec(t: Transmit) -> Option<VecDeque<Vec<u8>>> {
 
 fn set_state(current_state: &mut RtcSctpState, state: RtcSctpState) {
     if *current_state != state {
-        info!("{:?} => {:?}", current_state, state);
+        debug!("{:?} => {:?}", current_state, state);
         *current_state = state;
     }
 }
@@ -709,7 +725,7 @@ fn stream_entry<'a>(
     if let Some(idx) = idx {
         entries.get_mut(idx).unwrap()
     } else {
-        info!("New stream {} ({:?}): {}", id, initial_state, reason);
+        debug!("New stream {} ({:?}): {}", id, initial_state, reason);
         let e = StreamEntry {
             config: None,
             state: initial_state,

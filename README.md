@@ -2,11 +2,11 @@
 
 <image src="https://user-images.githubusercontent.com/227204/226143511-66fe5264-6ab7-47b9-9551-90ba7e155b96.svg" alt="str0m logo" ></image>
 
-A synchronous sans I/O WebRTC implementation in Rust.
+A Sans I/O WebRTC implementation in Rust.
 
 This is a [Sans I/O][sansio] implementation meaning the `Rtc` instance itself is not doing any network
-talking. Furthermore it has no internal threads or async tasks. All operations are synchronously
-happening from the calls of the public API.
+talking. Furthermore it has no internal threads or async tasks. All operations are happening from the
+calls of the public API.
 
 This is deliberately not a standard `RTCPeerConnection` API since that isn't a great fit for Rust.
 See more details in below section.
@@ -47,6 +47,11 @@ is a bit simpler than the chat. It is a good starting point to understand the AP
 cargo run --example http-post
 ```
 
+#### Real example
+
+To see how str0m is used in a real project, check out [BitWHIP][bitwhip] –
+a CLI WebRTC Agent written in Rust.
+
 ### Passive
 
 For passive connections, i.e. where the media and initial OFFER is
@@ -77,7 +82,6 @@ Active connections means we are making the inital OFFER and waiting for a
 remote ANSWER to start the connection.
 
 ```rust
-#
 // Instantiate a new Rtc instance.
 let mut rtc = Rtc::new();
 
@@ -112,7 +116,6 @@ Driving the state of the `Rtc` forward is a run loop that, regardless of sync or
 looks like this.
 
 ```rust
-#
 // Buffer for reading incoming UDP packets.
 let mut buf = vec![0; 2000];
 
@@ -210,7 +213,6 @@ are negotiated with the remote side. Each codec corresponds to a
 to use when sending.
 
 ```rust
-#
 // Obtain mid from Event::MediaAdded
 let mid: Mid = todo!();
 
@@ -218,7 +220,7 @@ let mid: Mid = todo!();
 let writer = rtc.writer(mid).unwrap();
 
 // Get the payload type (pt) for the wanted codec.
-let pt = writer.payload_params()[0].pt();
+let pt = writer.payload_params().nth(0).unwrap().pt();
 
 // Write the data
 let wallclock = todo!();   // Absolute time of the data
@@ -285,15 +287,37 @@ A production worthy SFU probably needs an even more sophisticated
 strategy weighing in all possible time sources to get a good estimate
 of the remote wallclock for a packet.
 
+## Crypto backends
+
+str0m has two crypto backends, `openssl` and `wincrypto`. The default is
+`openssl` which works on all platforms (also Windows). Ideally we want a
+pure rust version of the crypto code, but WebRTC currently requires
+DTLS 1.2 (not the latest version 1.3), and that leaves us only with a
+few possible options.
+
+When compiling for Windows, the `openssl` feature can be removed and
+only rely on `wincrypto`. However notice that `str0m` never picks up a
+default automatically, you must explicitly configure the crypto backend,
+also when removing the `openssl` feature.
+
+If you are building an application, the easiest is to set the default
+for the entire process.
+
+```rust
+use str0m::config::CryptoProvider;
+
+// Will panic if run twice
+CryptoProvider::WinCrypto.install_process_default();
+```
+
 ## Project status
 
 Str0m was originally developed by Martin Algesten of
 [Lookback][lookback]. We use str0m for a specific use case: str0m as a
 server SFU (as opposed to peer-2-peer). That means we are heavily
 testing and developing the parts needed for our use case. Str0m is
-intended to be an all-purpose WebRTC library, which means it should
-also work for peer-2-peer (mostly thinking about the ICE agent), but
-these areas have not received as much attention and testing.
+intended to be an all-purpose WebRTC library, which means it also
+works for peer-2-peer, though that aspect has received less testing.
 
 Performance is very good, there have been some work the discover and
 optimize bottlenecks. Such efforts are of course never ending with
@@ -328,9 +352,9 @@ forward by different kinds of input.
 Str0m defaults to the "sample level" which treats the RTP as an internal detail. The user
 will thus mainly interact with:
 
-1. [`Event::MediaData`] to receive full "samples" (audio frames or video frames).
-2. [`Writer::write`][crate::media::Writer::write] to write full samples.
-3. [`Writer::request_keyframe`][crate::media::Writer::request_keyframe] to request keyframes.
+1. [`Event::MediaData`][evmed] to receive full "samples" (audio frames or video frames).
+2. [`Writer::write`][writer] to write full samples.
+3. [`Writer::request_keyframe`][reqkey] to request keyframes.
 
 #### Sample level
 
@@ -344,18 +368,13 @@ Samples are not suitable to use directly in UDP (RTP) packets - for
 one they are too big. Samples are therefore further chunked up by
 codec specific payloaders into RTP packets.
 
-#### RTP level
+#### RTP mode
 
 Str0m also provides an RTP level API. This would be similar to many other
 RTP libraries where the RTP packets themselves are the the API surface
 towards the user (when building an SFU one would often talk about "forwarding
-RTP packets", while with str0m we can also "forward samples").
-
-#### RTP mode
-
-str0m has a lower level API which let's the user write/receive RTP
-packets directly. Using this API requires a deeper knowledge of
-RTP and WebRTC.
+RTP packets", while with str0m we can also "forward samples").  Using
+this API requires a deeper knowledge of RTP and WebRTC.
 
 To enable RTP mode
 
@@ -369,10 +388,10 @@ let rtc = Rtc::builder()
 
 RTP mode gives us some new API points.
 
-1. [`Event::RtpPacket`] emitted for every incoming RTP packet. Empty packets for bandwidth
+1. [`Event::RtpPacket`][rtppak] emitted for every incoming RTP packet. Empty packets for bandwidth
    estimation are silently discarded.
-2. [`StreamTx::write_rtp`][crate::rtp::StreamTx::write_rtp] to write outgoing RTP packets.
-3. [`StreamRx::request_keyframe`][crate::rtp::StreamRx::request_keyframe] to request keyframes from remote.
+2. [`StreamTx::write_rtp`][wrtrtp] to write outgoing RTP packets.
+3. [`StreamRx::request_keyframe`][reqkey2] to request keyframes from remote.
 
 ### NIC enumeration and TURN (and STUN)
 
@@ -434,7 +453,7 @@ collected or reference counted languages, but not great with Rust.
 
 ### Panics, Errors and unwraps
 
-Rust adheres to [fail-fast][ff]. That means rather than brushing state
+Str0m adheres to [fail-fast][ff]. That means rather than brushing state
 bugs under the carpet, it panics. We make a distinction between errors and
 bugs.
 
@@ -558,6 +577,13 @@ Yes use the direct API!
 [intg]:       https://github.com/algesten/str0m/blob/main/tests/unidirectional.rs#L12
 [ff]:         https://en.wikipedia.org/wiki/Fail-fast
 [catch]:      https://doc.rust-lang.org/std/panic/fn.catch_unwind.html
+[evmed]:      https://docs.rs/str0m/*/str0m/enum.Event.html#variant.MediaData
+[writer]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.write
+[reqkey]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.request_keyframe
+[rtppak]:     https://docs.rs/str0m/*/str0m/enum.Event.html#variant.RtpPacket
+[wrtrtp]:     https://docs.rs/str0m/*/str0m/rtp/struct.StreamTx.html#method.write_rtp
+[reqkey2]:    https://docs.rs/str0m/*/str0m/rtp/struct.StreamRx.html#method.request_keyframe
+[bitwhip]:    https://github.com/bitwhip/bitwhip
 
 ---
 

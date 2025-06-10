@@ -1,13 +1,14 @@
-use core::panic;
 use std::collections::VecDeque;
 use std::fmt;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::time::Instant;
 
 use crate::rtp_::{ExtensionValues, MediaTime, RtpHeader, SenderInfo, SeqNo};
 
-use super::vp8_contiguity::Vp8Contiguity;
-use super::{CodecDepacketizer, CodecExtra, Depacketizer, PacketError, Vp8CodecExtra};
+use super::contiguity::Contiguity;
+use super::contiguity_vp8::Vp8Contiguity;
+use super::contiguity_vp9::Vp9Contiguity;
+use super::{CodecDepacketizer, CodecExtra, Depacketizer, PacketError};
 
 #[derive(Clone, PartialEq, Eq)]
 /// Holds metadata incoming RTP data.
@@ -53,15 +54,36 @@ impl Depacketized {
     }
 
     pub fn seq_range(&self) -> RangeInclusive<SeqNo> {
-        let first = self.meta[0].seq_no;
-        let last = self.meta.last().expect("at least one element").seq_no;
+        let first = self
+            .meta
+            .first()
+            .expect("a depacketized to consist of at least one packet")
+            .seq_no;
+        let last = self
+            .meta
+            .last()
+            .expect("a depacketized to consist of at least one packet")
+            .seq_no;
         first..=last
+    }
+
+    pub fn start_of_talkspurt(&self) -> bool {
+        self.meta
+            .first()
+            .expect("a depacketized to consist of at least one packet")
+            .header
+            .marker
     }
 
     pub fn ext_vals(&self) -> &ExtensionValues {
         // We use the extensions from the last packet because certain extensions, such as video
         // orientation, are only added on the last packet to save bytes.
-        &self.meta[self.meta.len() - 1].header.ext_vals
+        &self
+            .meta
+            .last()
+            .expect("a depacketized to consist of at least one packet")
+            .header
+            .ext_vals
     }
 }
 
@@ -81,12 +103,22 @@ pub struct DepacketizingBuffer {
     segments: Vec<(usize, usize)>,
     last_emitted: Option<(SeqNo, CodecExtra)>,
     max_time: Option<MediaTime>,
-    depack_cache: Option<(SeqNo, Depacketized)>,
-    vp8_contiguity: Vp8Contiguity,
+    depack_cache: Option<(Range<usize>, Depacketized)>,
+    contiguity: Contiguity,
 }
 
 impl DepacketizingBuffer {
     pub(crate) fn new(depack: CodecDepacketizer, hold_back: usize) -> Self {
+        let contiguity = match depack {
+            CodecDepacketizer::Vp8(_) => Contiguity::Vp8(Vp8Contiguity::new()),
+            CodecDepacketizer::Vp9(_) => Contiguity::Vp9(Vp9Contiguity::new()),
+            CodecDepacketizer::H264(_)
+            | CodecDepacketizer::H265(_)
+            | CodecDepacketizer::Boxed(_)
+            | CodecDepacketizer::Opus(_)
+            | CodecDepacketizer::Null(_) => Contiguity::None,
+        };
+
         DepacketizingBuffer {
             hold_back,
             depack,
@@ -95,7 +127,7 @@ impl DepacketizingBuffer {
             last_emitted: None,
             max_time: None,
             depack_cache: None,
-            vp8_contiguity: Vp8Contiguity::new(),
+            contiguity,
         }
     }
 
@@ -181,16 +213,11 @@ impl DepacketizingBuffer {
 
         if wait_for_contiguity {
             // if we are not sending, cache the depacked
-            self.depack_cache = Some((seq, dep));
+            self.depack_cache = Some((start..stop, dep));
             return None;
         }
 
-        let (can_emit, contiguous_codec) = match dep.codec_extra {
-            CodecExtra::Vp8(next) => self.vp8_contiguity.check(&next, contiguous_seq),
-            CodecExtra::Vp9(_) => (true, contiguous_seq),
-            CodecExtra::None => (true, contiguous_seq),
-        };
-
+        let (can_emit, contiguous_codec) = self.contiguity.check(&dep.codec_extra, contiguous_seq);
         dep.contiguous = contiguous_codec;
 
         let last = self
@@ -217,10 +244,10 @@ impl DepacketizingBuffer {
         &mut self,
         start: usize,
         stop: usize,
-        seq: SeqNo,
+        _seq: SeqNo,
     ) -> Result<Depacketized, PacketError> {
         if let Some(cached) = self.depack_cache.take() {
-            if cached.0 == seq {
+            if cached.0 == (start..stop) {
                 trace!("depack cache hit for segment start {}", start);
                 return Ok(cached.1);
             }
@@ -233,13 +260,8 @@ impl DepacketizingBuffer {
         let mut meta = Vec::with_capacity(stop - start + 1);
 
         for entry in self.queue.range_mut(start..=stop) {
-            if let Err(e) = self
-                .depack
-                .depacketize(&entry.data, &mut data, &mut codec_extra)
-            {
-                println!("depacketize error: {} {}", start, stop);
-                return Err(e);
-            }
+            self.depack
+                .depacketize(&entry.data, &mut data, &mut codec_extra)?;
             meta.push(entry.meta.clone());
         }
 
@@ -267,7 +289,7 @@ impl DepacketizingBuffer {
         for (index, entry) in self.queue.iter().enumerate() {
             let index = index as i64;
             let iseq = *entry.meta.seq_no as i64;
-            let expected_seq = start.map(|s| s.offset + index);
+            let expected_seq = start.map(|s| s.offset.saturating_add(index));
 
             let is_expected_seq = expected_seq == Some(iseq);
             let is_same_timestamp = start.map(|s| s.time) == Some(entry.meta.time);
@@ -292,7 +314,7 @@ impl DepacketizingBuffer {
                 start = Some(Start {
                     index,
                     time: entry.meta.time,
-                    offset: iseq - index,
+                    offset: iseq.saturating_sub(index),
                 });
             }
 
@@ -336,10 +358,6 @@ impl DepacketizingBuffer {
 
         seq.is_next(start_entry.meta.seq_no)
     }
-
-    pub fn max_time(&self) -> Option<MediaTime> {
-        self.max_time
-    }
 }
 
 impl fmt::Debug for RtpMeta {
@@ -366,7 +384,8 @@ impl fmt::Debug for Depacketized {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::rtp_::MediaTime;
+    use crate::packet::vp9::Vp9Depacketizer;
+    use crate::rtp_::{Frequency, MediaTime, Pt, Ssrc};
 
     #[test]
     fn end_on_marker() {
@@ -473,10 +492,10 @@ mod test {
     fn test(
         v: &[(
             u64,   // seq
-            i64,   // time
+            u64,   // time
             &[u8], // data
             &[(
-                i64,   // time
+                u64,   // time
                 &[u8], // depacketized data
             )],
         )],
@@ -487,10 +506,10 @@ mod test {
     fn test0(
         v: &[(
             u64,   // seq
-            i64,   // time
+            u64,   // time
             &[u8], // data
             &[(
-                i64,   // time
+                u64,   // time
                 &[u8], // depacketized data
             )],
         )],
@@ -502,10 +521,10 @@ mod test {
         hold_back: usize,
         v: &[(
             u64,   // seq
-            i64,   // time
+            u64,   // time
             &[u8], // data
             &[(
-                i64,   // time
+                u64,   // time
                 &[u8], // depacketized data
             )],
         )],
@@ -587,7 +606,193 @@ mod test {
         }
 
         fn is_partition_tail(&self, _marker: bool, packet: &[u8]) -> bool {
-            !packet.is_empty() && packet.iter().any(|v| *v == 9)
+            !packet.is_empty() && packet.contains(&9)
         }
+    }
+
+    #[test]
+    fn rtp_out_of_order() {
+        let construct_input =
+            |(time, seq, marker, cc, data): (u32, u16, bool, u16, Vec<u8>)| -> (RtpMeta, Vec<u8>) {
+                (
+                    RtpMeta {
+                        received: Instant::now(),
+                        time: MediaTime::new(time.into(), Frequency::new(90000).unwrap()),
+                        seq_no: SeqNo::from(seq as u64),
+                        header: RtpHeader {
+                            version: 2,
+                            has_padding: false,
+                            has_extension: true,
+                            marker,
+                            payload_type: Pt::new_with_value(98),
+                            sequence_number: seq,
+                            timestamp: time,
+                            ssrc: Ssrc::from(2930203832),
+                            ext_vals: ExtensionValues {
+                                transport_cc: Some(cc),
+                                ..Default::default()
+                            },
+                            header_len: 28,
+                        },
+                        last_sender_info: None,
+                    },
+                    data,
+                )
+            };
+
+        let inputs = [
+            // PID: 23860
+            (
+                821395241, // Timestamp
+                8685,      // SeqN
+                false,     // Marker
+                56,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([236, 221, 52, 80, 26, 10, 1, 1, 1, 1, 1, 1, 1, 1]), // Data
+            ),
+            // PID: 23860
+            (
+                821395241, // Timestamp
+                8686,      // SeqN
+                true,      // Marker
+                57,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([237, 221, 52, 83, 26, 10, 2, 2, 2, 2, 2, 2, 2, 2]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481, // Timestamp
+                8687,      // SeqN
+                false,     // Marker
+                60,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +------------------------+
+                Vec::from([170, 221, 53, 16, 27, 56, 20, 0, 0, 0, 0, 0, 0, 0, 0]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481, // Timestamp
+                8688,      // SeqN
+                false,     // Marker
+                61,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([160, 221, 53, 16, 27, 20, 1, 1, 1, 1, 1, 1, 1, 1]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481,
+                8689,
+                false,
+                62,
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([164, 221, 53, 16, 27, 20, 2, 2, 2, 2, 2, 2, 2, 2]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481, // Timestamp
+                8690,      // SeqN
+                false,     // Marker
+                63,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([169, 221, 53, 19, 27, 20, 3, 3, 3, 3, 3, 3, 3, 3]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481, // Timestamp
+                8691,      // SeqN
+                false,     // Marker
+                64,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([161, 221, 53, 19, 27, 20, 4, 4, 4, 4, 4, 4, 4, 4]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481, // Timestamp
+                8692,      // SeqN
+                false,     // Marker
+                65,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([161, 221, 53, 19, 27, 20, 5, 5, 5, 5, 5, 5, 5, 5]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481, // Timestamp
+                8693,      // SeqN
+                false,     // Marker
+                66,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([161, 221, 53, 19, 27, 20, 6, 6, 6, 6, 6, 6, 6, 6]), // Data
+            ),
+            // PID: 23861
+            (
+                821398481, // Timestamp
+                8694,      // SeqN
+                true,      // Marker
+                67,        // Transport CC
+                // VP9 header--------+
+                //                   |
+                //        +--------------------+
+                Vec::from([165, 221, 53, 19, 27, 20, 7, 7, 7, 7, 7, 7, 7, 7]), // Data
+            ),
+        ];
+
+        let mut buffer =
+            DepacketizingBuffer::new(CodecDepacketizer::Vp9(Vp9Depacketizer::default()), 30);
+
+        for input in &inputs {
+            let (meta, data) = construct_input(input.clone());
+            buffer.push(meta, data);
+        }
+
+        let res0before = buffer.pop().unwrap().unwrap(); // Pop PID: 23860, `contiguous_seq == true`.
+        let res1before = buffer.pop().unwrap().unwrap(); // Pop PID: 23861, `contiguous_seq == true`.
+
+        let mut buffer =
+            DepacketizingBuffer::new(CodecDepacketizer::Vp9(Vp9Depacketizer::default()), 30);
+
+        for input in &inputs {
+            let (meta, data) = construct_input(input.clone());
+            if meta.seq_no == SeqNo::from(8689) {
+                continue; // Skip RTP packet with seq_num=8689 vp9_payload=[20, 2, 2, 2, 2, 2, 2, 2, 2].
+            }
+            buffer.push(meta.clone(), data.clone());
+        }
+
+        // Pop PID: 23860, `contiguous_seq == true`.
+        let res0after = buffer.pop().unwrap().unwrap();
+        // Try to pop PID: 23861. `None` because `contiguous_seq == false` -- no seq_num=8689.
+        assert!(buffer.pop().is_none());
+        assert!(buffer.pop().is_none()); // Ensure once again.
+
+        for input in &inputs {
+            let (meta, data) = construct_input(input.clone());
+            if meta.seq_no == SeqNo::from(8689) {
+                // Send RTP packet with seq_num=8689 vp9_payload=[20, 2, 2, 2, 2, 2, 2, 2, 2].
+                buffer.push(meta.clone(), data.clone());
+                break;
+            }
+        }
+
+        let res1after = buffer.pop().unwrap().unwrap();
+
+        assert_eq!(res0before.data, res0after.data);
+        assert_eq!(res1before.data, res1after.data);
     }
 }

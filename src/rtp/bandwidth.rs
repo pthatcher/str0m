@@ -13,6 +13,12 @@ pub struct Bitrate(f64);
 impl Bitrate {
     /// A bitrate of zero bit/s.
     pub const ZERO: Self = Self::bps(0);
+    /// The maximum bitrate that can be represented.
+    pub const MAX: Self = Self::bps(u64::MAX);
+    /// Positive infinity, useful as an invalid value with comparison semantics
+    pub const INFINITY: Self = Self(f64::INFINITY);
+    /// Negative infinity, useful as an invalid value with comparison semantics
+    pub const NEG_INFINITY: Self = Self(f64::NEG_INFINITY);
 
     /// Create a bitrate of some bit per second(bps).
     pub const fn bps(bps: u64) -> Self {
@@ -57,6 +63,16 @@ impl Bitrate {
     /// Return the maximum bitrate between `self` and `other`.
     pub fn max(&self, other: Self) -> Self {
         Self(self.0.max(other.0))
+    }
+
+    /// Whether this bitrate is valid
+    pub fn is_valid(&self) -> bool {
+        self.0.is_finite()
+    }
+
+    /// Turn self into `Option<Bitrate>` based on its validity
+    pub fn as_valid(&self) -> Option<Bitrate> {
+        self.is_valid().then_some(*self)
     }
 }
 
@@ -150,6 +166,10 @@ impl DataSize {
     pub fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))
     }
+
+    pub(crate) fn as_kb(&self) -> f64 {
+        self.0 as f64 / 1000.0
+    }
 }
 
 impl From<usize> for DataSize {
@@ -169,8 +189,13 @@ impl Div<Duration> for DataSize {
 
     fn div(self, rhs: Duration) -> Self::Output {
         let bytes = self.as_bytes_f64();
+        let s = rhs.as_secs_f64();
 
-        let bps = (bytes * 8.0) / rhs.as_secs_f64();
+        if s == 0.0 {
+            return Bitrate::ZERO;
+        }
+
+        let bps = (bytes * 8.0) / s;
 
         bps.into()
     }
@@ -181,9 +206,27 @@ impl Div<Bitrate> for DataSize {
 
     fn div(self, rhs: Bitrate) -> Self::Output {
         let bits = self.as_bytes_f64() * 8.0;
-        let seconds = bits / rhs.as_f64();
+        let rhs = rhs.as_f64();
+
+        if rhs == 0.0 {
+            return Duration::ZERO;
+        }
+
+        let seconds = bits / rhs;
 
         Duration::from_secs_f64(seconds)
+    }
+}
+
+impl Div<f64> for Bitrate {
+    type Output = Bitrate;
+
+    fn div(self, rhs: f64) -> Self::Output {
+        if rhs == 0.0 {
+            return Self::ZERO;
+        }
+
+        Self(self.0 / rhs)
     }
 }
 
@@ -198,6 +241,17 @@ impl Mul<u64> for DataSize {
 impl AddAssign<DataSize> for DataSize {
     fn add_assign(&mut self, rhs: DataSize) {
         self.0 += rhs.0;
+    }
+}
+
+impl Sub<DataSize> for DataSize {
+    type Output = DataSize;
+
+    fn sub(self, rhs: DataSize) -> Self::Output {
+        let mut res = self;
+        res -= rhs;
+
+        res
     }
 }
 
@@ -224,8 +278,7 @@ impl Sum<DataSize> for DataSize {
 impl fmt::Display for DataSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let size = self.0 as f64;
-        // TODO: Use ilog10 when MSRV policy allows Rust 1.67.0
-        let log = size.log10().floor() as u64;
+        let log = (size as u64).ilog10();
 
         match log {
             0..=2 => write!(f, "{size}B"),
@@ -300,5 +353,13 @@ mod test {
         let duration = size / rate;
 
         assert_eq!(duration.as_millis(), 40);
+    }
+
+    #[test]
+    fn test_bitrate_div_f64() {
+        let rate = Bitrate::kbps(2_500);
+        let new_rate = rate / 2.0;
+
+        assert_eq!(new_rate, Bitrate::kbps(1250));
     }
 }

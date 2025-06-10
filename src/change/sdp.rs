@@ -4,13 +4,13 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use crate::channel::ChannelId;
-use crate::dtls::Fingerprint;
+use crate::crypto::Fingerprint;
 use crate::format::CodecConfig;
 use crate::format::PayloadParams;
-use crate::ice::{Candidate, IceCreds};
 use crate::io::Id;
-use crate::media::Media;
+use crate::media::{Media, Rids, Simulcast};
 use crate::packet::MediaKind;
+use crate::rtp_::MidRid;
 use crate::rtp_::Rid;
 use crate::rtp_::{Direction, Extension, ExtensionMap, Mid, Pt, Ssrc};
 use crate::sctp::ChannelConfig;
@@ -20,10 +20,10 @@ use crate::sdp::{Proto, SessionAttribute, Setup};
 use crate::session::Session;
 use crate::Rtc;
 use crate::RtcError;
+use crate::{Candidate, IceCreds};
 
 pub use crate::sdp::{SdpAnswer, SdpOffer};
-use crate::streams::Streams;
-use crate::streams::DEFAULT_RTX_CACHE_DURATION;
+use crate::streams::{Streams, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP};
 
 /// Changes to the Rtc via SDP Offer/Answer dance.
 pub struct SdpApi<'a> {
@@ -73,6 +73,12 @@ impl<'a> SdpApi<'a> {
             return Err(RtcError::RemoteSdp("No m-lines in offer".into()));
         }
 
+        if self.rtc.ice.ice_lite() && offer.session.ice_lite() {
+            return Err(RtcError::RemoteSdp(
+                "Both peers being ICE-Lite not supported".into(),
+            ));
+        }
+
         add_ice_details(self.rtc, &offer, None)?;
 
         if self.rtc.remote_fingerprint.is_none() {
@@ -85,8 +91,9 @@ impl<'a> SdpApi<'a> {
         }
 
         if !self.rtc.dtls.is_inited() {
-            // The side that makes the first offer is the controlling side.
-            self.rtc.ice.set_controlling(false);
+            // The side that makes the first offer is the controlling side, unless they
+            // are ICE Lite, in which case the roles are reversed (see RFC 5245).
+            self.rtc.ice.set_controlling(offer.session.ice_lite());
         }
 
         // Ensure setup=active/passive is corresponding remote and init dtls.
@@ -121,7 +128,7 @@ impl<'a> SdpApi<'a> {
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
-    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
+    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
     /// let (offer, pending) = changes.apply().unwrap();
     ///
     /// // send offer to remote peer, receive answer back
@@ -141,6 +148,12 @@ impl<'a> SdpApi<'a> {
 
         if !self.rtc.is_correct_change_id(pending.change_id) {
             return Err(RtcError::ChangesOutOfOrder);
+        }
+
+        if self.rtc.ice.ice_lite() && answer.session.ice_lite() {
+            return Err(RtcError::RemoteSdp(
+                "Both peers being ICE-Lite not supported".into(),
+            ));
         }
 
         add_ice_details(self.rtc, &answer, Some(&pending))?;
@@ -181,14 +194,16 @@ impl<'a> SdpApi<'a> {
     /// If changes have been made, nothing happens until we call [`SdpApi::apply()`].
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::{Rtc, media::MediaKind, media::Direction};
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
     /// assert!(!changes.has_changes());
     ///
-    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
     /// assert!(changes.has_changes());
+    /// # }
     /// ```
     pub fn has_changes(&self) -> bool {
         !self.changes.0.is_empty()
@@ -206,12 +221,14 @@ impl<'a> SdpApi<'a> {
     ///   CNAME in the RTP SDES.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::{Rtc, media::MediaKind, media::Direction};
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
     ///
-    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    /// # }
     /// ```
     pub fn add_media(
         &mut self,
@@ -219,6 +236,7 @@ impl<'a> SdpApi<'a> {
         dir: Direction,
         stream_id: Option<String>,
         track_id: Option<String>,
+        simulcast: Option<crate::media::Simulcast>,
     ) -> Mid {
         let mid = self.rtc.new_mid();
 
@@ -249,8 +267,15 @@ impl<'a> SdpApi<'a> {
             Id::<20>::random().to_string()
         };
 
-        let rtx = kind.is_video().then(|| self.rtc.session.streams.new_ssrc());
-        let ssrcs = vec![(self.rtc.session.streams.new_ssrc(), rtx)];
+        let mut ssrcs = Vec::new();
+
+        // Main SSRC, not counting RTX.
+        let main_ssrc_count = simulcast.as_ref().map(|s| s.send.len()).unwrap_or(1);
+
+        for _ in 0..main_ssrc_count {
+            let rtx = kind.is_video().then(|| self.rtc.session.streams.new_ssrc());
+            ssrcs.push((self.rtc.session.streams.new_ssrc(), rtx));
+        }
 
         // TODO: let user configure stream/track name.
         let msid = Msid {
@@ -265,6 +290,7 @@ impl<'a> SdpApi<'a> {
             kind,
             dir,
             ssrcs,
+            simulcast,
 
             // Added later
             pts: vec![],
@@ -295,7 +321,9 @@ impl<'a> SdpApi<'a> {
         }
     }
 
-    /// Add a new data channel and get the `id` that will be used.
+    /// Add a new reliable ordered data channel and get the `id` that will be used.
+    ///
+    /// Use `add_channel_with_config` when unreliable or unordered data channels are preferred.
     ///
     /// The first ever data channel added to a WebRTC session results in a media
     /// of a special "application" type in the SDP. The m-line is for a SCTP association over
@@ -305,17 +333,45 @@ impl<'a> SdpApi<'a> {
     /// Consecutive channels will be opened without needing a negotiation.
     ///
     /// The label is used to identify the data channel to the remote peer. This is mostly
-    /// useful whe multiple channels are in use at the same time.
+    /// useful when multiple channels are in use at the same time.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::Rtc;
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
     ///
     /// let cid = changes.add_channel("my special channel".to_string());
+    /// # }
     /// ```
     pub fn add_channel(&mut self, label: String) -> ChannelId {
+        self.add_channel_with_config(ChannelConfig {
+            label,
+            ..Default::default()
+        })
+    }
+
+    /// Add a new data channel with a given configuration and get the `id` that will be used.
+    ///
+    /// Refer to `add_channel` for more details.
+    ///
+    /// ```
+    /// # #[cfg(feature = "openssl")] {
+    /// # use str0m::{channel::{ChannelConfig, Reliability}, Rtc};
+    /// let mut rtc = Rtc::new();
+    ///
+    /// let mut changes = rtc.sdp_api();
+    ///
+    /// let cid = changes.add_channel_with_config(ChannelConfig {
+    ///     label: "my special channel".to_string(),
+    ///     reliability: Reliability::MaxRetransmits{ retransmits: 0 },
+    ///     ordered: false,
+    ///     ..Default::default()
+    /// });
+    /// # }
+    /// ```
+    pub fn add_channel_with_config(&mut self, config: ChannelConfig) -> ChannelId {
         let has_media = self.rtc.session.app().is_some();
         let changes_contains_add_app = self.changes.contains_add_app();
 
@@ -323,11 +379,6 @@ impl<'a> SdpApi<'a> {
             let mid = self.rtc.new_mid();
             self.changes.0.push(Change::AddApp(mid));
         }
-
-        let config = ChannelConfig {
-            label,
-            ..Default::default()
-        };
 
         let id = self.rtc.chan.new_channel(&config);
 
@@ -372,11 +423,13 @@ impl<'a> SdpApi<'a> {
     /// the current [`SdpPendingOffer`].
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::Rtc;
     /// let mut rtc = Rtc::new();
     ///
     /// let changes = rtc.sdp_api();
     /// assert!(changes.apply().is_none());
+    /// # }
     /// ```
     pub fn apply(self) -> Option<(SdpOffer, SdpPendingOffer)> {
         if self.changes.is_empty() {
@@ -415,11 +468,11 @@ impl<'a> SdpApi<'a> {
     /// # use str0m::Rtc;
     /// let mut rtc = Rtc::new();
     /// let mut changes = rtc.sdp_api();
-    /// changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
+    /// changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
     /// let (_offer, pending) = changes.apply().unwrap();
     ///
     /// let mut changes = rtc.sdp_api();
-    /// changes.add_media(MediaKind::Video, Direction::SendOnly, None, None);
+    /// changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
     /// changes.merge(pending);
     ///
     /// // This `SdpOffer` will have changes from the first `SdpPendingChanges`
@@ -445,7 +498,7 @@ impl<'a> SdpApi<'a> {
 /// let mut rtc = Rtc::new();
 ///
 /// let mut changes = rtc.sdp_api();
-/// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
+/// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
 /// let (offer, pending) = changes.apply().unwrap();
 ///
 /// // send offer to remote peer, receive answer back
@@ -517,6 +570,7 @@ pub(crate) struct AddMedia {
     pub kind: MediaKind,
     pub dir: Direction,
     pub ssrcs: Vec<(Ssrc, Option<Ssrc>)>,
+    pub simulcast: Option<Simulcast>,
 
     // pts and index are filled in when creating the SDP OFFER.
     // The default PT order is set by the Session (BUNDLE).
@@ -561,8 +615,9 @@ fn apply_direct_changes(rtc: &mut Rtc, mut changes: Changes) {
 
 fn create_offer(rtc: &mut Rtc, changes: &Changes) -> SdpOffer {
     if !rtc.dtls.is_inited() {
-        // The side that makes the first offer is the controlling side.
-        rtc.ice.set_controlling(true);
+        // The side that makes the first offer is the controlling side, unless they
+        // are ICE Lite, in which case the roles are reversed (see RFC 5245).
+        rtc.ice.set_controlling(!rtc.ice.ice_lite());
     }
 
     let params = AsSdpParams::new(rtc, Some(changes));
@@ -701,11 +756,17 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
         (lines, mids, stream_ids)
     };
 
+    // AllowMixedExts adds "a=extmap-allow-mixed" at session level to signal
+    // support for mixing one-byte and two-byte RTP header extensions.
+    // TODO: It would make sense to perform an actual negotiation, however
+    //       just adding this line should work fine:
+    // https://github.com/meetecho/janus-gateway/blob/d2e74fdf9bb8aa7a39ed68ed28394afe1e0cd22d/src/sdp.c#L1519
     let mut attrs = vec![
         SessionAttribute::Group {
             typ: "BUNDLE".into(),
             mids,
         },
+        SessionAttribute::AllowMixedExts,
         SessionAttribute::MsidSemantic {
             semantic: "WMS".to_string(),
             stream_ids,
@@ -793,11 +854,10 @@ fn ensure_stream_tx(session: &mut Session) {
             .any(|p| p.resend().is_some());
 
         for rid in rids {
+            let midrid = MidRid(media.mid(), rid);
+
             // If we already have the stream, we don't make any new one.
-            let has_stream = session
-                .streams
-                .stream_tx_by_mid_rid(media.mid(), rid)
-                .is_some();
+            let has_stream = session.streams.stream_tx_by_midrid(midrid).is_some();
 
             if has_stream {
                 continue;
@@ -811,9 +871,7 @@ fn ensure_stream_tx(session: &mut Session) {
                 (ssrc, None)
             };
 
-            let stream = session
-                .streams
-                .declare_stream_tx(ssrc, rtx, media.mid(), rid);
+            let stream = session.streams.declare_stream_tx(ssrc, rtx, midrid);
 
             // Configure cache size
             let size = if media.kind().is_audio() {
@@ -822,7 +880,7 @@ fn ensure_stream_tx(session: &mut Session) {
                 session.send_buffer_video
             };
 
-            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION);
+            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP);
         }
     }
 }
@@ -846,11 +904,14 @@ fn add_pending_changes(session: &mut Session, pending: Changes) {
         media.set_cname(add_media.cname);
         media.set_msid(add_media.msid);
 
-        for (ssrc, rtx) in add_media.ssrcs {
-            // TODO: When we allow sending RID, we need to add that here.
-            let stream = session
-                .streams
-                .declare_stream_tx(ssrc, rtx, add_media.mid, None);
+        // If there are RIDs, the SSRC order matches that of the rid order.
+        let rids = add_media.simulcast.map(|x| x.send).unwrap_or(vec![]);
+
+        for (i, (ssrc, rtx)) in add_media.ssrcs.into_iter().enumerate() {
+            let maybe_rid = rids.get(i).cloned();
+            let midrid = MidRid(add_media.mid, maybe_rid);
+
+            let stream = session.streams.declare_stream_tx(ssrc, rtx, midrid);
 
             let size = if media.kind().is_audio() {
                 session.send_buffer_audio
@@ -858,7 +919,7 @@ fn add_pending_changes(session: &mut Session, pending: Changes) {
                 session.send_buffer_video
             };
 
-            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION);
+            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP);
         }
     }
 }
@@ -972,9 +1033,10 @@ fn update_session(session: &mut Session, sdp: &Sdp) {
         .id_of(Extension::TransportSequenceNumber)
         .is_some();
 
-    // Since twcc feedback is session wide and not per m-line or pt, we enable it if
-    // there are _any_ m-line with a a=rtcp-fb transport-cc parameter and the sequence
-    // number header is enabled.
+    // Since twcc feedback is session wide we enable it if there are _any_
+    // m-line with a a=rtcp-fb transport-cc parameter and the sequence number
+    // header is enabled. It can later be disabled for specific m-lines based
+    // on the extensions map.
     if has_transport_cc && has_twcc_header {
         session.enable_twcc_feedback();
     }
@@ -1011,7 +1073,7 @@ fn update_media(
         && new_dir == Direction::SendOnly;
 
     if change_direction_disallowed {
-        info!(
+        debug!(
             "Ignore attempt to change inactive to recvonly by remote peer for locally created mid: {}",
             media.mid()
         );
@@ -1019,8 +1081,26 @@ fn update_media(
         media.set_direction(new_dir);
     }
 
-    for rid in m.rids().iter() {
-        media.expect_rid(*rid);
+    if new_dir.is_sending() {
+        // The other side has declared how it EXPECTING to receive. We must only send
+        // the RIDs declared in the answer.
+        let rids = m.rids();
+        let rid_tx = if rids.is_empty() {
+            Rids::None
+        } else {
+            Rids::Specific(rids)
+        };
+        media.set_rid_tx(rid_tx);
+    }
+    if new_dir.is_receiving() {
+        // The other side has declared what it proposes to send. We are accepting it.
+        let rids = m.rids();
+        let rid_rx = if rids.is_empty() {
+            Rids::Any
+        } else {
+            Rids::Specific(rids)
+        };
+        media.set_rid_rx(rid_rx);
     }
 
     // Narrowing/ordering of of PT
@@ -1035,57 +1115,64 @@ fn update_media(
     for (id, ext) in m.extmaps().into_iter() {
         // The remapping of extensions should already have happened, which
         // means the ID are matching in the session to the remote.
-        if exts.lookup(id) != Some(ext) {
+
+        // Does the ID exist in session?
+        let in_session = match exts.lookup(id) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if in_session != ext {
             // Don't set any extensions that aren't enabled in Session.
             continue;
         }
-        remote_extmap.set(id, ext.clone());
+
+        // Use the Extension from session, since there might be a special
+        // serializer for cases like VLA.
+        remote_extmap.set(id, in_session.clone());
     }
     media.set_remote_extmap(remote_extmap);
 
-    if new_dir.is_receiving() {
-        // SSRC changes
-        // This will always be for ReceiverSource since any incoming a=ssrc line will be
-        // about the remote side's SSRC.
-        let infos = m.ssrc_info();
-        let main = infos.iter().filter(|i| i.repairs.is_none());
+    // SSRC changes
+    // This will always be for ReceiverSource since any incoming a=ssrc line will be
+    // about the remote side's SSRC.
+    if !new_dir.is_receiving() {
+        return;
+    }
 
-        if m.simulcast().is_none() {
-            // Only use pre-communicated SSRC if we are running without simulcast.
-            // We found a bug in FF where the order of the simulcast lines does not
-            // correspond to the order of the simulcast declarations. In this case
-            // it's better to fall back on mid/rid dynamic mapping.
-
-            for i in main {
-                // TODO: If the remote is communicating _BOTH_ rid and a=ssrc this will fail.
-                info!("Adding pre-communicated SSRC: {:?}", i);
-                let repair_ssrc = infos
-                    .iter()
-                    .find(|r| r.repairs == Some(i.ssrc))
-                    .map(|r| r.ssrc);
-
-                // If remote communicated a main a=ssrc, but no RTX, we will not send nacks.
-                let suppress_nack = repair_ssrc.is_none();
-                streams.expect_stream_rx(
-                    i.ssrc,
-                    repair_ssrc,
-                    media.mid(),
-                    None,
-                    suppress_nack,
-                    None,
-                );
-            }
+    // Simulcast configuration
+    if let Some(s) = m.simulcast() {
+        if s.is_munged {
+            warn!("Not supporting simulcast via munging SDP");
+        } else if media.simulcast().is_none() {
+            // Invert before setting, since it has a recv and send config.
+            media.set_simulcast(s.invert());
         }
+    }
 
-        // Simulcast configuration
-        if let Some(s) = m.simulcast() {
-            if s.is_munged {
-                warn!("Not supporting simulcast via munging SDP");
-            } else if media.simulcast().is_none() {
-                // Invert before setting, since it has a recv and send config.
-                media.set_simulcast(s.invert());
-            }
-        }
+    // Only use pre-communicated SSRC if we are running without simulcast.
+    // We found a bug in FF where the order of the simulcast lines does not
+    // correspond to the order of the simulcast declarations. In this case
+    // it's better to fall back on mid/rid dynamic mapping.
+    if m.simulcast().is_some() {
+        return;
+    }
+
+    let infos = m.ssrc_info();
+    let main = infos.iter().filter(|i| i.repairs.is_none());
+
+    for i in main {
+        // TODO: If the remote is communicating _BOTH_ rid and a=ssrc this will fail.
+        debug!("Adding pre-communicated SSRC: {:?}", i);
+        let repair_ssrc = infos
+            .iter()
+            .find(|r| r.repairs == Some(i.ssrc))
+            .map(|r| r.ssrc);
+
+        // If remote communicated a main a=ssrc, but no RTX, we will not send nacks.
+        let midrid = MidRid(media.mid(), None);
+        let suppress_nack = repair_ssrc.is_none();
+        streams.expect_stream_rx(i.ssrc, repair_ssrc, midrid, suppress_nack);
     }
 }
 
@@ -1238,18 +1325,13 @@ impl AsSdpMediaLine for Media {
             }
         }
 
-        let count = ssrcs_tx.len();
-        #[allow(clippy::comparison_chain)]
-        if count == 1 {
-            let (ssrc, ssrc_rtx) = &ssrcs_tx[0];
+        for (ssrc, ssrc_rtx) in ssrcs_tx {
             if let Some(ssrc_rtx) = ssrc_rtx {
                 attrs.push(MediaAttribute::SsrcGroup {
                     semantics: "FID".to_string(),
                     ssrcs: vec![*ssrc, *ssrc_rtx],
                 });
             }
-        } else {
-            // TODO: handle simulcast
         }
 
         MediaLine {
@@ -1430,7 +1512,7 @@ impl Changes {
         index_start: usize,
         config: &'b CodecConfig,
         exts: &'b ExtensionMap,
-    ) -> impl Iterator<Item = Media> + '_ {
+    ) -> impl Iterator<Item = Media> + 'a {
         self.0
             .iter()
             .enumerate()
@@ -1496,7 +1578,10 @@ impl Change {
 
 #[cfg(test)]
 mod test {
+    use sdp::RestrictionId;
+
     use crate::format::Codec;
+    use crate::media::Simulcast;
     use crate::sdp::RtpMap;
 
     use super::*;
@@ -1514,6 +1599,8 @@ mod test {
 
     #[test]
     fn test_out_of_order_error() {
+        crate::init_crypto_default();
+
         let mut rtc1 = Rtc::new();
         let mut rtc2 = Rtc::new();
 
@@ -1536,13 +1623,15 @@ mod test {
 
     #[test]
     fn sdp_api_merge_works() {
+        crate::init_crypto_default();
+
         let mut rtc = Rtc::new();
         let mut changes = rtc.sdp_api();
-        changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
+        changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
         let (offer, pending) = changes.apply().unwrap();
 
         let mut changes = rtc.sdp_api();
-        changes.add_media(MediaKind::Video, Direction::SendOnly, None, None);
+        changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
         changes.merge(pending);
         let (new_offer, _) = changes.apply().unwrap();
 
@@ -1552,6 +1641,8 @@ mod test {
 
     #[test]
     fn test_rtp_payload_priority() {
+        crate::init_crypto_default();
+
         let mut rtc1 = Rtc::builder()
             .clear_codecs()
             .enable_h264(true)
@@ -1565,7 +1656,7 @@ mod test {
             .build();
 
         let mut change1 = rtc1.sdp_api();
-        change1.add_media(MediaKind::Video, Direction::SendOnly, None, None);
+        change1.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
         let (offer1, _) = change1.apply().unwrap();
 
         let answer = rtc2.sdp_api().accept_offer(offer1).unwrap();
@@ -1592,5 +1683,112 @@ mod test {
             !vp9_unsupported,
             "VP9 was not offered, so it should not be present in the answer"
         );
+    }
+
+    #[test]
+    fn non_simulcast_rids() {
+        crate::init_crypto_default();
+
+        let mut rtc1 = Rtc::new();
+        let mut rtc2 = Rtc::new();
+
+        // Test initial media creation
+        let mid = {
+            let mut changes = rtc1.sdp_api();
+            let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+            let (offer, pending) = changes.apply().unwrap();
+            let answer = rtc2.sdp_api().accept_offer(offer).unwrap();
+            rtc1.sdp_api().accept_answer(pending, answer).unwrap();
+
+            assert!(matches!(rtc1.media(mid).unwrap().rids_rx(), Rids::Any));
+            assert!(matches!(rtc1.media(mid).unwrap().rids_tx(), Rids::None));
+            assert!(matches!(rtc2.media(mid).unwrap().rids_rx(), Rids::Any));
+            assert!(matches!(rtc2.media(mid).unwrap().rids_tx(), Rids::None));
+
+            mid
+        };
+
+        // Test later updates to that media
+        {
+            let mut changes = rtc1.sdp_api();
+            changes.set_direction(mid, Direction::Inactive);
+            let (offer, pending) = changes.apply().unwrap();
+            let answer = rtc2.sdp_api().accept_offer(offer).unwrap();
+            rtc1.sdp_api().accept_answer(pending, answer).unwrap();
+
+            assert!(matches!(rtc1.media(mid).unwrap().rids_rx(), Rids::Any));
+            assert!(matches!(rtc1.media(mid).unwrap().rids_tx(), Rids::None));
+            assert!(matches!(rtc2.media(mid).unwrap().rids_rx(), Rids::Any));
+            assert!(matches!(rtc2.media(mid).unwrap().rids_tx(), Rids::None));
+        }
+    }
+
+    #[test]
+    fn simulcast_ssrc_allocation() {
+        crate::init_crypto_default();
+
+        let mut rtc1 = Rtc::new();
+
+        let mut change = rtc1.sdp_api();
+        change.add_media(
+            MediaKind::Video,
+            Direction::SendOnly,
+            None,
+            None,
+            Some(Simulcast {
+                send: vec!["m".into(), "h".into(), "l".into()],
+                recv: vec![],
+            }),
+        );
+
+        let Change::AddMedia(am) = &change.changes[0] else {
+            panic!("Not AddMedia?!");
+        };
+
+        // these should be organized in order: m, h, l
+        let pending_ssrcs = am.ssrcs.clone();
+        assert_eq!(pending_ssrcs.len(), 3);
+
+        for p in &pending_ssrcs {
+            assert!(p.1.is_some()); // all should have rtx
+        }
+
+        let (offer, _) = change.apply().unwrap();
+        let sdp = offer.into_inner();
+        let line = &sdp.media_lines[0];
+
+        assert_eq!(
+            line.simulcast().unwrap().send,
+            SimulcastGroups(vec![
+                RestrictionId("m".into(), true),
+                RestrictionId("h".into(), true),
+                RestrictionId("l".into(), true),
+            ])
+        );
+
+        // Each SSRC, both regular and RTX get their own a=ssrc line.
+        assert_eq!(line.ssrc_info().len(), pending_ssrcs.len() * 2);
+
+        let fids: Vec<_> = line
+            .attrs
+            .iter()
+            .filter_map(|a| {
+                if let MediaAttribute::SsrcGroup { semantics, ssrcs } = a {
+                    // We don't have any other semantics right now.
+                    assert_eq!(semantics, "FID");
+                    assert_eq!(ssrcs.len(), 2);
+                    Some((ssrcs[0], ssrcs[1]))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(fids.len(), pending_ssrcs.len());
+
+        for (a, b) in fids.iter().zip(pending_ssrcs.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(Some(a.1), b.1);
+        }
     }
 }

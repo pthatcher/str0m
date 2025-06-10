@@ -1,19 +1,20 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::bwe::BweKind;
-use crate::dtls::{KeyingMaterial, SrtpProfile};
+use crate::crypto::SrtpProfile;
+use crate::crypto::{KeyingMaterial, SrtpCrypto};
 use crate::format::CodecConfig;
 use crate::format::PayloadParams;
 use crate::io::{DatagramSend, DATAGRAM_MTU, DATAGRAM_MTU_WARN};
 use crate::media::KeyframeRequestKind;
 use crate::media::Media;
 use crate::media::{MediaAdded, MediaChanged};
-use crate::net;
 use crate::packet::SendSideBandwithEstimator;
 use crate::packet::{LeakyBucketPacer, NullPacer, Pacer, PacerImpl};
-use crate::rtp::RawPacket;
+use crate::rtp::{Extension, RawPacket};
 use crate::rtp_::Direction;
+use crate::rtp_::MidRid;
 use crate::rtp_::Pt;
 use crate::rtp_::SeqNo;
 use crate::rtp_::SRTCP_OVERHEAD;
@@ -24,6 +25,7 @@ use crate::stats::StatsSnapshot;
 use crate::streams::{RtpPacket, Streams};
 use crate::util::{already_happened, not_happening, Soonest};
 use crate::Event;
+use crate::{net, Reason};
 use crate::{RtcConfig, RtcError};
 
 /// Minimum time we delay between sending nacks. This should be
@@ -74,6 +76,7 @@ pub(crate) struct Session {
     twcc: u64,
     twcc_rx_register: TwccRecvRegister,
     twcc_tx_register: TwccSendRegister,
+    max_rx_seq_lookup: HashMap<Ssrc, SeqNo>,
 
     bwe: Option<Bwe>,
 
@@ -107,10 +110,11 @@ impl Session {
         while *id > MAX_ID {
             id = (*id >> 1).into();
         }
-        let (pacer, bwe) = if let Some(rate) = config.bwe_initial_bitrate {
+        let (pacer, bwe) = if let Some(config) = &config.bwe_config {
+            let rate = config.initial_bitrate;
             let pacer = PacerImpl::LeakyBucket(LeakyBucketPacer::new(rate * PACING_FACTOR * 2.0));
 
-            let send_side_bwe = SendSideBandwithEstimator::new(rate);
+            let send_side_bwe = SendSideBandwithEstimator::new(rate, config.enable_loss_controller);
             let bwe = Bwe {
                 bwe: send_side_bwe,
                 desired_bitrate: Bitrate::ZERO,
@@ -124,10 +128,12 @@ impl Session {
             (PacerImpl::Null(NullPacer::default()), None)
         };
 
+        let enable_stats = config.stats_interval.is_some();
+
         Session {
             id,
             medias: vec![],
-            streams: Streams::default(),
+            streams: Streams::new(enable_stats),
             app: None,
             reordering_size_audio: config.reordering_size_audio,
             reordering_size_video: config.reordering_size_video,
@@ -146,6 +152,7 @@ impl Session {
             twcc: 0,
             twcc_rx_register: TwccRecvRegister::new(100),
             twcc_tx_register: TwccSendRegister::new(1000),
+            max_rx_seq_lookup: HashMap::new(),
             bwe,
             enable_twcc_feedback: false,
             pacer,
@@ -188,6 +195,7 @@ impl Session {
     pub fn set_keying_material(
         &mut self,
         mat: KeyingMaterial,
+        srtp_crypto: &SrtpCrypto,
         srtp_profile: SrtpProfile,
         active: bool,
     ) {
@@ -196,17 +204,17 @@ impl Session {
         // hand side of the key material to derive input/output.
         let left = active;
 
-        self.srtp_rx = Some(SrtpContext::new(srtp_profile, &mat, !left));
-        self.srtp_tx = Some(SrtpContext::new(srtp_profile, &mat, left));
+        self.srtp_rx = Some(SrtpContext::new(srtp_crypto, srtp_profile, &mat, !left));
+        self.srtp_tx = Some(SrtpContext::new(srtp_crypto, srtp_profile, &mat, left));
     }
 
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
         // Payload any waiting samples
-        self.do_payload(now)?;
+        self.do_payload()?;
 
         let sender_ssrc = self.streams.first_ssrc_local();
 
-        let do_nack = now >= self.nack_at();
+        let do_nack = now >= self.nack_at().unwrap_or(not_happening());
 
         self.streams.handle_timeout(
             now,
@@ -245,7 +253,7 @@ impl Session {
 
         let stream = self
             .streams
-            .stream_tx_by_mid_rid(padding_request.mid, None)
+            .stream_tx_by_midrid(padding_request.midrid)
             .expect("pacer to use an existing stream");
 
         stream.generate_padding(padding_request.padding);
@@ -255,46 +263,36 @@ impl Session {
         self.last_twcc = now;
         let mut twcc = self.twcc_rx_register.build_report(DATAGRAM_MTU - 100)?;
 
-        // These SSRC are on medial level, but twcc is on session level,
+        // These SSRC are on media level, but twcc is on session level,
         // we fill in the first discovered media SSRC in each direction.
         twcc.sender_ssrc = sender_ssrc;
         twcc.ssrc = self.streams.first_ssrc_remote();
 
-        debug!("Created feedback TWCC: {:?}", twcc);
+        trace!("Created feedback TWCC: {:?}", twcc);
         self.feedback_tx.push_front(Rtcp::Twcc(twcc));
         Some(())
     }
 
-    pub fn handle_receive(&mut self, now: Instant, r: net::Receive) {
-        self.do_handle_receive(now, r);
+    pub fn handle_rtp_receive(&mut self, now: Instant, message: &[u8]) {
+        let Some(header) = RtpHeader::parse(message, &self.exts) else {
+            trace!("Failed to parse RTP header");
+            return;
+        };
+
+        self.handle_rtp(now, header, message);
     }
 
-    fn do_handle_receive(&mut self, now: Instant, r: net::Receive) -> Option<()> {
-        use crate::io::DatagramRecv::*;
-        match r.contents {
-            Rtp(buf) => {
-                if let Some(header) = RtpHeader::parse(buf, &self.exts) {
-                    self.handle_rtp(now, header, buf);
-                } else {
-                    trace!("Failed to parse RTP header");
-                }
-            }
-            Rtcp(buf) => {
-                // According to spec, the outer enclosing SRTCP packet should always be a SR or RR,
-                // even if it's irrelevant and empty.
-                // In practice I'm not sure that is happening, because libWebRTC hates empty packets.
-                self.handle_rtcp(now, buf)?;
-            }
-            _ => {}
-        }
-
-        Some(())
+    pub fn handle_rtcp_receive(&mut self, now: Instant, message: &[u8]) {
+        // According to spec, the outer enclosing SRTCP packet should always be a SR or RR,
+        // even if it's irrelevant and empty.
+        // In practice I'm not sure that is happening, because libWebRTC hates empty packets.
+        self.handle_rtcp(now, message);
     }
 
-    fn mid_and_ssrc_for_header(&mut self, header: &RtpHeader) -> Option<(Mid, Ssrc)> {
+    fn mid_and_ssrc_for_header(&mut self, now: Instant, header: &RtpHeader) -> Option<(Mid, Ssrc)> {
         let ssrc_header = header.ssrc;
 
-        if let Some(r) = self.streams.mid_ssrc_rx_by_ssrc_or_rtx(ssrc_header) {
+        if let Some(r) = self.streams.mid_ssrc_rx_by_ssrc_or_rtx(now, ssrc_header) {
             return Some(r);
         }
 
@@ -302,7 +300,7 @@ impl Session {
         self.map_dynamic(header);
 
         // The dynamic mapping might have added an entry by now.
-        self.streams.mid_ssrc_rx_by_ssrc_or_rtx(ssrc_header)
+        self.streams.mid_ssrc_rx_by_ssrc_or_rtx(now, ssrc_header)
     }
 
     fn map_dynamic(&mut self, header: &RtpHeader) {
@@ -340,30 +338,29 @@ impl Session {
             // Case A - use the rid_repair header to identify RTX.
             let is_main = header.ext_vals.rid.is_some();
 
+            let midrid = MidRid(mid, Some(rid));
+
             self.streams
-                .map_dynamic_by_rid(header.ssrc, mid, rid, media, *payload, is_main);
+                .map_dynamic_by_rid(header.ssrc, midrid, media, *payload, is_main);
         } else {
             // Case B - the payload type identifies RTX.
             let is_main = payload.pt() == header.payload_type;
 
+            let midrid = MidRid(mid, None);
+
             self.streams
-                .map_dynamic_by_pt(header.ssrc, mid, media, *payload, is_main);
+                .map_dynamic_by_pt(header.ssrc, midrid, media, *payload, is_main);
         }
     }
 
-    fn handle_rtp(&mut self, now: Instant, mut header: RtpHeader, buf: &[u8]) {
+    pub(crate) fn handle_rtp(&mut self, now: Instant, mut header: RtpHeader, buf: &[u8]) {
         // Rewrite absolute-send-time (if present) to be relative to now.
         header.ext_vals.update_absolute_send_time(now);
 
         trace!("Handle RTP: {:?}", header);
-        if let Some(transport_cc) = header.ext_vals.transport_cc {
-            let prev = self.twcc_rx_register.max_seq();
-            let extended = extend_u16(Some(*prev), transport_cc);
-            self.twcc_rx_register.update_seq(extended.into(), now);
-        }
 
         // The ssrc is the _main_ ssrc (no the rtx, that might be in the header).
-        let Some((mid, ssrc)) = self.mid_and_ssrc_for_header(&header) else {
+        let Some((mid, ssrc)) = self.mid_and_ssrc_for_header(now, &header) else {
             debug!("No mid/SSRC for header: {:?}", header);
             return;
         };
@@ -394,14 +391,37 @@ impl Session {
         let pt = params.pt();
         let is_repair = pt != header.payload_type;
 
+        let max_seq_lookup = make_max_seq_lookup(&self.max_rx_seq_lookup);
+
         // is_repair controls whether update is updating the main register or the RTX register.
         // Either way we get a seq_no_outer which is used to decrypt the SRTP.
-        let receipt_outer = stream.update(now, &header, clock_rate, is_repair);
+        let mut seq_no = stream.extend_seq(&header, is_repair, max_seq_lookup);
 
-        let mut data = match srtp.unprotect_rtp(buf, &header, *receipt_outer.seq_no) {
+        if !stream.is_new_packet(is_repair, seq_no) {
+            // Dupe packet. This could be a potential SRTP replay attack, which means
+            // we should not spend any CPU cycles towards decrypting it.
+            trace!(
+                "Ignoring dupe packet mid: {} seq_no: {} is_repair: {}",
+                mid,
+                seq_no,
+                is_repair
+            );
+            return;
+        }
+
+        let mut data = match srtp.unprotect_rtp(buf, &header, *seq_no) {
             Some(v) => v,
             None => {
-                trace!("Failed to unprotect SRTP");
+                trace!(
+                    "Failed to unprotect SRTP for SSRC: {} pt: {}  mid: {} \
+                    rid: {:?} seq_no: {} is_repair: {}",
+                    header.ssrc,
+                    pt,
+                    stream.mid(),
+                    stream.rid(),
+                    seq_no,
+                    is_repair
+                );
                 return;
             }
         };
@@ -415,6 +435,20 @@ impl Session {
         if let Some(raw_packets) = &mut self.raw_packets {
             raw_packets.push_back(Box::new(RawPacket::RtpRx(header.clone(), data.clone())));
         }
+
+        // Mark as received for TWCC purposes
+        if let Some(transport_cc) = header.ext_vals.transport_cc {
+            let prev = self.twcc_rx_register.max_seq();
+            let extended = extend_u16(Some(*prev), transport_cc);
+            self.twcc_rx_register.update_seq(extended.into(), now);
+        }
+
+        // Store largest seen seq_no for the SSRC. This is used in case we get SSRC changes
+        // like A -> B -> A. When we go back to A, we must keep the ROC.
+        update_max_seq(&mut self.max_rx_seq_lookup, header.ssrc, seq_no);
+
+        // Register reception in nack registers.
+        let receipt_outer = stream.update_register(now, &header, clock_rate, is_repair, seq_no);
 
         // RTX packets must be rewritten to be a normal packet. This only changes the
         // the seq_no, however MediaTime might be different when interpreted against the
@@ -430,23 +464,30 @@ impl Session {
             // Rewrite the header, and removes the resent seq_no from the body.
             stream.un_rtx(&mut header, &mut data, pt);
 
+            let max_seq_lookup = make_max_seq_lookup(&self.max_rx_seq_lookup);
+
+            // Header has changed, which means we extend a new seq_no. This time
+            // without is_repair since this is the wrapped resend. This is the
+            // extended number of the main stream.
+            seq_no = stream.extend_seq(&header, false, max_seq_lookup);
+
+            // header.ssrc is changed by un_rtx() above to be main SSRC.
+            update_max_seq(&mut self.max_rx_seq_lookup, header.ssrc, seq_no);
+
             // Now update the "main" register with the repaired packet info.
-            // This gives us the extended sequence number of the main stream.
-            stream.update(now, &header, clock_rate, false)
+            stream.update_register(now, &header, clock_rate, false, seq_no)
         } else {
             // This is not RTX, the outer seq and time is what we use. The first
             // stream.update will have updated the main register.
             receipt_outer
         };
 
-        let Some(packet) = stream.handle_rtp(now, header, data, receipt.seq_no, receipt.time)
-        else {
-            return;
-        };
+        let packet = stream.handle_rtp(now, header, data, seq_no, receipt.time);
 
         if self.rtp_mode {
             // In RTP mode, we store the packet temporarily here for the next poll_output().
-            // However only if this is a packet not seen before. This filters out spurious resends for padding.
+            // However only if this is a packet not seen before. This filters out spurious
+            // resends for padding.
             if receipt.is_new_packet {
                 self.pending_packet = Some(packet);
             }
@@ -477,15 +518,11 @@ impl Session {
 
         for fb in RtcpFb::from_rtcp(self.feedback_rx.drain(..)) {
             if let RtcpFb::Twcc(twcc) = fb {
-                debug!("Handle TWCC: {:?}", twcc);
-                let range = self.twcc_tx_register.apply_report(twcc, now);
+                trace!("Handle TWCC: {:?}", twcc);
+                let maybe_records = self.twcc_tx_register.apply_report(twcc, now);
 
-                if let Some(bwe) = &mut self.bwe {
-                    let records = range.and_then(|range| self.twcc_tx_register.send_records(range));
-
-                    if let Some(records) = records {
-                        bwe.update(records, now);
-                    }
+                if let (Some(maybe_records), Some(bwe)) = (maybe_records, &mut self.bwe) {
+                    bwe.update(maybe_records, now);
                 }
                 need_configure_pacer = true;
 
@@ -541,8 +578,10 @@ impl Session {
             return Some(Event::StreamPaused(paused));
         }
 
-        if let Some(packet) = self.pending_packet.take() {
-            return Some(Event::RtpPacket(packet));
+        if self.rtp_mode {
+            if let Some(packet) = self.pending_packet.take() {
+                return Some(Event::RtpPacket(packet));
+            }
         }
 
         if let Some(req) = self.streams.poll_keyframe_request() {
@@ -572,16 +611,24 @@ impl Session {
                     direction: media.direction(),
                 }));
             }
-
-            if let Some(r) = media.poll_sample(&self.codec_config) {
-                match r {
-                    Ok(v) => return Some(Event::MediaData(v)),
-                    Err(e) => return Some(Event::Error(e)),
-                }
-            }
         }
 
         None
+    }
+
+    pub fn poll_event_fallible(&mut self) -> Result<Option<Event>, RtcError> {
+        // Not relevant in rtp_mode, where the packets are picked up by poll_event().
+        if self.rtp_mode {
+            return Ok(None);
+        }
+
+        for media in &mut self.medias {
+            if let Some(e) = media.poll_sample(&self.codec_config)? {
+                return Ok(Some(Event::MediaData(e)));
+            }
+        }
+
+        Ok(None)
     }
 
     fn ready_for_srtp(&self) -> bool {
@@ -608,6 +655,13 @@ impl Session {
         }
 
         x
+    }
+
+    /// To be called in lieu of [`Self::poll_datagram`] when the owner is not in a position to transmit any
+    /// generated feedback, and thus such feedback should be dropped.
+    pub fn clear_feedback(&mut self) {
+        self.feedback_rx.clear();
+        self.feedback_tx.clear();
     }
 
     fn poll_feedback(&mut self) -> Option<net::DatagramSend> {
@@ -651,22 +705,27 @@ impl Session {
         let srtp_tx = self.srtp_tx.as_mut()?;
 
         // Figure out which, if any, queue to poll
-        let mid = self.pacer.poll_queue()?;
+        let midrid = self.pacer.poll_queue()?;
         let media = self
             .medias
             .iter()
-            .find(|m| m.mid() == mid)
+            .find(|m| m.mid() == midrid.mid())
             .expect("index is media");
 
         let buf = &mut self.poll_packet_buf;
         let twcc_seq = self.twcc;
 
-        // TODO: allow for sending simulcast
-        let stream = self.streams.stream_tx_by_mid_rid(media.mid(), None)?;
+        let stream = self.streams.stream_tx_by_midrid(midrid)?;
 
         let params = &self.codec_config;
         let exts = media.remote_extmap();
-        let receipt = stream.poll_packet(now, exts, &mut self.twcc, params, buf)?;
+
+        // TWCC might not be enabled for this m-line. Firefox do use TWCC, but not
+        // for audio. This is indiciated via the SDP.
+        let twcc_enabled = exts.id_of(Extension::TransportSequenceNumber).is_some();
+        let twcc = twcc_enabled.then_some(&mut self.twcc);
+
+        let receipt = stream.poll_packet(now, exts, twcc, params, buf)?;
 
         let PacketReceipt {
             header,
@@ -684,7 +743,7 @@ impl Session {
             crate::log_stat!("PACKET_SENT", header.ssrc, payload_size, kind);
         }
 
-        self.pacer.register_send(now, payload_size.into(), mid);
+        self.pacer.register_send(now, payload_size.into(), midrid);
 
         if let Some(raw_packets) = &mut self.raw_packets {
             raw_packets.push_back(Box::new(RawPacket::RtpTx(header.clone(), buf.clone())));
@@ -692,8 +751,10 @@ impl Session {
 
         let protected = srtp_tx.protect_rtp(buf, &header, *seq_no);
 
-        self.twcc_tx_register
-            .register_seq(twcc_seq.into(), now, payload_size);
+        if twcc_enabled {
+            self.twcc_tx_register
+                .register_seq(twcc_seq.into(), now, payload_size);
+        }
 
         // Technically we should wait for the next handle_timeout, but this speeds things up a bit
         // avoiding an extra poll_timeout.
@@ -702,46 +763,44 @@ impl Session {
         Some(protected.into())
     }
 
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
-        let regular_at = Some(self.regular_feedback_at());
-        let nack_at = Some(self.nack_at());
+    pub fn poll_timeout(&mut self) -> (Option<Instant>, Reason) {
+        let feedback_at = self.regular_feedback_at();
+        let nack_at = self.nack_at();
         let twcc_at = self.twcc_at();
         let pacing_at = self.pacer.poll_timeout();
         let packetize_at = self.medias.iter().flat_map(|m| m.poll_timeout()).next();
         let bwe_at = self.bwe.as_ref().map(|bwe| bwe.poll_timeout());
-        let paused_at = Some(self.paused_at());
-        let timestamp_writes_at = self.streams.timestamp_writes_at();
+        let paused_at = self.paused_at();
+        let send_stream_at = self.streams.send_stream();
 
-        let timeout = (regular_at, "regular")
-            .soonest((nack_at, "nack"))
-            .soonest((twcc_at, "twcc"))
-            .soonest((pacing_at, "pacing"))
-            .soonest((packetize_at, "media"))
-            .soonest((bwe_at, "bwe"))
-            .soonest((paused_at, "paused"))
-            .soonest((timestamp_writes_at, "timestamp writes"));
-
-        // trace!("poll_timeout soonest is: {}", timeout.1);
-
-        timeout.0
+        (feedback_at, Reason::Feedback)
+            .soonest((nack_at, Reason::Nack))
+            .soonest((twcc_at, Reason::Twcc))
+            .soonest((pacing_at, Reason::Pacing))
+            .soonest((packetize_at, Reason::Packetize))
+            .soonest((bwe_at, Reason::Bwe))
+            .soonest((paused_at, Reason::PauseCheck))
+            .soonest((send_stream_at, Reason::SendStream))
     }
 
     pub fn has_mid(&self, mid: Mid) -> bool {
         self.medias.iter().any(|m| m.mid() == mid)
     }
 
-    fn regular_feedback_at(&self) -> Instant {
-        self.streams
-            .regular_feedback_at()
-            .unwrap_or_else(not_happening)
+    fn regular_feedback_at(&self) -> Option<Instant> {
+        self.streams.regular_feedback_at()
     }
 
-    fn paused_at(&self) -> Instant {
-        self.streams.paused_at().unwrap_or_else(not_happening)
+    fn paused_at(&self) -> Option<Instant> {
+        self.streams.paused_at()
     }
 
-    fn nack_at(&mut self) -> Instant {
-        self.last_nack + NACK_MIN_INTERVAL
+    fn nack_at(&mut self) -> Option<Instant> {
+        if !self.streams.any_nack_enabled() {
+            return None;
+        }
+
+        Some(self.last_nack + NACK_MIN_INTERVAL)
     }
 
     fn twcc_at(&self) -> Option<Instant> {
@@ -774,6 +833,7 @@ impl Session {
         snapshot.bwe_tx = self.bwe.as_ref().and_then(|bwe| bwe.last_estimate());
 
         snapshot.egress_loss_fraction = self.twcc_tx_register.loss(Duration::from_secs(1), now);
+        snapshot.rtt = self.twcc_tx_register.rtt();
         snapshot.ingress_loss_fraction = self.twcc_rx_register.loss();
     }
 
@@ -788,6 +848,12 @@ impl Session {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.desired_bitrate = desired_bitrate;
             self.configure_pacer();
+        }
+    }
+
+    pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.reset(init_bitrate);
         }
     }
 
@@ -838,9 +904,9 @@ impl Session {
         self.medias.iter_mut().find(|m| m.mid() == mid)
     }
 
-    fn do_payload(&mut self, now: Instant) -> Result<(), RtcError> {
+    fn do_payload(&mut self) -> Result<(), RtcError> {
         for m in &mut self.medias {
-            m.do_payload(now, &mut self.streams, &self.codec_config)?;
+            m.do_payload(&mut self.streams, &self.codec_config)?;
         }
 
         Ok(())
@@ -861,8 +927,9 @@ impl Session {
             self.streams.reset_buffers_tx(mid);
         }
 
+        let max_seq_lookup = make_max_seq_lookup(&self.max_rx_seq_lookup);
         if old_dir.is_receiving() && !direction.is_receiving() {
-            self.streams.reset_buffers_rx(mid);
+            self.streams.reset_buffers_rx(mid, max_seq_lookup);
         }
 
         true
@@ -877,6 +944,11 @@ impl Session {
             KeyframeRequestKind::Pli => r.fb_pli,
             KeyframeRequestKind::Fir => r.fb_fir,
         })
+    }
+
+    /// Checks whether the SRTP contexts are up.
+    pub fn is_connected(&self) -> bool {
+        self.srtp_rx.is_some() && self.srtp_tx.is_some()
     }
 }
 
@@ -893,7 +965,11 @@ impl Bwe {
         self.bwe.handle_timeout(now);
     }
 
-    pub fn update<'t>(
+    fn reset(&mut self, init_bitrate: Bitrate) {
+        self.bwe.reset(init_bitrate);
+    }
+
+    fn update<'t>(
         &mut self,
         records: impl Iterator<Item = &'t crate::rtp_::TwccSendRecord>,
         now: Instant,
@@ -936,4 +1012,15 @@ pub struct PacketReceipt {
 /// when it's the RTX Pt.
 fn main_payload_params(c: &CodecConfig, pt: Pt) -> Option<&PayloadParams> {
     c.iter().find(|p| (p.pt == pt || p.resend == Some(pt)))
+}
+
+fn make_max_seq_lookup(map: &HashMap<Ssrc, SeqNo>) -> impl Fn(Ssrc) -> Option<SeqNo> + '_ {
+    |ssrc| map.get(&ssrc).cloned()
+}
+
+fn update_max_seq(map: &mut HashMap<Ssrc, SeqNo>, ssrc: Ssrc, seq_no: SeqNo) {
+    let current = map.entry(ssrc).or_insert(seq_no);
+    if seq_no > *current {
+        *current = seq_no;
+    }
 }

@@ -56,9 +56,11 @@ pub struct Candidate {
     /// Type of candidate.
     kind: CandidateKind, // host/srflx/prflx/relay
 
-    /// Relay address.
+    /// Related address.
     ///
-    /// For server reflexive candidates, this is the address/port of the server.
+    /// For server-reflexive candidates, this is the internal IP/port the candidate corresponds to
+    /// (the one behind the NAT, usually). For relay candidates, this is the mapped address selected
+    /// by the TURN server.
     raddr: Option<SocketAddr>, // ip/port
 
     /// Ufrag.
@@ -177,8 +179,10 @@ impl Candidate {
     ///
     /// Server reflexive candidates are local sockets mapped to external ip discovered
     /// via a STUN binding request.
+    /// The `base` is the local interface that this address corresponds to.
     pub fn server_reflexive(
         addr: SocketAddr,
+        base: SocketAddr,
         proto: impl TryInto<Protocol>,
     ) -> Result<Self, IceError> {
         if !is_valid_ip(addr.ip()) {
@@ -191,9 +195,9 @@ impl Candidate {
             parse_proto(proto)?,
             None,
             addr,
-            Some(addr),
+            Some(base),
             CandidateKind::ServerReflexive,
-            None,
+            Some(Self::arbitrary_raddr(addr)),
             None,
         ))
     }
@@ -202,7 +206,17 @@ impl Candidate {
     ///
     /// Relayed candidates are server sockets relaying traffic to a local socket.
     /// Allocate a TURN addr to use as a local candidate.
-    pub fn relayed(addr: SocketAddr, proto: impl TryInto<Protocol>) -> Result<Self, IceError> {
+    ///
+    /// * `addr` - The TURN server's allocated address that will be used for relaying traffic.
+    ///            This is the address that will be used for communication with the peer.
+    /// * `base` - The local interface address that corresponds to this candidate. This is the
+    ///            address from which the TURN allocation request was sent.
+    /// * `proto` - The transport protocol to use (UDP, TCP, etc.).
+    pub fn relayed(
+        addr: SocketAddr,
+        base: SocketAddr,
+        proto: impl TryInto<Protocol>,
+    ) -> Result<Self, IceError> {
         if !is_valid_ip(addr.ip()) {
             return Err(IceError::BadCandidate(format!("invalid ip {}", addr.ip())));
         }
@@ -213,9 +227,9 @@ impl Candidate {
             parse_proto(proto)?,
             None,
             addr,
-            Some(addr),
+            Some(base),
             CandidateKind::Relayed,
-            None,
+            Some(Self::arbitrary_raddr(addr)),
             None,
         ))
     }
@@ -249,6 +263,25 @@ impl Candidate {
             None,
             Some(ufrag),
         )
+    }
+
+    /// Create an arbitrary socket address, matching the format of the input address,
+    /// for placement in the `raddr` field.
+    ///
+    /// For non-host candidates, Firefox (and perhaps others) require the SDP string to
+    /// contain `raddr` and `rport` to correctly parse. While we could put honest values
+    /// here, those honest values are likely private IP addresses that we would rather not
+    /// expose to the world. Instead, browsers often spoof values to go here instead, and
+    /// we do the same.
+    ///
+    /// Note that `raddr` and `rport` are only for diagnostic purposes, and have no
+    /// bearing on ICE connectivity checks.
+    fn arbitrary_raddr(s: SocketAddr) -> SocketAddr {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+        match s {
+            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+        }
     }
 
     #[cfg(test)]
@@ -301,7 +334,7 @@ impl Candidate {
 
         let hash = hasher.finish();
 
-        hash.to_string()
+        format!("{:08x}{hash:x}", self.prio().to_be())
     }
 
     /// Returns the priority value for the specified ICE candidate.
@@ -386,11 +419,22 @@ impl Candidate {
         self.base.unwrap_or(self.addr)
     }
 
+    pub(crate) fn source_addr(&self) -> SocketAddr {
+        // For relayed candidates, the source address the allocated address on the TURN server.
+        // The base is the local address.
+        if self.kind == CandidateKind::Relayed {
+            self.addr
+        } else {
+            self.base()
+        }
+    }
+
     pub(crate) fn raddr(&self) -> Option<SocketAddr> {
         self.raddr
     }
 
-    pub(crate) fn kind(&self) -> CandidateKind {
+    /// Returns the kind of this candidate.
+    pub fn kind(&self) -> CandidateKind {
         self.kind
     }
 
@@ -398,8 +442,8 @@ impl Candidate {
         self.local_preference = Some(v);
     }
 
-    pub(crate) fn set_discarded(&mut self) {
-        self.discarded = true;
+    pub(crate) fn set_discarded(&mut self, discarded: bool) {
+        self.discarded = discarded;
     }
 
     pub(crate) fn discarded(&self) -> bool {
@@ -410,8 +454,7 @@ impl Candidate {
         self.ufrag = Some(ufrag.into());
     }
 
-    #[doc(hidden)]
-    pub fn ufrag(&self) -> Option<&str> {
+    pub(crate) fn ufrag(&self) -> Option<&str> {
         self.ufrag.as_deref()
     }
 
@@ -564,16 +607,23 @@ mod tests {
         let socket_addr = "1.2.3.4:9876".parse().unwrap();
         let mut candidate = Candidate::host(socket_addr, Protocol::Udp).unwrap();
         assert_eq!(
-            serde_json::to_string(&candidate).unwrap(),
-            r#"{"candidate":"candidate:12044049749558888150 1 udp 2130706175 1.2.3.4 9876 typ host","sdpMid":null,"sdpMLineIndex":0,"usernameFragment":null}"#
+            no_hash(serde_json::to_string(&candidate).unwrap()),
+            r#"{"candidate":"candidate:--- 1 udp 2130706175 1.2.3.4 9876 typ host","sdpMid":null,"sdpMLineIndex":0,"usernameFragment":null}"#
         );
 
         // Add a username fragment
         candidate.ufrag = Some("ufrag".to_string());
         assert_eq!(
-            serde_json::to_string(&candidate).unwrap(),
-            r#"{"candidate":"candidate:12044049749558888150 1 udp 2130706175 1.2.3.4 9876 typ host ufrag ufrag","sdpMid":null,"sdpMLineIndex":0,"usernameFragment":"ufrag"}"#
+            no_hash(serde_json::to_string(&candidate).unwrap()),
+            r#"{"candidate":"candidate:--- 1 udp 2130706175 1.2.3.4 9876 typ host ufrag ufrag","sdpMid":null,"sdpMLineIndex":0,"usernameFragment":"ufrag"}"#
         );
+    }
+
+    fn no_hash(mut s: String) -> String {
+        let f = s.find("candidate:").unwrap();
+        let t = s.find(" 1 ").unwrap();
+        s.replace_range((f + 10)..t, "---");
+        s
     }
 
     #[test]
@@ -596,32 +646,34 @@ mod tests {
         let socket_addr = "1.2.3.4:9876".parse().unwrap();
         let mut candidate = Candidate::host(socket_addr, Protocol::Udp).unwrap();
         assert_eq!(
-            candidate.to_string(),
-            "candidate:12044049749558888150 1 udp 2130706175 1.2.3.4 9876 typ host"
+            no_hash(candidate.to_string()),
+            "candidate:--- 1 udp 2130706175 1.2.3.4 9876 typ host"
         );
 
         candidate.ufrag = Some("ufrag".into());
         assert_eq!(
-            candidate.to_string(),
-            "candidate:12044049749558888150 1 udp 2130706175 1.2.3.4 9876 typ host ufrag ufrag"
+            no_hash(candidate.to_string()),
+            "candidate:--- 1 udp 2130706175 1.2.3.4 9876 typ host ufrag ufrag"
         );
 
         candidate.raddr = Some("5.5.5.5:5555".parse().unwrap());
         assert_eq!(
-            candidate.to_string(),
-            "candidate:6812072969737413130 1 udp 2130706175 1.2.3.4 9876 typ host raddr 5.5.5.5 rport 5555 ufrag ufrag");
+            no_hash(candidate.to_string()),
+            "candidate:--- 1 udp 2130706175 1.2.3.4 9876 typ host raddr 5.5.5.5 rport 5555 ufrag ufrag");
 
-        let candidate = Candidate::relayed(socket_addr, Protocol::SslTcp).unwrap();
+        let base_addr = "5.6.7.8:4321".parse().unwrap();
+
+        let candidate = Candidate::relayed(socket_addr, base_addr, Protocol::SslTcp).unwrap();
         assert_eq!(
-            candidate.to_string(),
-            "candidate:432709134138909083 1 ssltcp 16776959 1.2.3.4 9876 typ relay"
+            no_hash(candidate.to_string()),
+            "candidate:--- 1 ssltcp 16776959 1.2.3.4 9876 typ relay raddr 0.0.0.0 rport 0"
         );
     }
 
     #[test]
     fn new_from_sdp_string() {
         let candidate = Candidate::from_sdp_string(
-            "candidate:6812072969737413130 1 udp 2130706175 1.2.3.4 9876 typ host ufrag myuserfrag",
+            "candidate:fffeff7e5e895846293d220a 1 udp 2130706175 1.2.3.4 9876 typ host ufrag myuserfrag",
         )
         .unwrap();
 
@@ -630,8 +682,71 @@ mod tests {
     }
 
     #[test]
+    fn spoofed_raddr() {
+        let socket_addr = "1.2.3.4:9876".parse().unwrap();
+        let base_addr = "5.6.7.8:4321".parse().unwrap();
+
+        let host = Candidate::host(socket_addr, Protocol::Udp).unwrap();
+        assert!(host.raddr().is_none());
+
+        // We're not picky on the exact choice, but it must not be the private base
+        let relay = Candidate::relayed(socket_addr, base_addr, Protocol::Udp).unwrap();
+        assert!(relay.raddr().is_some());
+        let srflx = Candidate::server_reflexive(socket_addr, base_addr, Protocol::Udp).unwrap();
+        assert!(srflx.raddr().is_some_and(|raddr| raddr != base_addr));
+
+        let prflx = Candidate::peer_reflexive(
+            Protocol::Udp,
+            socket_addr,
+            base_addr,
+            1000,
+            None,
+            "ufrag".into(),
+        );
+        assert!(prflx.raddr().is_none());
+    }
+
+    #[test]
     fn bad_candidate() {
         let s = "candidate:12344 bad value";
         assert!(Candidate::from_sdp_string(s).is_err());
+    }
+
+    #[test]
+    fn lexical_ordering_of_sdp_is_follows_priority() {
+        let mut candidates = Vec::from([
+            host("1.1.1.1:0"),
+            host("2.2.2.2:0"),
+            srflx("3.3.3.3:0", "4.4.4.4:0"),
+            srflx("5.5.5.5:0", "6.6.6.6:0"),
+            relay("8.8.8.8:0", "7.7.7.7:0"),
+            relay("7.7.7.7:0", "8.8.8.8:0"),
+        ]);
+        candidates.sort();
+
+        assert!(candidates[0].contains("relay"));
+        assert!(candidates[1].contains("relay"));
+        assert!(candidates[2].contains("srflx"));
+        assert!(candidates[3].contains("srflx"));
+        assert!(candidates[4].contains("host"));
+        assert!(candidates[5].contains("host"));
+    }
+
+    fn host(socket: &str) -> String {
+        Candidate::host(socket.parse().unwrap(), "udp")
+            .unwrap()
+            .to_sdp_string()
+    }
+
+    fn srflx(addr: &str, base: &str) -> String {
+        Candidate::server_reflexive(addr.parse().unwrap(), base.parse().unwrap(), "udp")
+            .unwrap()
+            .to_sdp_string()
+    }
+
+    fn relay(addr: &str, base: &str) -> String {
+        Candidate::relayed(addr.parse().unwrap(), base.parse().unwrap(), "udp")
+            .unwrap()
+            .to_sdp_string()
     }
 }

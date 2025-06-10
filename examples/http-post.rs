@@ -18,16 +18,14 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 mod util;
 
 fn init_log() {
-    use std::env;
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "http_post=debug,str0m=debug");
-    }
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("http_post=debug,str0m=debug"));
 
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
+        .with(env_filter)
         .init();
 }
 
@@ -36,12 +34,16 @@ pub fn main() {
 
     let certificate = include_bytes!("cer.pem").to_vec();
     let private_key = include_bytes!("key.pem").to_vec();
+
+    // Figure out some public IP address, since Firefox will not accept 127.0.0.1 for WebRTC traffic.
+    let host_addr = util::select_host_address();
+
     let server = Server::new_ssl("0.0.0.0:3000", web_request, certificate, private_key)
         .expect("starting the web server");
-    info!(
-        "Connect a browser to https://10.0.0.103:{}",
-        server.server_addr().port()
-    );
+
+    let port = server.server_addr().port();
+    info!("Connect a browser to https://{:?}:{:?}", host_addr, port);
+
     server.run();
 }
 
@@ -61,9 +63,9 @@ fn web_request(request: &Request) -> Response {
 
     // Spin up a UDP socket for the RTC
     let socket = UdpSocket::bind(format!("{addr}:0")).expect("binding a random UDP port");
-    let addr = socket.local_addr().expect("a local socket adddress");
+    let addr = socket.local_addr().expect("a local socket address");
     let candidate = Candidate::host(addr, "udp").expect("a host candidate");
-    rtc.add_local_candidate(candidate);
+    rtc.add_local_candidate(candidate).unwrap();
 
     // Create an SDP Answer.
     let answer = rtc

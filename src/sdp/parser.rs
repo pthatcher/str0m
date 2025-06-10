@@ -1,17 +1,15 @@
+use combine::error::*;
+use combine::parser::char::*;
+use combine::parser::combinator::*;
+use combine::stream::StreamErrorFor;
+use combine::*;
+use combine::{ParseError, Parser, Stream};
 use std::net::{IpAddr, SocketAddr};
-use {
-    combine::error::*,
-    combine::parser::char::*,
-    combine::parser::combinator::*,
-    combine::stream::StreamErrorFor,
-    combine::*,
-    combine::{ParseError, Parser, Stream},
-};
 
-use crate::dtls::Fingerprint;
-use crate::ice::{Candidate, CandidateKind};
+use crate::crypto::Fingerprint;
 use crate::rtp_::{Direction, Extension, Frequency, Mid, Pt, SessionId, Ssrc};
 use crate::sdp::SdpError;
+use crate::{Candidate, CandidateKind};
 
 use super::data::*;
 
@@ -27,12 +25,13 @@ where
     })
 }
 
-/// /////////////////////////////////////////////////// Session description
+// /////////////////////////////////////////////////// Session description
 
 /// 1. First line must be v=0
 /// 2. The second SDP line MUST be an "o=" line The sess-id MUST be representable by a 64-bit signed
 ///    integer, and the initial value MUST be less than (2**62)-1
 /// 3. Third line a single dash SHOULD be used as the session name, e.g. "s=-"
+///
 /// Session is over when we find a "t=" line MUST be added, both <start-time> and <stop-time>
 ///    SHOULD be set to zero, e.g. "t=0 0".
 pub fn session_parser<Input>() -> impl Parser<Input, Output = Session>
@@ -317,8 +316,7 @@ where
 }
 
 /// Parser for a=candidate lines.
-#[doc(hidden)]
-pub fn candidate_attribute<Input>() -> impl Parser<Input, Output = Candidate>
+pub(crate) fn candidate_attribute<Input>() -> impl Parser<Input, Output = Candidate>
 where
     Input: Stream<Token = char>,
     Input::Error: ParseError<Input::Token, Input::Range, Input::Position>,
@@ -354,7 +352,7 @@ where
     line(ignored, any_value()).map(|_| ())
 }
 
-/// /////////////////////////////////////////////////// Media description
+// /////////////////////////////////////////////////// Media description
 
 /// A m= section with attributes, until next m= or EOF
 fn media_parser<Input>() -> impl Parser<Input, Output = MediaLine>
@@ -782,7 +780,8 @@ where
         unused,
     ))
 }
-/// /////////////////////////////////////////////////// Generic things below
+
+// /////////////////////////////////////////////////// Generic things below
 
 /// A specific line
 fn typed_line<Input, Pval, Out>(expected: char, val: Pval) -> impl Parser<Input, Output = Out>
@@ -1372,18 +1371,22 @@ mod test {
 // a=ssrc:2147603131 label:7a08dda6-518f-4027-b707-410a6d414176
 
 // Chrome add video
-// sendEncodings: [
-//       { rid: 'hi' },
-//       { rid: 'lo', scaleResolutionDownBy: 2 },
+// pc.addTransceiver("video", {
+//     direction: 'sendonly',
+//     sendEncodings: [
+//         { rid: 'hi' },
+//         { rid: 'lo', scaleResolutionDownBy: 2 },
 //     ]
+// })
 
 // v=0
 // o=- 2847298852000198709 3 IN IP4 127.0.0.1
 // s=-
 // t=0 0
 // a=group:BUNDLE 0
+// a=extmap-allow-mixed
 // a=msid-semantic: WMS
-// m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101 102 120 127 119 125 107 108 109 124 118 123
+// m=video 9 UDP/TLS/RTP/SAVPF 96 97 102 103 104 105 106 107 108 109 127 125 39 40 45 46 98 99 100 101 112 113 114
 // c=IN IP4 0.0.0.0
 // a=rtcp:9 IN IP4 0.0.0.0
 // a=ice-ufrag:numD
@@ -1403,6 +1406,8 @@ mod test {
 // a=extmap:9 urn:ietf:params:rtp-hdrext:sdes:mid
 // a=extmap:10 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id
 // a=extmap:11 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id
+// a=extmap:13 https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
+// a=extmap:14 http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00
 // a=sendonly
 // a=msid:- 7d27ad91-4770-4a4d-a053-2b06233753d2
 // a=rtcp-mux
@@ -1415,6 +1420,69 @@ mod test {
 // a=rtcp-fb:96 nack pli
 // a=rtpmap:97 rtx/90000
 // a=fmtp:97 apt=96
+// a=rtpmap:102 H264/90000
+// a=rtcp-fb:102 goog-remb
+// a=rtcp-fb:102 transport-cc
+// a=rtcp-fb:102 ccm fir
+// a=rtcp-fb:102 nack
+// a=rtcp-fb:102 nack pli
+// a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
+// a=rtpmap:103 rtx/90000
+// a=fmtp:103 apt=102
+// a=rtpmap:104 H264/90000
+// a=rtcp-fb:104 goog-remb
+// a=rtcp-fb:104 transport-cc
+// a=rtcp-fb:104 ccm fir
+// a=rtcp-fb:104 nack
+// a=rtcp-fb:104 nack pli
+// a=fmtp:104 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f
+// a=rtpmap:105 rtx/90000
+// a=fmtp:105 apt=104
+// a=rtpmap:106 H264/90000
+// a=rtcp-fb:106 goog-remb
+// a=rtcp-fb:106 transport-cc
+// a=rtcp-fb:106 ccm fir
+// a=rtcp-fb:106 nack
+// a=rtcp-fb:106 nack pli
+// a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
+// a=rtpmap:107 rtx/90000
+// a=fmtp:107 apt=106
+// a=rtpmap:108 H264/90000
+// a=rtcp-fb:108 goog-remb
+// a=rtcp-fb:108 transport-cc
+// a=rtcp-fb:108 ccm fir
+// a=rtcp-fb:108 nack
+// a=rtcp-fb:108 nack pli
+// a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+// a=rtpmap:109 rtx/90000
+// a=fmtp:109 apt=108
+// a=rtpmap:127 H264/90000
+// a=rtcp-fb:127 goog-remb
+// a=rtcp-fb:127 transport-cc
+// a=rtcp-fb:127 ccm fir
+// a=rtcp-fb:127 nack
+// a=rtcp-fb:127 nack pli
+// a=fmtp:127 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f
+// a=rtpmap:125 rtx/90000
+// a=fmtp:125 apt=127
+// a=rtpmap:39 H264/90000
+// a=rtcp-fb:39 goog-remb
+// a=rtcp-fb:39 transport-cc
+// a=rtcp-fb:39 ccm fir
+// a=rtcp-fb:39 nack
+// a=rtcp-fb:39 nack pli
+// a=fmtp:39 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=4d001f
+// a=rtpmap:40 rtx/90000
+// a=fmtp:40 apt=39
+// a=rtpmap:45 AV1/90000
+// a=rtcp-fb:45 goog-remb
+// a=rtcp-fb:45 transport-cc
+// a=rtcp-fb:45 ccm fir
+// a=rtcp-fb:45 nack
+// a=rtcp-fb:45 nack pli
+// a=fmtp:45 level-idx=5;profile=0;tier=0
+// a=rtpmap:46 rtx/90000
+// a=fmtp:46 apt=45
 // a=rtpmap:98 VP9/90000
 // a=rtcp-fb:98 goog-remb
 // a=rtcp-fb:98 transport-cc
@@ -1433,46 +1501,10 @@ mod test {
 // a=fmtp:100 profile-id=2
 // a=rtpmap:101 rtx/90000
 // a=fmtp:101 apt=100
-// a=rtpmap:102 H264/90000
-// a=rtcp-fb:102 goog-remb
-// a=rtcp-fb:102 transport-cc
-// a=rtcp-fb:102 ccm fir
-// a=rtcp-fb:102 nack
-// a=rtcp-fb:102 nack pli
-// a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
-// a=rtpmap:120 rtx/90000
-// a=fmtp:120 apt=102
-// a=rtpmap:127 H264/90000
-// a=rtcp-fb:127 goog-remb
-// a=rtcp-fb:127 transport-cc
-// a=rtcp-fb:127 ccm fir
-// a=rtcp-fb:127 nack
-// a=rtcp-fb:127 nack pli
-// a=fmtp:127 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f
-// a=rtpmap:119 rtx/90000
-// a=fmtp:119 apt=127
-// a=rtpmap:125 H264/90000
-// a=rtcp-fb:125 goog-remb
-// a=rtcp-fb:125 transport-cc
-// a=rtcp-fb:125 ccm fir
-// a=rtcp-fb:125 nack
-// a=rtcp-fb:125 nack pli
-// a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
-// a=rtpmap:107 rtx/90000
-// a=fmtp:107 apt=125
-// a=rtpmap:108 H264/90000
-// a=rtcp-fb:108 goog-remb
-// a=rtcp-fb:108 transport-cc
-// a=rtcp-fb:108 ccm fir
-// a=rtcp-fb:108 nack
-// a=rtcp-fb:108 nack pli
-// a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
-// a=rtpmap:109 rtx/90000
-// a=fmtp:109 apt=108
-// a=rtpmap:124 red/90000
-// a=rtpmap:118 rtx/90000
-// a=fmtp:118 apt=124
-// a=rtpmap:123 ulpfec/90000
+// a=rtpmap:112 red/90000
+// a=rtpmap:113 rtx/90000
+// a=fmtp:113 apt=112
+// a=rtpmap:114 ulpfec/90000
 // a=rid:hi send
 // a=rid:lo send
 // a=simulcast:send hi;lo

@@ -1,6 +1,17 @@
 #![allow(clippy::all)]
 
-use super::{CodecExtra, Depacketizer, MediaKind, PacketError, Packetizer};
+use super::{CodecExtra, Depacketizer, PacketError, Packetizer};
+
+/// H264 information describing the depacketized / packetized data
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct H264CodecExtra {
+    /// Flag which indicates that within [`MediaData`], there is an individual frame
+    /// containing complete and independent visual information. This frame serves
+    /// as a reference point for other frames in the video sequence.
+    ///
+    /// [`MediaData`]: crate::media::MediaData
+    pub is_keyframe: bool,
+}
 
 /// Packetizes H264 RTP packets.
 #[derive(Default, Debug, Clone)]
@@ -12,6 +23,7 @@ pub struct H264Packetizer {
 pub const STAPA_NALU_TYPE: u8 = 24;
 pub const FUA_NALU_TYPE: u8 = 28;
 pub const FUB_NALU_TYPE: u8 = 29;
+pub const IDR_NALU_TYPE: u8 = 5;
 pub const SPS_NALU_TYPE: u8 = 7;
 pub const PPS_NALU_TYPE: u8 = 8;
 pub const AUD_NALU_TYPE: u8 = 9;
@@ -188,7 +200,7 @@ impl Packetizer for H264Packetizer {
         Ok(payloads)
     }
 
-    fn is_marker(&mut self, data: &[u8], previous: Option<&[u8]>, last: bool) -> bool {
+    fn is_marker(&mut self, _data: &[u8], _previous: Option<&[u8]>, last: bool) -> bool {
         last
     }
 }
@@ -201,12 +213,13 @@ pub struct H264Depacketizer {
 }
 
 impl Depacketizer for H264Depacketizer {
-    /// depacketize parses the passed byte slice and stores the result in the H264Packet this method is called upon
+    /// depacketize parses the passed byte slice and stores the result in the
+    /// H264Packet this method is called upon
     fn depacketize(
         &mut self,
         packet: &[u8],
         out: &mut Vec<u8>,
-        _: &mut CodecExtra,
+        extra: &mut CodecExtra,
     ) -> Result<(), PacketError> {
         if packet.len() == 0 {
             return Err(PacketError::ErrShortPacket);
@@ -218,7 +231,14 @@ impl Depacketizer for H264Depacketizer {
         let nalu_type = b0 & NALU_TYPE_BITMASK;
 
         match nalu_type {
-            1..=23 => {
+            t @ 1..=23 => {
+                let is_keyframe = if let CodecExtra::H264(e) = extra {
+                    (t == IDR_NALU_TYPE) | e.is_keyframe
+                } else {
+                    t == IDR_NALU_TYPE
+                };
+                *extra = CodecExtra::H264(H264CodecExtra { is_keyframe });
+
                 if self.is_avc {
                     out.extend_from_slice(&(packet.len() as u32).to_be_bytes());
                 } else {
@@ -229,17 +249,28 @@ impl Depacketizer for H264Depacketizer {
             }
             STAPA_NALU_TYPE => {
                 let mut curr_offset = STAPA_HEADER_SIZE;
-                while curr_offset < packet.len() {
+                while curr_offset + 1 < packet.len() {
                     let nalu_size =
                         ((packet[curr_offset] as usize) << 8) | packet[curr_offset + 1] as usize;
                     curr_offset += STAPA_NALU_LENGTH_SIZE;
 
-                    if packet.len() < curr_offset + nalu_size {
+                    if curr_offset + nalu_size > packet.len() {
                         return Err(PacketError::StapASizeLargerThanBuffer(
                             nalu_size,
                             packet.len() - curr_offset,
                         ));
                     }
+
+                    let Some(b0) = packet.get(curr_offset) else {
+                        continue;
+                    };
+                    let t = b0 & NALU_TYPE_BITMASK;
+                    let is_keyframe = if let CodecExtra::H264(e) = extra {
+                        (t == IDR_NALU_TYPE) | e.is_keyframe
+                    } else {
+                        t == IDR_NALU_TYPE
+                    };
+                    *extra = CodecExtra::H264(H264CodecExtra { is_keyframe });
 
                     if self.is_avc {
                         out.extend_from_slice(&(nalu_size as u32).to_be_bytes());
@@ -269,6 +300,13 @@ impl Depacketizer for H264Depacketizer {
                 if b1 & FU_END_BITMASK != 0 {
                     let nalu_ref_idc = b0 & NALU_REF_IDC_BITMASK;
                     let fragmented_nalu_type = b1 & NALU_TYPE_BITMASK;
+
+                    let is_keyframe = if let CodecExtra::H264(e) = extra {
+                        (fragmented_nalu_type == IDR_NALU_TYPE) | e.is_keyframe
+                    } else {
+                        fragmented_nalu_type == IDR_NALU_TYPE
+                    };
+                    *extra = CodecExtra::H264(H264CodecExtra { is_keyframe });
 
                     if let Some(fua_buffer) = self.fua_buffer.take() {
                         if self.is_avc {
@@ -380,20 +418,97 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test_h264_packet_unmarshal() -> Result<(), PacketError> {
-        let single_payload = &[0x90, 0x90, 0x90];
-        let single_payload_unmarshaled = &[0x00, 0x00, 0x00, 0x01, 0x90, 0x90, 0x90];
-        let single_payload_unmarshaled_avc = &[0x00, 0x00, 0x00, 0x03, 0x90, 0x90, 0x90];
+    macro_rules! test_h264 {
+        ($name:tt, $is_avc:expr, $is_ok: expr, $payload:expr, $err:tt) => {
+            #[test]
+            fn $name() -> Result<(), PacketError> {
+                let mut pkt = H264Depacketizer::default();
+                pkt.is_avc = $is_avc;
+                let mut extra = CodecExtra::None;
+                let mut out: Vec<u8> = Vec::new();
+                let result = pkt.depacketize($payload, &mut out, &mut extra);
+                if $is_ok {
+                    assert!(result.is_ok(), $err);
+                } else {
+                    assert!(result.is_err(), $err);
+                }
+                Ok(())
+            }
+        };
+    }
 
-        let large_payload = &[
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-        ];
-        let large_payload_avc = &[
-            0x00, 0x00, 0x00, 0x10, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-        ];
+    test_h264!(
+        nil_payload,
+        false,
+        false,
+        &[],
+        "Unmarshal did not fail on nil payload"
+    );
+    test_h264!(
+        unit_delimiter,
+        false,
+        true,
+        &[0x09, 0x30],
+        "Unmarshal should accept minimal h.264 access unit delimiter"
+    );
+    test_h264!(
+        end_of_sequence_nalu,
+        false,
+        true,
+        &[0x0A],
+        "Unmarshal should accept end of sequence NALU"
+    );
+    test_h264!(
+        not_handled,
+        false,
+        false,
+        &[0xFF, 0x00, 0x00],
+        "Unmarshal accepted a packet with a NALU Type we don't handle"
+    );
+    test_h264!(
+        incomplete_single_payload_multi_nalu,
+        false,
+        false,
+        &[
+            0x78, 0x00, 0x0f, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a, 0x40,
+            0x3c, 0x22, 0x11,
+        ],
+        "Unmarshal accepted a STAP-A packet with insufficient data"
+    );
+
+    #[test]
+    fn single_payload() -> Result<(), PacketError> {
+        let mut pkt = H264Depacketizer::default();
+        let mut extra = CodecExtra::None;
+        let mut out: Vec<u8> = Vec::new();
+        let single_payload = &[0x90, 0x90, 0x90];
+        let _ = pkt.depacketize(single_payload, &mut out, &mut extra);
+        let single_payload_unmarshaled = &[0x00, 0x00, 0x00, 0x01, 0x90, 0x90, 0x90];
+        assert_eq!(
+            out, single_payload_unmarshaled,
+            "Unmarshaling a single payload shouldn't modify the payload"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn single_payload_avc() -> Result<(), PacketError> {
+        let mut pkt = H264Depacketizer::default();
+        pkt.is_avc = true;
+        let mut extra = CodecExtra::None;
+        let mut out: Vec<u8> = Vec::new();
+        let single_payload = &[0x90, 0x90, 0x90];
+        let _ = pkt.depacketize(single_payload, &mut out, &mut extra);
+        let single_payload_unmarshaled_avc = &[0x00, 0x00, 0x00, 0x03, 0x90, 0x90, 0x90];
+        assert_eq!(
+            out, single_payload_unmarshaled_avc,
+            "Unmarshaling a single payload into avc stream shouldn't modify the payload"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn h264_large_out() -> Result<(), PacketError> {
         let large_payload_packetized = vec![
             &[0x1c, 0x80, 0x01, 0x02, 0x03],
             &[0x1c, 0x00, 0x04, 0x05, 0x06],
@@ -402,81 +517,13 @@ mod test {
             &[0x1c, 0x40, 0x13, 0x14, 0x15],
         ];
 
-        let single_payload_multi_nalu = &[
-            0x78, 0x00, 0x0f, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a, 0x40,
-            0x3c, 0x22, 0x11, 0xa8, 0x00, 0x05, 0x68, 0x1a, 0x34, 0xe3, 0xc8,
-        ];
-        let single_payload_multi_nalu_unmarshaled = &[
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a,
-            0x40, 0x3c, 0x22, 0x11, 0xa8, 0x00, 0x00, 0x00, 0x01, 0x68, 0x1a, 0x34, 0xe3, 0xc8,
-        ];
-        let single_payload_multi_nalu_unmarshaled_avc = &[
-            0x00, 0x00, 0x00, 0x0f, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a,
-            0x40, 0x3c, 0x22, 0x11, 0xa8, 0x00, 0x00, 0x00, 0x05, 0x68, 0x1a, 0x34, 0xe3, 0xc8,
-        ];
-
-        let incomplete_single_payload_multi_nalu = &[
-            0x78, 0x00, 0x0f, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a, 0x40,
-            0x3c, 0x22, 0x11,
+        let large_payload = &[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
         ];
 
         let mut pkt = H264Depacketizer::default();
-        let mut avc_pkt = H264Depacketizer {
-            is_avc: true,
-            ..Default::default()
-        };
-
         let mut extra = CodecExtra::None;
-
-        let data = &[];
-        let mut out = Vec::new();
-        let result = pkt.depacketize(data, &mut out, &mut extra);
-        assert!(result.is_err(), "Unmarshal did not fail on nil payload");
-
-        let data = &[0x09, 0x30];
-        let mut out = Vec::new();
-        let result = pkt.depacketize(data, &mut out, &mut extra);
-        assert!(
-            result.is_ok(),
-            "Unmarshal should accept minimal h.264 access unit delimiter"
-        );
-
-        let data = &[0x0A];
-        let mut out = Vec::new();
-        let result = pkt.depacketize(data, &mut out, &mut extra);
-        assert!(
-            result.is_ok(),
-            "Unmarshal should accept end of sequence NALU"
-        );
-
-        let data = &[0xFF, 0x00, 0x00];
-        let mut out = Vec::new();
-        let result = pkt.depacketize(data, &mut out, &mut extra);
-        assert!(
-            result.is_err(),
-            "Unmarshal accepted a packet with a NALU Type we don't handle"
-        );
-
-        let mut out = Vec::new();
-        let result = pkt.depacketize(incomplete_single_payload_multi_nalu, &mut out, &mut extra);
-        assert!(
-            result.is_err(),
-            "Unmarshal accepted a STAP-A packet with insufficient data"
-        );
-
-        let mut out = Vec::new();
-        pkt.depacketize(single_payload, &mut out, &mut extra)?;
-        assert_eq!(
-            out, single_payload_unmarshaled,
-            "Unmarshaling a single payload shouldn't modify the payload"
-        );
-
-        let mut out = Vec::new();
-        avc_pkt.depacketize(single_payload, &mut out, &mut extra)?;
-        assert_eq!(
-            out, single_payload_unmarshaled_avc,
-            "Unmarshaling a single payload into avc stream shouldn't modify the payload"
-        );
 
         let mut large_out = Vec::new();
         for p in &large_payload_packetized {
@@ -487,6 +534,31 @@ mod test {
             "Failed to unmarshal a large payload"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn h264_large_out_avc() -> Result<(), PacketError> {
+        let large_payload_packetized = vec![
+            &[0x1c, 0x80, 0x01, 0x02, 0x03],
+            &[0x1c, 0x00, 0x04, 0x05, 0x06],
+            &[0x1c, 0x00, 0x07, 0x08, 0x09],
+            &[0x1c, 0x00, 0x10, 0x11, 0x12],
+            &[0x1c, 0x40, 0x13, 0x14, 0x15],
+        ];
+
+        let large_payload_avc = &[
+            0x00, 0x00, 0x00, 0x10, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+        ];
+
+        let mut avc_pkt = H264Depacketizer {
+            is_avc: true,
+            ..Default::default()
+        };
+
+        let mut extra = CodecExtra::None;
+
         let mut large_out_avc = Vec::new();
         for p in &large_payload_packetized {
             avc_pkt.depacketize(*p, &mut large_out_avc, &mut extra)?;
@@ -496,12 +568,49 @@ mod test {
             "Failed to unmarshal a large payload into avc stream"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn single_payload_multi_nalu() -> Result<(), PacketError> {
+        let single_payload_multi_nalu = &[
+            0x78, 0x00, 0x0f, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a, 0x40,
+            0x3c, 0x22, 0x11, 0xa8, 0x00, 0x05, 0x68, 0x1a, 0x34, 0xe3, 0xc8, 0x00,
+        ];
+        let single_payload_multi_nalu_unmarshaled = &[
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a,
+            0x40, 0x3c, 0x22, 0x11, 0xa8, 0x00, 0x00, 0x00, 0x01, 0x68, 0x1a, 0x34, 0xe3, 0xc8,
+        ];
+
+        let mut pkt = H264Depacketizer::default();
+
+        let mut extra = CodecExtra::None;
+
         let mut out = Vec::new();
         pkt.depacketize(single_payload_multi_nalu, &mut out, &mut extra)?;
         assert_eq!(
             out, single_payload_multi_nalu_unmarshaled,
             "Failed to unmarshal a single packet with multiple NALUs"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn single_payload_multi_nalu_avc() -> Result<(), PacketError> {
+        let single_payload_multi_nalu = &[
+            0x78, 0x00, 0x0f, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a, 0x40,
+            0x3c, 0x22, 0x11, 0xa8, 0x00, 0x05, 0x68, 0x1a, 0x34, 0xe3, 0xc8, 0x00,
+        ];
+        let single_payload_multi_nalu_unmarshaled_avc = &[
+            0x00, 0x00, 0x00, 0x0f, 0x67, 0x42, 0xc0, 0x1f, 0x1a, 0x32, 0x35, 0x01, 0x40, 0x7a,
+            0x40, 0x3c, 0x22, 0x11, 0xa8, 0x00, 0x00, 0x00, 0x05, 0x68, 0x1a, 0x34, 0xe3, 0xc8,
+        ];
+
+        let mut avc_pkt = H264Depacketizer::default();
+        avc_pkt.is_avc = true;
+
+        let mut extra = CodecExtra::None;
 
         let mut out = Vec::new();
         avc_pkt.depacketize(single_payload_multi_nalu, &mut out, &mut extra)?;
@@ -582,5 +691,81 @@ mod test {
         assert_eq!(actual, expected, "SPS and PPS aren't packed together");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_h264_depacketizer_idr_handling() -> Result<(), PacketError> {
+        let mut pck = H264Depacketizer::default();
+        let mut extra = CodecExtra::None;
+        let mut out = vec![];
+
+        // First byte is NALU type
+        let packet = [0x85];
+        pck.depacketize(&packet, &mut out, &mut extra)?;
+        let CodecExtra::H264(e) = extra else {
+            panic!("Expected CodecExtra::H264");
+        };
+        assert!(e.is_keyframe);
+
+        // First byte is STAPA NALU type
+        let packet = vec![
+            vec![
+                120, 0, 15, 103, 66, 192, 21, 140, 141, 64, 160, 203, 207, 0, 240, 136, 70, 160, 0,
+                4, 104, 206, 60, 128, 1, 20, 101,
+            ],
+            vec![0; 276],
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        pck.depacketize(packet.as_slice(), &mut out, &mut extra)?;
+        let CodecExtra::H264(e) = extra else {
+            panic!("Expected CodecExtra::H264");
+        };
+        assert!(e.is_keyframe);
+
+        // First byte is FUA NALU type
+        let packet = [124, 69];
+        pck.depacketize(&packet, &mut out, &mut extra)?;
+        let CodecExtra::H264(e) = extra else {
+            panic!("Expected CodecExtra::H264");
+        };
+        assert!(e.is_keyframe);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_first_packet() {
+        const PACKET: &[u8] = &[
+            120, 000, 015, 103, 066, 192, 021, 140, 141, 064, 160, 203, 207, 000, 240, 136, 070,
+            160, 000, 004, 104, 206, 060, 128, 000, 204, 101, 184, 000, 004, 000, 000, 005, 057,
+            049, 064, 000, 064, 222, 078, 078, 078, 078, 078, 078, 078, 078, 078, 078, 078, 078,
+            078, 078, 078, 078, 078, 078, 078, 186, 235, 174, 186, 235, 174, 186, 235, 174, 186,
+            235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174,
+            186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 173, 223, 039, 125, 247, 223,
+            125, 245, 215, 093, 117, 215, 093, 117, 214, 239, 174, 187, 235, 174, 186, 235, 174,
+            186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235,
+            174, 186, 235, 174, 183, 093, 117, 215, 093, 117, 215, 093, 117, 215, 093, 117, 215,
+            093, 117, 215, 093, 117, 215, 092, 189, 117, 215, 093, 117, 215, 093, 117, 215, 093,
+            117, 215, 093, 117, 215, 093, 117, 215, 093, 117, 214, 239, 190, 251, 239, 190, 186,
+            235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174, 186, 235, 174,
+            186, 235, 174, 186, 235, 175, 227, 255, 240, 247, 021, 223, 125, 247, 223, 125, 247,
+            223, 125, 247, 223, 125, 247, 223, 125, 248,
+        ];
+
+        let mut pck = H264Depacketizer::default();
+        let mut extra = CodecExtra::None;
+        let mut out = vec![];
+        pck.depacketize(PACKET, &mut out, &mut extra).unwrap();
+    }
+
+    #[test]
+    fn test_out_of_bounds_access() {
+        const PACKET: &[u8] = &[STAPA_NALU_TYPE, 0x00, 0x00];
+
+        let mut pck = H264Depacketizer::default();
+        let mut extra = CodecExtra::None;
+        let mut out = vec![];
+        pck.depacketize(PACKET, &mut out, &mut extra).unwrap();
     }
 }

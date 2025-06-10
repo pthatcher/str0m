@@ -1,6 +1,6 @@
-use crate::rtp_::{extend_u15, extend_u16, extend_u7, extend_u8};
+use crate::rtp_::{extend_u15, extend_u7, extend_u8};
 
-use super::{BitRead, CodecExtra, Depacketizer, MediaKind, PacketError, Packetizer};
+use super::{BitRead, CodecExtra, Depacketizer, PacketError, Packetizer};
 
 pub const VP8_HEADER_SIZE: usize = 1;
 
@@ -18,6 +18,12 @@ pub struct Vp8CodecExtra {
     pub picture_id: Option<u64>,
     /// Extended picture id of layer 0 frames, if present
     pub tl0_picture_id: Option<u64>,
+    /// Flag which indicates that within [`MediaData`], there is an individual frame
+    /// containing complete and independent visual information. This frame serves
+    /// as a reference point for other frames in the video sequence.
+    ///
+    /// [`MediaData`]: crate::media::MediaData
+    pub is_keyframe: bool,
 }
 
 /// Packetizes VP8 RTP packets.
@@ -115,7 +121,7 @@ impl Packetizer for Vp8Packetizer {
         Ok(payloads)
     }
 
-    fn is_marker(&mut self, data: &[u8], previous: Option<&[u8]>, last: bool) -> bool {
+    fn is_marker(&mut self, _data: &[u8], _previous: Option<&[u8]>, last: bool) -> bool {
         last
     }
 }
@@ -159,10 +165,16 @@ pub struct Vp8Depacketizer {
     pub y: u8,
     /// 5 bits temporal key frame index
     pub key_idx: u8,
+
+    /// Inverse key frame flag.
+    ///
+    /// 0 if the current frame is a key frame.
+    pub p: u8,
 }
 
 impl Depacketizer for Vp8Depacketizer {
-    /// depacketize parses the passed byte slice and stores the result in the VP8Packet this method is called upon
+    /// depacketize parses the passed byte slice and stores the result in the
+    /// VP8Packet this method is called upon
     fn depacketize(
         &mut self,
         packet: &[u8],
@@ -170,9 +182,9 @@ impl Depacketizer for Vp8Depacketizer {
         extra: &mut CodecExtra,
     ) -> Result<(), PacketError> {
         let payload_len = packet.len();
-        if payload_len < 4 {
-            return Err(PacketError::ErrShortPacket);
-        }
+        // VP8 Payload Descriptor
+        // https://datatracker.ietf.org/doc/html/rfc7741#section-4.2
+        //
         //    0 1 2 3 4 5 6 7                      0 1 2 3 4 5 6 7
         //    +-+-+-+-+-+-+-+-+                   +-+-+-+-+-+-+-+-+
         //    |X|R|N|S|R| PID | (REQUIRED)        |X|R|N|S|R| PID | (REQUIRED)
@@ -185,13 +197,13 @@ impl Depacketizer for Vp8Depacketizer {
         //    +-+-+-+-+-+-+-+-+                   +-+-+-+-+-+-+-+-+
         //T/K:|tid|Y| KEYIDX  | (OPTIONAL)   L:   |   tl0picidx   | (OPTIONAL)
         //    +-+-+-+-+-+-+-+-+                   +-+-+-+-+-+-+-+-+
-        //T/K:|tid|Y| KEYIDX  | (OPTIONAL)
-        //    +-+-+-+-+-+-+-+-+
+        //                                    T/K:|tid|Y| KEYIDX  | (OPTIONAL)
+        //                                        +-+-+-+-+-+-+-+-+
 
         let mut reader = (packet, 0);
         let mut payload_index = 0;
 
-        let mut b = reader.get_u8();
+        let mut b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
         payload_index += 1;
 
         self.x = (b & 0x80) >> 7;
@@ -200,7 +212,7 @@ impl Depacketizer for Vp8Depacketizer {
         self.pid = b & 0x07;
 
         if self.x == 1 {
-            b = reader.get_u8();
+            b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             payload_index += 1;
             self.i = (b & 0x80) >> 7;
             self.l = (b & 0x40) >> 6;
@@ -209,12 +221,13 @@ impl Depacketizer for Vp8Depacketizer {
         }
 
         if self.i == 1 {
-            b = reader.get_u8();
+            b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             payload_index += 1;
             // PID present?
             if b & 0x80 > 0 {
                 // M == 1, PID is 16bit
-                self.picture_id = (((b & 0x7f) as u16) << 8) | (reader.get_u8() as u16);
+                let x = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
+                self.picture_id = (((b & 0x7f) as u16) << 8) | (x as u16);
                 self.extended_pid = Some(extend_u15(self.extended_pid, self.picture_id));
                 payload_index += 1;
             } else {
@@ -228,7 +241,7 @@ impl Depacketizer for Vp8Depacketizer {
         }
 
         if self.l == 1 {
-            self.tl0_pic_idx = reader.get_u8();
+            self.tl0_pic_idx = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             self.extended_tl0_pic_idx =
                 Some(extend_u8(self.extended_tl0_pic_idx, self.tl0_pic_idx));
             payload_index += 1;
@@ -239,7 +252,7 @@ impl Depacketizer for Vp8Depacketizer {
         }
 
         if self.t == 1 || self.k == 1 {
-            let b = reader.get_u8();
+            let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             if self.t == 1 {
                 self.tid = b >> 6;
                 self.y = (b >> 5) & 0x1;
@@ -256,6 +269,42 @@ impl Depacketizer for Vp8Depacketizer {
 
         out.extend_from_slice(&packet[payload_index..]);
 
+        // VP8 Payload Header
+        // https://datatracker.ietf.org/doc/html/rfc7741#section-4.3
+        //
+        //  0 1 2 3 4 5 6 7
+        // +-+-+-+-+-+-+-+-+
+        // |Size0|H| VER |P|
+        // +-+-+-+-+-+-+-+-+
+        // |     Size1     |
+        // +-+-+-+-+-+-+-+-+
+        // |     Size2     |
+        // +-+-+-+-+-+-+-+-+
+        // | Octets 4..N of|
+        // | VP8 payload   |
+        // :               :
+        // +-+-+-+-+-+-+-+-+
+        // | OPTIONAL RTP  |
+        // | padding       |
+        // :               :
+        // +-+-+-+-+-+-+-+-+
+        //
+        // The header is present only in packets that have the S bit equal
+        // to one and the PID equal to zero in the payload descriptor
+        self.p = if self.s == 1 && self.pid == 0 {
+            b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
+            payload_index += 1;
+            b & 1
+        } else {
+            1
+        };
+
+        let is_keyframe = if let CodecExtra::Vp8(e) = extra {
+            e.is_keyframe | (self.p == 0)
+        } else {
+            self.p == 0
+        };
+
         *extra = CodecExtra::Vp8(Vp8CodecExtra {
             discardable: self.n == 1,
             sync: self.y == 1,
@@ -266,7 +315,11 @@ impl Depacketizer for Vp8Depacketizer {
             } else {
                 None
             },
+            is_keyframe,
         });
+
+        let _ = payload_index;
+
         Ok(())
     }
 
@@ -299,14 +352,15 @@ mod test {
         let result = pck.depacketize(empty_bytes, &mut payload, &mut extra);
         assert!(result.is_err(), "Result should be err in case of error");
 
-        // Payload smaller than header size
+        // Small Payload with single octet header
         let small_bytes = &[0x00, 0x11, 0x22];
         let mut payload = Vec::new();
-        let result = pck.depacketize(small_bytes, &mut payload, &mut extra);
-        assert!(result.is_err(), "Result should be err in case of error");
+        pck.depacketize(small_bytes, &mut payload, &mut extra)
+            .expect("Small packet");
+        assert_eq!(payload, [0x11, 0x22]);
 
-        // Payload smaller than header size
-        let small_bytes = &[0x00, 0x11];
+        // Payload is header only
+        let small_bytes = &[0x00];
         let mut payload = Vec::new();
         let result = pck.depacketize(small_bytes, &mut payload, &mut extra);
         assert!(result.is_err(), "Result should be err in case of error");
@@ -329,6 +383,7 @@ mod test {
         assert_eq!(pck.l, 0, "L must be 0");
         assert_eq!(pck.t, 0, "T must be 0");
         assert_eq!(pck.k, 0, "K must be 0");
+        assert_eq!(pck.p, 1, "P must be 1");
 
         // Header size, X and I, PID 16bits
         let raw_bytes = &[0x80, 0x80, 0x81, 0x00, 0x00];
@@ -341,6 +396,7 @@ mod test {
         assert_eq!(pck.l, 0, "L must be 0");
         assert_eq!(pck.t, 0, "T must be 0");
         assert_eq!(pck.k, 0, "K must be 0");
+        assert_eq!(pck.p, 1, "P must be 1");
 
         // Header size, X and L
         let raw_bytes = &[0x80, 0x40, 0x00, 0x00];
@@ -353,6 +409,7 @@ mod test {
         assert_eq!(pck.l, 1, "L must be 1");
         assert_eq!(pck.t, 0, "T must be 0");
         assert_eq!(pck.k, 0, "K must be 0");
+        assert_eq!(pck.p, 1, "P must be 1");
 
         // Header size, X and T
         let raw_bytes = &[0x80, 0x20, 0x00, 0x00];
@@ -365,6 +422,7 @@ mod test {
         assert_eq!(pck.l, 0, "L must be 0");
         assert_eq!(pck.t, 1, "T must be 1");
         assert_eq!(pck.k, 0, "K must be 0");
+        assert_eq!(pck.p, 1, "P must be 1");
 
         // Header size, X and K
         let raw_bytes = &[0x80, 0x10, 0x00, 0x00];
@@ -377,6 +435,7 @@ mod test {
         assert_eq!(pck.l, 0, "L must be 0");
         assert_eq!(pck.t, 0, "T must be 0");
         assert_eq!(pck.k, 1, "K must be 1");
+        assert_eq!(pck.p, 1, "P must be 1");
 
         // Header size, all flags and 8bit picture_id
         let raw_bytes = &[0xff, 0xff, 0x00, 0x00, 0x00, 0x00];
@@ -389,6 +448,7 @@ mod test {
         assert_eq!(pck.l, 1, "L must be 1");
         assert_eq!(pck.t, 1, "T must be 1");
         assert_eq!(pck.k, 1, "K must be 1");
+        assert_eq!(pck.p, 1, "P must be 1");
 
         // Header size, all flags and 16bit picture_id
         let raw_bytes = &[0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00];
@@ -401,6 +461,20 @@ mod test {
         assert_eq!(pck.l, 1, "L must be 1");
         assert_eq!(pck.t, 1, "T must be 1");
         assert_eq!(pck.k, 1, "K must be 1");
+        assert_eq!(pck.p, 1, "P must be 1");
+
+        // Header size, X, I and P
+        let raw_bytes = &[0x90, 0x80, 0x11, 0x10, 0x00, 0x00, 0x00];
+        let mut payload = Vec::new();
+        pck.depacketize(raw_bytes, &mut payload, &mut extra)
+            .expect("all flags and 16bit picture_id");
+        assert!(!payload.is_empty(), "Payload must be not empty");
+        assert_eq!(pck.x, 1, "X must be 1");
+        assert_eq!(pck.i, 1, "I must be 1");
+        assert_eq!(pck.l, 0, "L must be 0");
+        assert_eq!(pck.t, 0, "T must be 0");
+        assert_eq!(pck.k, 0, "K must be 0");
+        assert_eq!(pck.p, 0, "P must be 0");
 
         Ok(())
     }

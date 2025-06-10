@@ -7,11 +7,12 @@ use str0m::rtp::{ExtensionValues, Ssrc};
 use str0m::{Event, RtcError};
 
 mod common;
-use common::{connect_l_r, init_log, progress};
+use common::{connect_l_r, init_crypto_default, init_log, progress};
 
 #[test]
 pub fn rtx_cache_0() -> Result<(), RtcError> {
     init_log();
+    init_crypto_default();
 
     let (mut l, mut r) = connect_l_r();
 
@@ -27,11 +28,11 @@ pub fn rtx_cache_0() -> Result<(), RtcError> {
         .declare_stream_tx(ssrc_tx, None, mid, Some(rid))
         //
         // disable RTX cache by setting 0
-        .set_rtx_cache(0, Duration::ZERO);
+        .set_rtx_cache(0, Duration::ZERO, Some(0.15));
 
     r.direct_api()
         .declare_media(mid, MediaKind::Audio)
-        .expect_rid(rid);
+        .expect_rid_rx(rid);
 
     let max = l.last.max(r.last);
     l.last = max;

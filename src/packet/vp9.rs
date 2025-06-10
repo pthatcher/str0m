@@ -1,17 +1,11 @@
-use super::{BitRead, CodecExtra, Depacketizer, MediaKind, PacketError, Packetizer};
+use super::{BitRead, CodecExtra, Depacketizer, PacketError, Packetizer};
 
 use std::fmt;
-use std::panic::RefUnwindSafe;
-use std::panic::UnwindSafe;
-use std::sync::Arc;
 
 /// Flexible mode 15 bit picture ID
 const VP9HEADER_SIZE: usize = 3;
-const MAX_SPATIAL_LAYERS: u8 = 5;
+const MAX_SPATIAL_LAYERS: usize = 3;
 const MAX_VP9REF_PICS: usize = 3;
-
-/// InitialPictureIDFn is a function that returns random initial picture ID.
-pub type InitialPictureIDFn = Arc<dyn (Fn() -> u16) + Send + Sync + UnwindSafe + RefUnwindSafe>;
 
 /// Vp9 information describing the depacketized/packetized data.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +13,7 @@ pub struct Vp9CodecExtra {
     /// Map of the SVC layers.
     ///
     /// Index of each element corresponds to `spatial layer` index.
-    ///  
+    ///
     /// Each element represents the end (not including) in [`MediaData::data`]
     /// for `spatial layer` it belongs.
     ///
@@ -77,7 +71,7 @@ pub struct Vp9CodecExtra {
     ///     }
     /// }
     /// ```
-    pub layers_scheme: [Option<usize>; 3],
+    pub layers_scheme: [Option<usize>; MAX_SPATIAL_LAYERS],
 
     /// Temporal layer id.
     pub tid: Option<u8>,
@@ -85,15 +79,25 @@ pub struct Vp9CodecExtra {
     /// Map of the SVC layers widths.
     ///
     /// Specified for every spatial layer.
-    pub layers_widths: [Option<u16>; 3],
+    pub layers_widths: [Option<u16>; MAX_SPATIAL_LAYERS],
 
     /// Map of the SVC layers heights.
     ///
     /// Specified for every spatial layer.
-    pub layers_heights: [Option<u16>; 3],
+    pub layers_heights: [Option<u16>; MAX_SPATIAL_LAYERS],
+
+    /// Extended picture id of layer 0 frames, if present
+    pub tl0_picture_id: Option<u8>,
 
     /// Picture ID.
     pub pid: u16,
+
+    /// Flag which indicates that within [`MediaData`], there is an individual frame
+    /// containing complete and independent visual information. This frame serves
+    /// as a reference point for other frames in the video sequence.
+    ///
+    /// [`MediaData`]: crate::media::MediaData
+    pub is_keyframe: bool,
 }
 
 /// Packetizes VP9 RTP packets.
@@ -101,7 +105,8 @@ pub struct Vp9CodecExtra {
 pub struct Vp9Packetizer {
     picture_id: u16,
     initialized: bool,
-    initial_picture_id_fn: Option<InitialPictureIDFn>,
+    #[cfg(test)]
+    initial_picture_id: u16,
 }
 
 impl fmt::Debug for Vp9Packetizer {
@@ -159,15 +164,15 @@ impl Packetizer for Vp9Packetizer {
         }
 
         if !self.initialized {
-            if self.initial_picture_id_fn.is_none() {
-                self.initial_picture_id_fn =
-                    Some(Arc::new(|| -> u16 { rand::random::<u16>() & 0x7FFF }));
+            #[cfg(test)]
+            {
+                self.picture_id = self.initial_picture_id;
             }
-            self.picture_id = if let Some(f) = &self.initial_picture_id_fn {
-                f()
-            } else {
-                0
-            };
+            #[cfg(not(test))]
+            {
+                use crate::util::NonCryptographicRng;
+                self.picture_id = NonCryptographicRng::u16() & 0x7FFF;
+            }
             self.initialized = true;
         }
 
@@ -213,7 +218,7 @@ impl Packetizer for Vp9Packetizer {
         Ok(payloads)
     }
 
-    fn is_marker(&mut self, data: &[u8], previous: Option<&[u8]>, last: bool) -> bool {
+    fn is_marker(&mut self, _data: &[u8], _previous: Option<&[u8]>, last: bool) -> bool {
         last
     }
 }
@@ -267,8 +272,8 @@ pub struct Vp9Depacketizer {
     pub g: bool,
     /// N_G indicates the number of pictures in a Picture Group (PG)
     pub ng: u8,
-    pub width: [Option<u16>; MAX_SPATIAL_LAYERS as usize],
-    pub height: [Option<u16>; MAX_SPATIAL_LAYERS as usize],
+    pub width: [Option<u16>; MAX_SPATIAL_LAYERS],
+    pub height: [Option<u16>; MAX_SPATIAL_LAYERS],
     /// Temporal layer ID of pictures in a Picture Group
     pub pgtid: Vec<u8>,
     /// Switching up point of pictures in a Picture Group
@@ -278,7 +283,8 @@ pub struct Vp9Depacketizer {
 }
 
 impl Depacketizer for Vp9Depacketizer {
-    /// depacketize parses the passed byte slice and stores the result in the Vp9Packet this method is called upon
+    /// depacketize parses the passed byte slice and stores the result
+    /// in the Vp9Packet this method is called upon
     fn depacketize(
         &mut self,
         packet: &[u8],
@@ -290,7 +296,7 @@ impl Depacketizer for Vp9Depacketizer {
         }
 
         let mut reader = (packet, 0);
-        let b = reader.get_u8();
+        let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
 
         self.i = (b & 0x80) != 0;
         self.p = (b & 0x40) != 0;
@@ -356,7 +362,7 @@ impl Vp9Depacketizer {
         };
 
         if self.l {
-            let mut new_stop = out_len + packet_len - payload_index;
+            let new_stop = out_len + packet_len - payload_index;
 
             if let Some(stop) = vp9_extra.layers_scheme[self.sid as usize] {
                 if stop != out_len {
@@ -366,11 +372,20 @@ impl Vp9Depacketizer {
 
             vp9_extra.layers_scheme[self.sid as usize] = Some(new_stop);
             vp9_extra.tid = Some(self.tid);
+
+            if !self.f {
+                vp9_extra.tl0_picture_id = Some(self.tl0picidx);
+            }
         }
 
         vp9_extra.pid = self.picture_id;
-        vp9_extra.layers_widths.copy_from_slice(&self.width[..3]);
-        vp9_extra.layers_heights.copy_from_slice(&self.height[..3]);
+        vp9_extra
+            .layers_widths
+            .copy_from_slice(&self.width[..MAX_SPATIAL_LAYERS]);
+        vp9_extra
+            .layers_heights
+            .copy_from_slice(&self.height[..MAX_SPATIAL_LAYERS]);
+        vp9_extra.is_keyframe |= !self.p && (self.sid == 0 || !self.l) && self.b;
 
         *extra = CodecExtra::Vp9(vp9_extra);
 
@@ -393,7 +408,7 @@ impl Vp9Depacketizer {
         if reader.remaining() == 0 {
             return Err(PacketError::ErrShortPacket);
         }
-        let b = reader.get_u8();
+        let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
         payload_index += 1;
         // PID present?
         if (b & 0x80) != 0 {
@@ -401,7 +416,8 @@ impl Vp9Depacketizer {
                 return Err(PacketError::ErrShortPacket);
             }
             // M == 1, PID is 15bit
-            self.picture_id = (((b & 0x7f) as u16) << 8) | (reader.get_u8() as u16);
+            let x = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
+            self.picture_id = (((b & 0x7f) as u16) << 8) | (x as u16);
             payload_index += 1;
         } else {
             self.picture_id = (b & 0x7F) as u16;
@@ -438,7 +454,7 @@ impl Vp9Depacketizer {
         if reader.remaining() == 0 {
             return Err(PacketError::ErrShortPacket);
         }
-        let b = reader.get_u8();
+        let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
         payload_index += 1;
 
         self.tid = b >> 5;
@@ -446,7 +462,7 @@ impl Vp9Depacketizer {
         self.sid = (b >> 1) & 0x7;
         self.d = b & 0x01 != 0;
 
-        if self.sid >= MAX_SPATIAL_LAYERS {
+        if self.sid as usize >= MAX_SPATIAL_LAYERS {
             Err(PacketError::ErrTooManySpatialLayers)
         } else {
             Ok(payload_index)
@@ -469,7 +485,7 @@ impl Vp9Depacketizer {
         if reader.remaining() == 0 {
             return Err(PacketError::ErrShortPacket);
         }
-        self.tl0picidx = reader.get_u8();
+        self.tl0picidx = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
         payload_index += 1;
         Ok(payload_index)
     }
@@ -491,7 +507,7 @@ impl Vp9Depacketizer {
             if reader.remaining() == 0 {
                 return Err(PacketError::ErrShortPacket);
             }
-            b = reader.get_u8();
+            b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             payload_index += 1;
 
             self.pdiff.push(b >> 1);
@@ -532,7 +548,7 @@ impl Vp9Depacketizer {
             return Err(PacketError::ErrShortPacket);
         }
 
-        let b = reader.get_u8();
+        let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
         payload_index += 1;
 
         self.ns = b >> 5;
@@ -542,14 +558,18 @@ impl Vp9Depacketizer {
         let ns = (self.ns + 1) as usize;
         self.ng = 0;
 
+        if ns >= MAX_SPATIAL_LAYERS {
+            return Err(PacketError::ErrVP9CorruptedPacket);
+        }
+
         if self.y {
             if reader.remaining() < 4 * ns {
                 return Err(PacketError::ErrShortPacket);
             }
 
             for i in 0..ns {
-                self.width[i] = Some(reader.get_u16());
-                self.height[i] = Some(reader.get_u16());
+                self.width[i] = Some(reader.get_u16().ok_or(PacketError::ErrShortPacket)?);
+                self.height[i] = Some(reader.get_u16().ok_or(PacketError::ErrShortPacket)?);
             }
             payload_index += 4 * ns;
         }
@@ -559,7 +579,7 @@ impl Vp9Depacketizer {
                 return Err(PacketError::ErrShortPacket);
             }
 
-            self.ng = reader.get_u8();
+            self.ng = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             payload_index += 1;
         }
 
@@ -567,7 +587,7 @@ impl Vp9Depacketizer {
             if reader.remaining() == 0 {
                 return Err(PacketError::ErrShortPacket);
             }
-            let b = reader.get_u8();
+            let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             payload_index += 1;
 
             self.pgtid.push(b >> 5);
@@ -580,7 +600,7 @@ impl Vp9Depacketizer {
 
             self.pgpdiff.push(vec![]);
             for _ in 0..r {
-                let b = reader.get_u8();
+                let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
                 payload_index += 1;
 
                 self.pgpdiff[i].push(b);
@@ -772,14 +792,14 @@ mod test {
                     g: false,
                     ng: 0,
                     width: {
-                        let mut res = [None; MAX_SPATIAL_LAYERS as usize];
+                        let mut res = [None; MAX_SPATIAL_LAYERS];
                         res[0] = Some(640);
                         res[1] = Some(1280);
 
                         res
                     },
                     height: {
-                        let mut res = [None; MAX_SPATIAL_LAYERS as usize];
+                        let mut res = [None; MAX_SPATIAL_LAYERS];
                         res[0] = Some(360);
                         res[1] = Some(720);
 
@@ -895,7 +915,7 @@ mod test {
 
         for (name, bs, mtu, expected) in tests {
             let mut pck = Vp9Packetizer {
-                initial_picture_id_fn: Some(Arc::new(|| -> u16 { 8692 })),
+                initial_picture_id: 8692,
                 ..Default::default()
             };
 
@@ -909,7 +929,7 @@ mod test {
         //"PictureIDOverflow"
         {
             let mut pck = Vp9Packetizer {
-                initial_picture_id_fn: Some(Arc::new(|| -> u16 { 8692 })),
+                initial_picture_id: 8692,
                 ..Default::default()
             };
             let mut p_prev = Vp9Depacketizer::default();

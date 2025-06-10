@@ -1,21 +1,23 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use str0m::change::SdpOffer;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind};
 use str0m::rtp::Extension;
 use str0m::rtp::ExtensionSerializer;
 use str0m::rtp::ExtensionValues;
 use str0m::Rtc;
-use str0m::{Candidate, Event, RtcError};
+use str0m::{Event, RtcError};
 use tracing::info_span;
 
 mod common;
-use common::{init_log, progress, TestRtc};
+use common::{init_crypto_default, init_log, progress, TestRtc};
 
 #[test]
 pub fn user_rtp_header_extension() -> Result<(), RtcError> {
     init_log();
+    init_crypto_default();
 
     #[derive(Debug, PartialEq, Eq)]
     struct MyValue(u16);
@@ -80,17 +82,17 @@ pub fn user_rtp_header_extension() -> Result<(), RtcError> {
     let mut l = TestRtc::new_with_rtc(info_span!("L"), rtc_l);
     let mut r = TestRtc::new_with_rtc(info_span!("R"), rtc_r);
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
-    l.add_local_candidate(host1);
-    r.add_local_candidate(host2);
+    l.add_host_candidate((Ipv4Addr::new(1, 1, 1, 1), 1000).into());
+    r.add_host_candidate((Ipv4Addr::new(2, 2, 2, 2), 2000).into());
 
     // The change is on the L (sending side) with Direction::SendRecv.
     let mut change = l.sdp_api();
-    let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+    let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
     let (offer, pending) = change.apply().unwrap();
-
-    let answer = r.rtc.sdp_api().accept_offer(offer)?;
+    let offer_str = offer.to_sdp_string();
+    let offer_parsed =
+        SdpOffer::from_sdp_string(&offer_str).expect("Should parse offer from string");
+    let answer = r.rtc.sdp_api().accept_offer(offer_parsed)?;
     l.rtc.sdp_api().accept_answer(pending, answer)?;
 
     // Verify that the extension is negotiated.
@@ -160,6 +162,7 @@ pub fn user_rtp_header_extension() -> Result<(), RtcError> {
 #[test]
 pub fn user_rtp_header_extension_two_byte_form() -> Result<(), RtcError> {
     init_log();
+    init_crypto_default();
 
     #[derive(Debug, PartialEq, Eq, Clone)]
     struct MyValue(Vec<u8>);
@@ -220,14 +223,12 @@ pub fn user_rtp_header_extension_two_byte_form() -> Result<(), RtcError> {
     let mut l = TestRtc::new_with_rtc(info_span!("L"), rtc_l);
     let mut r = TestRtc::new_with_rtc(info_span!("R"), rtc_r);
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
-    l.add_local_candidate(host1);
-    r.add_local_candidate(host2);
+    l.add_host_candidate((Ipv4Addr::new(1, 1, 1, 1), 1000).into());
+    r.add_host_candidate((Ipv4Addr::new(2, 2, 2, 2), 2000).into());
 
     // The change is on the L (sending side) with Direction::SendRecv.
     let mut change = l.sdp_api();
-    let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+    let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
     let (offer, pending) = change.apply().unwrap();
 
     let answer = r.rtc.sdp_api().accept_offer(offer)?;

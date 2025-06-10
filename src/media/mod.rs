@@ -8,6 +8,7 @@ use crate::format::CodecConfig;
 use crate::io::{Id, DATAGRAM_MTU};
 use crate::packet::{DepacketizingBuffer, Payloader, RtpMeta};
 use crate::rtp_::ExtensionMap;
+use crate::rtp_::MidRid;
 use crate::rtp_::SRTP_BLOCK_SIZE;
 use crate::rtp_::SRTP_OVERHEAD;
 use crate::RtcError;
@@ -47,6 +48,11 @@ pub struct Media {
     ///
     /// RTP level.
     rids_rx: Rids,
+
+    /// Rid that we can send using the [`Writer`].
+    ///
+    /// RTP level.
+    rids_tx: Rids,
 
     // ========================================= SDP level =========================================
     //
@@ -119,8 +125,10 @@ pub struct Media {
 }
 
 #[derive(Debug)]
-/// Config value for [`Media::rids_rx()`]
+/// Config value for [`Media::rids_rx()`] and [`Media::rids_tx()`]
 pub enum Rids {
+    /// No rid is allowed.
+    None,
     /// Any Rid is allowed.
     ///
     /// This is the default value for direct API.
@@ -132,8 +140,9 @@ pub enum Rids {
 }
 
 impl Rids {
-    pub(crate) fn expects(&self, rid: Rid) -> bool {
+    pub(crate) fn contains(&self, rid: Rid) -> bool {
         match self {
+            Rids::None => false,
             Rids::Any => true,
             Rids::Specific(v) => v.contains(&rid),
         }
@@ -141,6 +150,16 @@ impl Rids {
 
     pub(crate) fn is_specific(&self) -> bool {
         matches!(self, Rids::Specific(_))
+    }
+
+    fn add(&mut self, rid: Rid) {
+        match self {
+            Rids::None | Rids::Any => {
+                *self = Rids::Specific(vec![rid]);
+            }
+            Rids::Specific(vec) if !vec.contains(&rid) => vec.push(rid),
+            Rids::Specific(_) => {}
+        }
     }
 }
 
@@ -150,6 +169,7 @@ pub(crate) struct ToPayload {
     pub rid: Option<Rid>,
     pub wallclock: Instant,
     pub rtp_time: MediaTime,
+    pub start_of_talk_spurt: bool,
     pub data: Vec<u8>,
     pub ext_vals: ExtensionValues,
 }
@@ -179,14 +199,8 @@ impl Media {
     /// a mid/rid combination in the RTP header extensions.
     ///
     /// RTP level.
-    pub fn expect_rid(&mut self, rid: Rid) {
-        match &mut self.rids_rx {
-            rids @ Rids::Any => {
-                *rids = Rids::Specific(vec![rid]);
-            }
-            Rids::Specific(v) if !v.contains(&rid) => v.push(rid),
-            _ => {}
-        }
+    pub fn expect_rid_rx(&mut self, rid: Rid) {
+        self.rids_rx.add(rid);
     }
 
     /// Rids we are expecting to see on incoming RTP packets that map to this mid.
@@ -199,12 +213,32 @@ impl Media {
         &self.rids_rx
     }
 
+    /// Rids we are can send via the [`Writer`].
+    ///
+    /// By default this is set to [`Rids::None`], which changes to [`Rids::Specific`] via SDP negotiation
+    /// that configures Simulcast where specific rids are expected.
+    ///
+    /// RTP level.
+    pub fn rids_tx(&self) -> &Rids {
+        &self.rids_tx
+    }
+
     pub(crate) fn index(&self) -> usize {
         self.index
     }
 
     pub(crate) fn msid(&self) -> &Msid {
         &self.msid
+    }
+
+    /// Identifier for the group this Media belongs to.
+    pub fn stream_id(&self) -> &str {
+        &self.msid().stream_id
+    }
+
+    /// Identifier for this Media. Should be unique for the given stream id.
+    pub fn track_id(&self) -> &str {
+        &self.msid().track_id
     }
 
     /// Whether this media is audio or video.
@@ -239,30 +273,32 @@ impl Media {
     pub(crate) fn poll_sample(
         &mut self,
         params: &[PayloadParams],
-    ) -> Option<Result<MediaData, RtcError>> {
+    ) -> Result<Option<MediaData>, RtcError> {
         for ((pt, rid), buf) in &mut self.depayloaders {
             if let Some(r) = buf.pop() {
-                let codec = *params.iter().find(|c| c.pt() == *pt)?;
-                return Some(
-                    r.map(|dep| MediaData {
-                        mid: self.mid,
-                        pt: *pt,
-                        rid: *rid,
-                        params: codec,
-                        time: dep.time,
-                        network_time: dep.first_network_time(),
-                        seq_range: dep.seq_range(),
-                        contiguous: dep.contiguous,
-                        ext_vals: dep.ext_vals().clone(),
-                        codec_extra: dep.codec_extra,
-                        last_sender_info: dep.first_sender_info(),
-                        data: dep.data,
-                    })
-                    .map_err(|e| RtcError::Packet(self.mid, *pt, e)),
-                );
+                let dep = r.map_err(|e| RtcError::Packet(self.mid, *pt, e))?;
+                let Some(codec) = params.iter().find(|c| c.pt() == *pt) else {
+                    return Ok(None);
+                };
+                return Ok(Some(MediaData {
+                    mid: self.mid,
+                    pt: *pt,
+                    rid: *rid,
+                    params: *codec,
+                    time: dep.time,
+                    network_time: dep.first_network_time(),
+                    seq_range: dep.seq_range(),
+                    contiguous: dep.contiguous,
+                    ext_vals: dep.ext_vals().clone(),
+                    codec_extra: dep.codec_extra,
+                    last_sender_info: dep.first_sender_info(),
+                    audio_start_of_talk_spurt: codec.spec().codec.is_audio()
+                        && dep.start_of_talkspurt(),
+                    data: dep.data,
+                }));
             }
         }
-        None
+        Ok(None)
     }
 
     pub(crate) fn depayload(
@@ -330,7 +366,7 @@ impl Media {
     }
 
     pub(crate) fn set_simulcast(&mut self, s: SdpSimulcast) {
-        info!("Set simulcast: {:?}", s);
+        debug!("Set simulcast: {:?}", s);
         self.simulcast = Some(s);
     }
 
@@ -367,7 +403,6 @@ impl Media {
 
     pub(crate) fn do_payload(
         &mut self,
-        now: Instant,
         streams: &mut Streams,
         params: &[PayloadParams],
     ) -> Result<(), RtcError> {
@@ -379,7 +414,9 @@ impl Media {
 
         let is_audio = self.kind.is_audio();
 
-        let stream = streams.tx_by_mid_rid(self.mid, *rid);
+        let midrid = MidRid(self.mid, *rid);
+
+        let stream = streams.stream_tx_by_midrid(midrid);
 
         let Some(stream) = stream else {
             return Err(RtcError::NoSenderSource);
@@ -394,7 +431,7 @@ impl Media {
         const MTU: usize = RTP_SIZE - RTP_SIZE % SRTP_BLOCK_SIZE;
 
         payloader
-            .push_sample(now, to_payload, MTU, is_audio, stream)
+            .push_sample(to_payload, MTU, is_audio, stream)
             .map_err(|e| RtcError::Packet(self.mid, pt, e))?;
 
         Ok(())
@@ -408,7 +445,7 @@ impl Media {
 
         // TODO: We should verify the remote peer doesn't suddenly change the PT
         // order or removes/adds PTs that weren't there from the start.
-        info!("Mid ({}) remote PT order is: {:?}", self.mid, pts);
+        debug!("Mid ({}) remote PT order is: {:?}", self.mid, pts);
         self.remote_pts = pts;
     }
 
@@ -443,13 +480,27 @@ impl Media {
     pub(crate) fn first_pt_with_rtx(&self, config: &CodecConfig) -> Option<Pt> {
         config
             .all_for_kind(self.kind)
-            .find(|p| p.resend().is_some() && self.remote_pts.contains(&p.pt))
-            .map(|p| p.pt())
+            // Only consider negotiated PTs
+            .filter(|p| self.remote_pts.contains(&p.pt))
+            // Map to the first PT found in payload params with RTX
+            .find_map(|p| p.resend().map(|_| p.pt))
     }
 
     pub(crate) fn reset_depayloader(&mut self, payload_type: Pt, rid: Option<Rid>) {
         // Simply remove the depayloader, it will be re-created on the next RTP packet.
         self.depayloaders.remove(&(payload_type, rid));
+    }
+
+    pub(crate) fn set_rid_rx(&mut self, rids: Rids) {
+        self.rids_rx = rids;
+    }
+
+    pub(crate) fn set_rid_tx(&mut self, rids: Rids) {
+        self.rids_tx = rids;
+    }
+
+    pub(crate) fn add_to_rid_tx(&mut self, rid: Rid) {
+        self.rids_tx.add(rid)
     }
 }
 
@@ -460,10 +511,7 @@ impl Default for Media {
             index: 0,
             app_tmp: false,
             cname: Id::<20>::random().to_string(),
-            msid: Msid {
-                stream_id: Id::<30>::random().to_string(),
-                track_id: Id::<30>::random().to_string(),
-            },
+            msid: Msid::random(),
             kind: MediaKind::Video,
             remote_pts: vec![],
             remote_exts: ExtensionMap::empty(),
@@ -471,6 +519,7 @@ impl Default for Media {
             dir: Direction::SendRecv,
             simulcast: None,
             rids_rx: Rids::Any,
+            rids_tx: Rids::None,
             payloaders: HashMap::new(),
             depayloaders: HashMap::new(),
             to_payload: VecDeque::default(),
@@ -489,9 +538,9 @@ impl Media {
         Media {
             mid: l.mid(),
             index,
-            // These two are not reflected back, and thus added by add_pending_changes().
+            // This is not reflected back, and thus added by add_pending_changes().
             // cname,
-            // msid,
+            msid: l.msid().unwrap_or(Msid::random()),
             kind: l.typ.clone().into(),
             dir: l.direction().invert(), // remote direction is reverse.
             remote_created,
@@ -515,6 +564,7 @@ impl Media {
             remote_pts: a.pts,
             remote_exts: a.exts,
             remote_created: false,
+            simulcast: a.simulcast.map(|s| s.into_sdp()),
             ..Default::default()
         }
     }

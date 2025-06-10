@@ -61,9 +61,9 @@ impl TimePoint {
 }
 
 impl ReceiverRegister {
-    pub fn new() -> Self {
+    pub fn new(max_seq_no: Option<SeqNo>) -> Self {
         ReceiverRegister {
-            nack: NackRegister::new(),
+            nack: NackRegister::new(max_seq_no),
             first: None,
             count: 0,
             time_point_prior: None,
@@ -71,6 +71,10 @@ impl ReceiverRegister {
             received_prior: 0,
             jitter: 0.0,
         }
+    }
+
+    pub fn accepts(&self, seq: SeqNo) -> bool {
+        self.nack.accepts(seq)
     }
 
     pub fn update(&mut self, seq: SeqNo, arrival: Instant, rtp_time: u32, clock_rate: u32) -> bool {
@@ -119,8 +123,8 @@ impl ReceiverRegister {
         self.nack.max_seq()
     }
 
-    pub fn clear(&mut self) {
-        self.nack = NackRegister::new();
+    pub fn clear(&mut self, max_seq_no: Option<SeqNo>) {
+        self.nack = NackRegister::new(max_seq_no);
         self.count = 0;
         self.first = None;
         self.time_point_prior = None;
@@ -243,7 +247,8 @@ fn packets_lost(expected: i64, received: i64) -> u32 {
 }
 
 fn expected(first: SeqNo, last: SeqNo) -> i64 {
-    *last as i64 - *first as i64 + 1
+    let delta = (*last - *first) as i64;
+    delta.saturating_add(1)
 }
 
 #[cfg(test)]
@@ -254,7 +259,7 @@ mod test {
 
     #[test]
     fn jitter_at_0() {
-        let mut r = ReceiverRegister::new();
+        let mut r = ReceiverRegister::new(None);
 
         // 100 fps in clock rate 90kHz => 90_000/100 = 900 per frame
         // 1/100 * 1_000_000 = 10_000 microseconds per frame.
@@ -271,7 +276,7 @@ mod test {
 
     #[test]
     fn jitter_at_20() {
-        let mut r = ReceiverRegister::new();
+        let mut r = ReceiverRegister::new(None);
 
         // 100 fps in clock rate 90kHz => 90_000/100 = 900 per frame
         // 1/100 * 1_000_000 = 10_000 microseconds per frame.
@@ -314,8 +319,16 @@ mod test {
     }
 
     #[test]
+    fn expected_overflow() {
+        let last = 0x7fff_ffff_ffff_ffff_u64.into();
+        let first = 0_u64.into();
+        let expected = expected(first, last);
+        assert_eq!(expected, i64::MAX);
+    }
+
+    #[test]
     fn receiver_report() {
-        let mut r = ReceiverRegister::new();
+        let mut r = ReceiverRegister::new(None);
         let now = Instant::now();
         let rtp_time = 0;
 

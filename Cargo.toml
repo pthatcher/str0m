@@ -1,6 +1,6 @@
 [package]
 name = "str0m"
-version = "0.4.1"
+version = "0.9.0"
 authors = ["Martin Algesten <martin@algesten.se>", "Hugo Tunius <h@tunius.se>", "Davide Bertola <dade@dadeb.it>"]
 description = "WebRTC library in Sans-IO style"
 license = "MIT OR Apache-2.0"
@@ -9,39 +9,81 @@ readme = "README.md"
 keywords = ["webrtc", "streaming", "video", "audio", "media"]
 categories = ["web-programming", "multimedia", "network-programming"]
 edition = "2021"
+exclude = ["/cargo_deny.sh", "/deny.toml", "/run-fuzz.sh"]
+
+# MSRV
+rust-version = "1.71.1"
+
+# Notes on OpenSSL
+# - Vendored (static link source build) ensures version consistency and easier
+#   to build but increases size.
+# - Non-vendored (dynamic link) uses system libraries, reducing size but may
+#   cause compatibility issues.
+# Choose based on security and footprint needs.
+# For large deployments sharing OS images, OS updates can be easier for
+# security patching than updating statically linked software.
 
 [features]
+default = ["openssl", "vendored", "sha1"]
+openssl = ["dep:openssl", "dep:openssl-sys", "dep:libc", "rouille/ssl"]
+vendored = ["openssl?/vendored"]
+
+# Without the sha1 feature, str0m uses the openssl sha1 impl which is slower.
+sha1 = ["dep:sha1"]
+
+# Uses native Windows API to implement cryptographic features, use instead on
+# openssl and sha1.
+wincrypto = ["dep:str0m-wincrypto"]
+
+# Redacts personally identifiable information (PII) from logs debug and above
+pii = []
+
 _internal_dont_use_log_stats = []
+_internal_test_exports = []
 
 [dependencies]
-thiserror = "1.0.38"
+thiserror = "1.0.69"
 tracing = "0.1.37"
-rand = "0.8.5"
-once_cell = "1.17.0"
-sctp-proto = "0.1.6"
+fastrand = "2.0.1"
+once_cell = "1.17.0" # NB: Can be dropped in MSRV 1.80 using LazyLock.
+sctp-proto = "0.3.0"
 combine = "4.6.6"
+
 # Sadly no DTLS support in rustls.
-# If you want to use a system provided openssl you can set env variable
-# OPENSSL_NO_VENDOR=1 to override the feature flag vendored
-openssl = { version = "0.10.45", features = ["vendored"] }
-openssl-sys = "0.9.80"
+openssl = { version = "0.10.70", optional = true }
+openssl-sys = { version = "0.9.80", optional = true }
+libc = { version = "0.2", optional = true }
+
 # STUN
 hmac = "0.12.1"
 crc = "3.0.0"
 serde = { version = "1.0.152", features = ["derive"] }
 
-
-# asm feature breaks on windows, but it is much faster than openssl
 [target.'cfg(unix)'.dependencies]
-sha-1 = { version = "0.10.1", features = ["asm"] }
+sha1 = { version = "0.10.6", features = ["asm"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# The ASM feature is broken on windows. Unclear where in the rust-crypto project
+# we're supposed to check when it gets sorted out.
+sha1 = { version = "0.10.6", optional = true }
+# Windows Crypto (CNG + SChannel)
+str0m-wincrypto = { version = "0.1.0", path = "wincrypto", optional = true }
 
 [dev-dependencies]
-rouille = { version = "3.5.0", features = ["ssl"] }
+rouille = { version = "3.5.0", features = [] }
 serde_json = "1.0"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "std"] }
 systemstat = "0.2.2"
-
-# This is to ensure MSRV 1.65
-# Remove when we move MSRV
-time = "=0.3.23"
 pcap-file = "2.0.0"
+regex = "1.11.1"
+
+# dummy package that enables "_internal_test_exports"
+_str0m_test = { path = "_str0m_test" }
+
+[[example]]
+name = "chat"
+required-features = ["openssl"]
+
+[[example]]
+name = "http-post"
+required-features = ["openssl"]

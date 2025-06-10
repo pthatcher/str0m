@@ -1,4 +1,4 @@
-use super::{MediaKind, PacketError, Packetizer};
+use super::{PacketError, Packetizer};
 
 /// Packetizes G711 RTP packets.
 pub type G711Packetizer = G7xxPacketizer;
@@ -32,7 +32,7 @@ impl Packetizer for G7xxPacketizer {
         Ok(payloads)
     }
 
-    fn is_marker(&mut self, data: &[u8], previous: Option<&[u8]>, last: bool) -> bool {
+    fn is_marker(&mut self, _data: &[u8], _previous: Option<&[u8]>, _last: bool) -> bool {
         false
     }
 }
@@ -49,7 +49,7 @@ mod test {
         const TEST_MTU: usize = 1500;
 
         //generate random 8-bit g722 samples
-        let samples: Vec<u8> = (0..TEST_LEN).map(|_| rand::random::<u8>()).collect();
+        let samples: Vec<u8> = (0..TEST_LEN).map(|_| fastrand::u8(..)).collect();
 
         //make a copy, for packetizer input
         let mut samples_in = vec![0u8; TEST_LEN];

@@ -1,10 +1,10 @@
 //! <image src="https://user-images.githubusercontent.com/227204/226143511-66fe5264-6ab7-47b9-9551-90ba7e155b96.svg" alt="str0m logo" ></image>
 //!
-//! A synchronous sans I/O WebRTC implementation in Rust.
+//! A Sans I/O WebRTC implementation in Rust.
 //!
 //! This is a [Sans I/O][sansio] implementation meaning the `Rtc` instance itself is not doing any network
-//! talking. Furthermore it has no internal threads or async tasks. All operations are synchronously
-//! happening from the calls of the public API.
+//! talking. Furthermore it has no internal threads or async tasks. All operations are happening from the
+//! calls of the public API.
 //!
 //! This is deliberately not a standard `RTCPeerConnection` API since that isn't a great fit for Rust.
 //! See more details in below section.
@@ -45,6 +45,11 @@
 //! cargo run --example http-post
 //! ```
 //!
+//! ### Real example
+//!
+//! To see how str0m is used in a real project, check out [BitWHIP][bitwhip] –
+//! a CLI WebRTC Agent written in Rust.
+//!
 //! ## Passive
 //!
 //! For passive connections, i.e. where the media and initial OFFER is
@@ -78,7 +83,6 @@
 //! ```no_run
 //! # use str0m::{Rtc, Candidate};
 //! # use str0m::media::{MediaKind, Direction};
-//! #
 //! // Instantiate a new Rtc instance.
 //! let mut rtc = Rtc::new();
 //!
@@ -92,7 +96,7 @@
 //! let mut change = rtc.sdp_api();
 //!
 //! // Do some change. A valid OFFER needs at least one "m-line" (media).
-//! let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+//! let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
 //!
 //! // Get the offer.
 //! let (offer, pending) = change.apply().unwrap();
@@ -119,7 +123,6 @@
 //! # use std::net::UdpSocket;
 //! # use std::time::Instant;
 //! # let rtc = Rtc::new();
-//! #
 //! // Buffer for reading incoming UDP packets.
 //! let mut buf = vec![0; 2000];
 //!
@@ -220,7 +223,6 @@
 //! # use str0m::Rtc;
 //! # use str0m::media::Mid;
 //! # let rtc: Rtc = todo!();
-//! #
 //! // Obtain mid from Event::MediaAdded
 //! let mid: Mid = todo!();
 //!
@@ -295,15 +297,37 @@
 //! strategy weighing in all possible time sources to get a good estimate
 //! of the remote wallclock for a packet.
 //!
+//! # Crypto backends
+//!
+//! str0m has two crypto backends, `openssl` and `wincrypto`. The default is
+//! `openssl` which works on all platforms (also Windows). Ideally we want a
+//! pure rust version of the crypto code, but WebRTC currently requires
+//! DTLS 1.2 (not the latest version 1.3), and that leaves us only with a
+//! few possible options.
+//!
+//! When compiling for Windows, the `openssl` feature can be removed and
+//! only rely on `wincrypto`. However notice that `str0m` never picks up a
+//! default automatically, you must explicitly configure the crypto backend,
+//! also when removing the `openssl` feature.
+//!
+//! If you are building an application, the easiest is to set the default
+//! for the entire process.
+//!
+//! ```no_run
+//! use str0m::config::CryptoProvider;
+//!
+//! // Will panic if run twice
+//! CryptoProvider::WinCrypto.install_process_default();
+//! ```
+//!
 //! # Project status
 //!
 //! Str0m was originally developed by Martin Algesten of
 //! [Lookback][lookback]. We use str0m for a specific use case: str0m as a
 //! server SFU (as opposed to peer-2-peer). That means we are heavily
 //! testing and developing the parts needed for our use case. Str0m is
-//! intended to be an all-purpose WebRTC library, which means it should
-//! also work for peer-2-peer (mostly thinking about the ICE agent), but
-//! these areas have not received as much attention and testing.
+//! intended to be an all-purpose WebRTC library, which means it also
+//! works for peer-2-peer, though that aspect has received less testing.
 //!
 //! Performance is very good, there have been some work the discover and
 //! optimize bottlenecks. Such efforts are of course never ending with
@@ -338,9 +362,9 @@
 //! Str0m defaults to the "sample level" which treats the RTP as an internal detail. The user
 //! will thus mainly interact with:
 //!
-//! 1. [`Event::MediaData`] to receive full "samples" (audio frames or video frames).
-//! 2. [`Writer::write`][crate::media::Writer::write] to write full samples.
-//! 3. [`Writer::request_keyframe`][crate::media::Writer::request_keyframe] to request keyframes.
+//! 1. [`Event::MediaData`][evmed] to receive full "samples" (audio frames or video frames).
+//! 2. [`Writer::write`][writer] to write full samples.
+//! 3. [`Writer::request_keyframe`][reqkey] to request keyframes.
 //!
 //! ### Sample level
 //!
@@ -354,36 +378,33 @@
 //! one they are too big. Samples are therefore further chunked up by
 //! codec specific payloaders into RTP packets.
 //!
-//! ### RTP level
+//! ### RTP mode
 //!
 //! Str0m also provides an RTP level API. This would be similar to many other
 //! RTP libraries where the RTP packets themselves are the the API surface
 //! towards the user (when building an SFU one would often talk about "forwarding
-//! RTP packets", while with str0m we can also "forward samples").
-//!
-//! ### RTP mode
-//!
-//! str0m has a lower level API which let's the user write/receive RTP
-//! packets directly. Using this API requires a deeper knowledge of
-//! RTP and WebRTC.
+//! RTP packets", while with str0m we can also "forward samples").  Using
+//! this API requires a deeper knowledge of RTP and WebRTC.
 //!
 //! To enable RTP mode
 //!
 //! ```
+//! # #[cfg(feature = "openssl")] {
 //! # use str0m::Rtc;
 //! let rtc = Rtc::builder()
 //!     // Enable RTP mode for this Rtc instance.
 //!     // This disables `MediaEvent` and the `Writer::write` API.
 //!     .set_rtp_mode(true)
 //!     .build();
+//! # }
 //! ```
 //!
 //! RTP mode gives us some new API points.
 //!
-//! 1. [`Event::RtpPacket`] emitted for every incoming RTP packet. Empty packets for bandwidth
+//! 1. [`Event::RtpPacket`][rtppak] emitted for every incoming RTP packet. Empty packets for bandwidth
 //!    estimation are silently discarded.
-//! 2. [`StreamTx::write_rtp`][crate::rtp::StreamTx::write_rtp] to write outgoing RTP packets.
-//! 3. [`StreamRx::request_keyframe`][crate::rtp::StreamRx::request_keyframe] to request keyframes from remote.
+//! 2. [`StreamTx::write_rtp`][wrtrtp] to write outgoing RTP packets.
+//! 3. [`StreamRx::request_keyframe`][reqkey2] to request keyframes from remote.
 //!
 //! ## NIC enumeration and TURN (and STUN)
 //!
@@ -445,7 +466,7 @@
 //!
 //! ## Panics, Errors and unwraps
 //!
-//! Rust adheres to [fail-fast][ff]. That means rather than brushing state
+//! Str0m adheres to [fail-fast][ff]. That means rather than brushing state
 //! bugs under the carpet, it panics. We make a distinction between errors and
 //! bugs.
 //!
@@ -569,12 +590,23 @@
 //! [intg]:       https://github.com/algesten/str0m/blob/main/tests/unidirectional.rs#L12
 //! [ff]:         https://en.wikipedia.org/wiki/Fail-fast
 //! [catch]:      https://doc.rust-lang.org/std/panic/fn.catch_unwind.html
+//! [evmed]:      https://docs.rs/str0m/*/str0m/enum.Event.html#variant.MediaData
+//! [writer]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.write
+//! [reqkey]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.request_keyframe
+//! [rtppak]:     https://docs.rs/str0m/*/str0m/enum.Event.html#variant.RtpPacket
+//! [wrtrtp]:     https://docs.rs/str0m/*/str0m/rtp/struct.StreamTx.html#method.write_rtp
+//! [reqkey2]:    https://docs.rs/str0m/*/str0m/rtp/struct.StreamRx.html#method.request_keyframe
+//! [bitwhip]:    https://github.com/bitwhip/bitwhip
 
 #![forbid(unsafe_code)]
 #![allow(clippy::new_without_default)]
 #![allow(clippy::bool_to_int_with_if)]
 #![allow(clippy::assertions_on_constants)]
 #![allow(clippy::manual_range_contains)]
+#![allow(clippy::get_first)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::precedence)]
+#![allow(clippy::doc_overindented_list_items)]
 #![deny(missing_docs)]
 
 #[macro_use]
@@ -589,27 +621,46 @@ use std::time::{Duration, Instant};
 use streams::RtpPacket;
 use streams::StreamPaused;
 use thiserror::Error;
-use util::InstantExt;
+use util::{InstantExt, Pii};
+
+mod crypto;
+use crypto::CryptoProvider;
+use crypto::Fingerprint;
 
 mod dtls;
-use dtls::DtlsCert;
-use dtls::Fingerprint;
-use dtls::{Dtls, DtlsEvent};
+use dtls::{Dtls, DtlsCert, DtlsCertOptions, DtlsEvent};
 
-mod ice;
-use ice::IceAgent;
-use ice::IceAgentEvent;
-use ice::IceCreds;
-pub use ice::{Candidate, CandidateKind};
+#[path = "ice/mod.rs"]
+mod ice_;
+use ice_::IceAgent;
+use ice_::IceAgentEvent;
+pub use ice_::{Candidate, CandidateKind, IceConnectionState, IceCreds};
+
+/// Additional configuration.
+pub mod config {
+    pub use super::crypto::{CryptoProvider, DtlsCert, DtlsCertOptions, DtlsPKeyType, Fingerprint};
+}
+
+/// Low level ICE access.
+// The ICE API is not necessary to interact with directly for "regular"
+// use of str0m. This is exported for other libraries that want to
+// reuse str0m's ICE implementation. In the future we might turn this
+// into a separate crate.
+#[doc(hidden)]
+pub mod ice {
+    pub use crate::ice_::IceCreds;
+    pub use crate::ice_::{IceAgent, IceAgentEvent};
+    pub use crate::io::{StunMessage, StunMessageBuilder, StunPacket, TransId};
+}
 
 mod io;
-use io::DatagramRecv;
+use io::DatagramRecvInner;
 
 mod packet;
 
 #[path = "rtp/mod.rs"]
 mod rtp_;
-use rtp_::Bitrate;
+use rtp_::{Bitrate, DataSize};
 use rtp_::{Extension, ExtensionMap};
 
 /// Low level RTP access.
@@ -661,8 +712,6 @@ mod sdp;
 pub mod format;
 use format::CodecConfig;
 
-pub use ice::IceConnectionState;
-
 pub mod channel;
 use channel::{Channel, ChannelData, ChannelHandler, ChannelId};
 
@@ -680,7 +729,8 @@ mod session;
 use session::Session;
 
 pub mod stats;
-use stats::{MediaEgressStats, MediaIngressStats, PeerStats, Stats, StatsEvent, StatsSnapshot};
+use stats::{CandidatePairStats, CandidateStats, MediaEgressStats, MediaIngressStats};
+use stats::{PeerStats, Stats, StatsEvent, StatsSnapshot};
 
 mod streams;
 
@@ -692,7 +742,7 @@ pub mod net {
 /// Various error types.
 pub mod error {
     pub use crate::dtls::DtlsError;
-    pub use crate::ice::IceError;
+    pub use crate::ice_::IceError;
     pub use crate::io::NetError;
     pub use crate::packet::PacketError;
     pub use crate::rtp_::RtpError;
@@ -833,10 +883,13 @@ pub struct Rtc {
     remote_fingerprint: Option<Fingerprint>,
     remote_addrs: Vec<SocketAddr>,
     send_addr: Option<SendAddr>,
+    need_init_time: bool,
     last_now: Instant,
     peer_bytes_rx: u64,
     peer_bytes_tx: u64,
     change_counter: usize,
+    last_timeout_reason: Reason,
+    crypto_provider: CryptoProvider,
 }
 
 struct SendAddr {
@@ -861,9 +914,13 @@ pub enum Event {
 
     // =================== Media related events ==================
 
-    /// Upon adding new media to the session. The lines are emitted.
+    /// Upon detecting the remote side adding new media to the session.
     ///
-    /// Upon this event, the [`Media`] instance is available via [`Rtc::media()`].
+    /// For locally added media, this event never fires. Thus it can be thought of as an
+    /// "SDP only" event. If the direct API is used on both sides, the declaration is local \
+    /// to both sides and the event never fires.
+    ///
+    /// The [`Media`] instance is available via [`Rtc::media()`].
     MediaAdded(MediaAdded),
 
     /// Incoming media data sent by the remote peer.
@@ -933,10 +990,6 @@ pub enum Event {
     /// This clones data, and is therefore expensive.
     /// Should not be enabled outside of tests and troubleshooting.
     RawPacket(Box<RawPacket>),
-
-    /// Internal for passing data from Session to Rtc.
-    #[doc(hidden)]
-    Error(RtcError),
 }
 
 impl Event {
@@ -952,6 +1005,7 @@ impl Event {
 
 /// Input as expected by [`Rtc::handle_input()`]. Either network data or a timeout.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // We purposely don't want to allocate.
 pub enum Input<'a> {
     /// A timeout without any network input.
     Timeout(Instant),
@@ -960,8 +1014,8 @@ pub enum Input<'a> {
 }
 
 /// Output produced by [`Rtc::poll_output()`]
-
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum Output {
     /// When the [`Rtc`] instance expects an [`Input::Timeout`].
     Timeout(Instant),
@@ -973,15 +1027,99 @@ pub enum Output {
     Event(Event),
 }
 
+/// The reason for the next [`Output::Timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Reason {
+    /// No timeout scheduled.
+    ///
+    /// The timeout value is in the distant future.
+    NotHappening,
+
+    /// The DTLS subsystem.
+    ///
+    /// Only relevant during handshaking.
+    DTLS,
+
+    /// The ICE agent.
+    ///
+    /// Includes checking candidate pairs and various cleanups.
+    Ice,
+
+    /// The SCTP subsystem.
+    ///
+    /// Things like handling retransmissions and keep-alive checks.
+    Sctp,
+
+    /// Data channels.
+    ///
+    /// Scheduled when we need to open allocations using SCTP.
+    Channel,
+
+    /// Stats gathering (if enabled).
+    ///
+    /// Periodic gathering of statistics.
+    Stats,
+
+    /// Regular RTP feedback.
+    ///
+    /// Receiver reports (RR) and sender reports (SR).
+    Feedback,
+
+    /// Sending of RTP NACK.
+    ///
+    /// When missing packets are discovered, a NACK is scheduled.
+    Nack,
+
+    /// Reporting of TWCC (if enabled).
+    ///
+    /// All incoming RTP packets are reported using TWCC. Enabled via SDP if both
+    /// sides support it.
+    Twcc,
+
+    /// RTP streams not receiving data goes into a paused state.
+    ///
+    /// Whenever an RTP receive stream receives data, a new timeout is scheduled.
+    PauseCheck,
+
+    /// Preprocessing of RTP packets to be sent.
+    ///
+    /// Housekeeping task in RTP send streams.
+    SendStream,
+
+    /// Packetizing of media into RTP data (if used).
+    ///
+    /// Written media data needs packetizing. This is not used in RTP mode.
+    Packetize,
+
+    /// Paced sending of RTP packets (if BWE is enabled).
+    ///
+    /// The pacer ensures bigger RTP chunks, like keyframes, are not sent as a burst,
+    /// but sent smoothly.
+    Pacing,
+
+    /// Bandwidth estimation update (if enabled).
+    ///
+    /// Calculations regarding sender bandwidth using incoming TWCC.
+    Bwe,
+}
+
+impl Default for Reason {
+    fn default() -> Self {
+        Self::NotHappening
+    }
+}
+
 impl Rtc {
     /// Creates a new instance with default settings.
     ///
     /// To configure the instance, use [`RtcConfig`].
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// use str0m::Rtc;
     ///
     /// let rtc = Rtc::new();
+    /// # }
     /// ```
     pub fn new() -> Self {
         let config = RtcConfig::default();
@@ -991,10 +1129,12 @@ impl Rtc {
     /// Creates a config builder that configures an [`Rtc`] instance.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::Rtc;
     /// let rtc = Rtc::builder()
     ///     .set_ice_lite(true)
     ///     .build();
+    /// # }
     /// ```
     pub fn builder() -> RtcConfig {
         RtcConfig::new()
@@ -1003,19 +1143,23 @@ impl Rtc {
     pub(crate) fn new_from_config(config: RtcConfig) -> Self {
         let session = Session::new(&config);
 
-        let mut ice = IceAgent::with_local_credentials(config.local_ice_credentials);
+        let local_creds = config.local_ice_credentials.unwrap_or_else(IceCreds::new);
+        let mut ice = IceAgent::with_local_credentials(local_creds);
         if config.ice_lite {
             ice.set_ice_lite(config.ice_lite);
         }
 
+        let dtls_cert = match config.dtls_cert_config {
+            DtlsCertConfig::Options(options) => DtlsCert::new(config.crypto_provider, options),
+            DtlsCertConfig::PregeneratedCert(cert) => cert,
+        };
+
+        let crypto_provider = dtls_cert.crypto_provider();
+
         Rtc {
             alive: true,
             ice,
-            dtls: Dtls::new(
-                config.dtls_cert.unwrap_or_else(DtlsCert::new),
-                config.fingerprint_verification,
-            )
-            .expect("DTLS to init without problem"),
+            dtls: Dtls::new(dtls_cert).expect("DTLS to init without problem"),
             session,
             sctp: RtcSctp::new(),
             chan: ChannelHandler::default(),
@@ -1023,10 +1167,13 @@ impl Rtc {
             remote_fingerprint: None,
             remote_addrs: vec![],
             send_addr: None,
+            need_init_time: true,
             last_now: already_happened(),
             peer_bytes_rx: 0,
             peer_bytes_tx: 0,
             change_counter: 0,
+            last_timeout_reason: Reason::NotHappening,
+            crypto_provider,
         }
     }
 
@@ -1039,6 +1186,7 @@ impl Rtc {
     /// The instance can be manually disconnected using [`Rtc::disconnect()`].
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::Rtc;
     /// let mut rtc = Rtc::new();
     ///
@@ -1046,6 +1194,7 @@ impl Rtc {
     ///
     /// rtc.disconnect();
     /// assert!(!rtc.is_alive());
+    /// # }
     /// ```
     pub fn is_alive(&self) -> bool {
         self.alive
@@ -1057,21 +1206,26 @@ impl Rtc {
     /// produce anymore network output or events.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::Rtc;
     /// let mut rtc = Rtc::new();
     ///
     /// rtc.disconnect();
     /// assert!(!rtc.is_alive());
+    /// # }
     /// ```
     pub fn disconnect(&mut self) {
         if self.alive {
-            info!("Set alive=false");
+            debug!("Set alive=false");
             self.alive = false;
         }
     }
 
     /// Add a local ICE candidate. Local candidates are socket addresses the `Rtc` instance
     /// use for communicating with the peer.
+    ///
+    /// If the candidate is accepted by the `Rtc` instance, it will return `Some` with a reference
+    /// to it. You should then signal this candidate to the remote peer.
     ///
     /// This library has no built-in discovery of local network addresses on the host
     /// or NATed addresses via a STUN server or TURN server. The user of the library
@@ -1081,6 +1235,7 @@ impl Rtc {
     /// however advisable to add at least one local candidate before starting the instance.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::{Rtc, Candidate};
     /// let mut rtc = Rtc::new();
     ///
@@ -1088,11 +1243,12 @@ impl Rtc {
     /// let c = Candidate::host(a, "udp").unwrap();
     ///
     /// rtc.add_local_candidate(c);
+    /// # }
     /// ```
     ///
     /// [1]: https://www.rfc-editor.org/rfc/rfc8838.txt
-    pub fn add_local_candidate(&mut self, c: Candidate) {
-        self.ice.add_local_candidate(c);
+    pub fn add_local_candidate(&mut self, c: Candidate) -> Option<&Candidate> {
+        self.ice.add_local_candidate(c)
     }
 
     /// Add a remote ICE candidate. Remote candidates are addresses of the peer.
@@ -1104,6 +1260,7 @@ impl Rtc {
     /// that are "trickled" from the other side.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::{Rtc, Candidate};
     /// let mut rtc = Rtc::new();
     ///
@@ -1111,6 +1268,7 @@ impl Rtc {
     /// let c = Candidate::host(a, "udp").unwrap();
     ///
     /// rtc.add_remote_candidate(c);
+    /// }
     /// ```
     ///
     /// [1]: https://www.rfc-editor.org/rfc/rfc8838.txt
@@ -1120,10 +1278,9 @@ impl Rtc {
 
     /// Checks if we are connected.
     ///
-    /// This tests both if we have ICE connection and DTLS is ready.
-    ///
+    /// This tests if we have ICE connection, DTLS and the SRTP crypto derived contexts are up.
     pub fn is_connected(&self) -> bool {
-        self.ice.state().is_connected() && self.dtls.is_connected()
+        self.ice.state().is_connected() && self.dtls.is_connected() && self.session.is_connected()
     }
 
     /// Make changes to the Rtc session via SDP.
@@ -1135,8 +1292,8 @@ impl Rtc {
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
-    /// let mid_audio = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
-    /// let mid_video = changes.add_media(MediaKind::Video, Direction::SendOnly, None, None);
+    /// let mid_audio = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+    /// let mid_video = changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
     ///
     /// let (offer, pending) = changes.apply().unwrap();
     /// let json = serde_json::to_vec(&offer).unwrap();
@@ -1182,13 +1339,16 @@ impl Rtc {
     /// writer.write(pt, data.network_time, data.time, data.data).unwrap();
     /// ```
     ///
-    /// This is a sample level API: For RTP level see [`DirectApi::stream_tx()`] and [`DirectApi::stream_rx()`].
+    /// This is a sample level API: For RTP level see [`DirectApi::stream_tx()`]
+    /// and [`DirectApi::stream_rx()`].
     ///
     pub fn writer(&mut self, mid: Mid) -> Option<Writer> {
         if self.session.rtp_mode {
             panic!("In rtp_mode use direct_api().stream_tx().write_rtp()");
         }
 
+        // This does not catch potential RIDs required to send simulcast, but
+        // it's a good start. An error might arise later on RID mismatch.
         self.session.media_by_mid_mut(mid)?;
 
         Some(Writer::new(&mut self.session, mid))
@@ -1206,7 +1366,7 @@ impl Rtc {
             return Ok(());
         }
 
-        info!("DTLS setup is: {:?}", active);
+        debug!("DTLS setup is: {:?}", active);
         self.dtls.set_active(active);
 
         if active {
@@ -1256,7 +1416,9 @@ impl Rtc {
 
         match &o {
             Output::Event(e) => match e {
-                Event::ChannelData(_) | Event::MediaData(_) => trace!("{:?}", e),
+                Event::ChannelData(_) | Event::MediaData(_) | Event::RtpPacket(_) => {
+                    trace!("{:?}", e)
+                }
                 _ => debug!("{:?}", e),
             },
             Output::Transmit(t) => {
@@ -1271,6 +1433,7 @@ impl Rtc {
 
     fn do_poll_output(&mut self) -> Result<Output, RtcError> {
         if !self.alive {
+            self.last_timeout_reason = Reason::NotHappening;
             return Ok(Output::Timeout(not_happening()));
         }
 
@@ -1283,7 +1446,7 @@ impl Rtc {
                     return Ok(Output::Event(Event::IceConnectionStateChange(v)))
                 }
                 IceAgentEvent::DiscoveredRecv { proto, source } => {
-                    info!("ICE remote address: {:?}/{:?}", source, proto);
+                    debug!("ICE remote address: {:?}/{:?}", Pii(source), proto);
                     self.remote_addrs.push(source);
                     while self.remote_addrs.len() > 20 {
                         self.remote_addrs.remove(0);
@@ -1294,9 +1457,11 @@ impl Rtc {
                     source,
                     destination,
                 } => {
-                    info!(
+                    debug!(
                         "ICE nominated send from: {:?} to: {:?} with protocol {:?}",
-                        source, destination, proto,
+                        Pii(source),
+                        Pii(destination),
+                        proto,
                     );
                     self.send_addr = Some(SendAddr {
                         proto,
@@ -1316,12 +1481,14 @@ impl Rtc {
                     dtls_connected = true;
                 }
                 DtlsEvent::SrtpKeyingMaterial(mat, srtp_profile) => {
-                    info!(
+                    debug!(
                         "DTLS set SRTP keying material and profile: {}",
                         srtp_profile
                     );
                     let active = self.dtls.is_active().expect("DTLS must be inited by now");
-                    self.session.set_keying_material(mat, srtp_profile, active);
+                    let srtp_crypto = self.crypto_provider.srtp_crypto();
+                    self.session
+                        .set_keying_material(mat, &srtp_crypto, srtp_profile, active);
                 }
                 DtlsEvent::RemoteFingerprint(v1) => {
                     debug!("DTLS verify remote fingerprint");
@@ -1391,11 +1558,12 @@ impl Rtc {
         }
 
         if let Some(ev) = self.session.poll_event() {
-            if let Event::Error(err) = ev {
-                return Err(err);
-            } else {
-                return Ok(Output::Event(ev));
-            }
+            return Ok(Output::Event(ev));
+        }
+
+        // Some polling needs to bubble up errors.
+        if let Some(ev) = self.session.poll_event_fallible()? {
+            return Ok(Output::Event(ev));
         }
 
         if let Some(e) = self.stats.as_mut().and_then(|s| s.poll_output()) {
@@ -1425,18 +1593,25 @@ impl Rtc {
                 };
                 return Ok(Output::Transmit(t));
             }
+        } else {
+            // Don't allow accumulated feedback to build up indefinitely
+            self.session.clear_feedback();
         }
 
-        let time_and_reason = (None, "<not happening>")
-            .soonest((self.ice.poll_timeout(), "ice"))
-            .soonest((self.session.poll_timeout(), "session"))
-            .soonest((self.sctp.poll_timeout(), "sctp"))
-            .soonest((self.chan.poll_timeout(&self.sctp), "chan"))
-            .soonest((self.stats.as_mut().and_then(|s| s.poll_timeout()), "stats"));
+        let stats = self.stats.as_mut();
+
+        let time_and_reason = (None, Reason::NotHappening)
+            .soonest((self.dtls.poll_timeout(self.last_now), Reason::DTLS))
+            .soonest((self.ice.poll_timeout(), Reason::Ice))
+            .soonest(self.session.poll_timeout())
+            .soonest((self.sctp.poll_timeout(), Reason::Sctp))
+            .soonest((self.chan.poll_timeout(&self.sctp), Reason::Channel))
+            .soonest((stats.and_then(|s| s.poll_timeout()), Reason::Stats));
 
         // trace!("poll_output timeout reason: {}", time_and_reason.1);
 
         let time = time_and_reason.0.unwrap_or_else(not_happening);
+        let reason = time_and_reason.1;
 
         // We want to guarantee time doesn't go backwards.
         let next = if time < self.last_now {
@@ -1445,7 +1620,33 @@ impl Rtc {
             time
         };
 
+        self.last_timeout_reason = reason;
+
         Ok(Output::Timeout(next))
+    }
+
+    /// The reason for the last [`Output::Timeout`]
+    ///
+    /// This is updated when calling [`Rtc::poll_output()`] and the next output
+    /// is a timeout.
+    ///
+    /// ```
+    /// # #[cfg(feature = "openssl")] {
+    /// # use str0m::{Rtc, Input, Output, Reason};
+    /// let mut rtc = Rtc::new();
+    ///
+    /// let output = rtc.poll_output().unwrap();
+    ///
+    /// // Reason updates every time we get an Output::Timeout
+    /// assert!(matches!(output, Output::Timeout(_)));
+    ///
+    /// // If there are no timeouts scheduled, we get NotHappening. The timeout
+    /// // value itself will be in the distant future.
+    /// assert_eq!(rtc.last_timeout_reason(), Reason::DTLS);
+    /// # }
+    /// ```
+    pub fn last_timeout_reason(&self) -> Reason {
+        self.last_timeout_reason
     }
 
     /// Check if this `Rtc` instance accepts the given input. This is used for demultiplexing
@@ -1454,7 +1655,8 @@ impl Rtc {
     /// [`Input::Timeout`] is always accepted. [`Input::Receive`] is tested against the nominated
     /// ICE candidate. If that doesn't match and the incoming data is a STUN packet, the accept call
     /// is delegated to the ICE agent which recognizes the remote peer from `a=ufrag`/`a=password`
-    /// credentials negotiated in the SDP.
+    /// credentials negotiated in the SDP. If that also doesn't match, all remote ICE candidates are
+    /// checked for a match.
     ///
     /// In a server setup, the server would try to find an `Rtc` instances using [`Rtc::accepts()`].
     /// The first found instance would be given the input via [`Rtc::handle_input()`].
@@ -1483,11 +1685,9 @@ impl Rtc {
             return true;
         };
 
-        // This should cover Dtls, Rtp and Rtcp
+        // Fast path: DTLS, RTP, and RTCP traffic coming in from the same socket address
+        // we've nominated for sending via the ICE agent. This is the typical case
         if let Some(send_addr) = &self.send_addr {
-            // TODO: This assume symmetrical routing, i.e. we are getting
-            // the incoming traffic from a remote peer from the same socket address
-            // we've nominated for sending via the ICE agent.
             if r.source == send_addr.destination {
                 return true;
             }
@@ -1495,8 +1695,15 @@ impl Rtc {
 
         // STUN can use the ufrag/password to identify that a message belongs
         // to this Rtc instance.
-        if let DatagramRecv::Stun(v) = &r.contents {
+        if let DatagramRecvInner::Stun(v) = &r.contents.inner {
             return self.ice.accepts_message(v);
+        }
+
+        // Slow path: Occasionally, traffic comes in on a socket address corresponding
+        // to a successful candidate pair other than the one we've currently nominated.
+        // This typically happens at the beginning of the connection
+        if self.ice.has_viable_remote_candidate(r.source) {
+            return true;
         }
 
         false
@@ -1542,9 +1749,16 @@ impl Rtc {
     }
 
     fn init_time(&mut self, now: Instant) {
+        // The operation is somewhat expensive, hence we only do it once.
+        if !self.need_init_time {
+            return;
+        }
+
         // We assume this first "now" is a time 0 start point for calculating ntp/unix time offsets.
         // This initializes the conversion of Instant -> NTP/Unix time.
         let _ = now.to_unix_duration();
+
+        self.need_init_time = false;
     }
 
     fn do_handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
@@ -1561,6 +1775,14 @@ impl Rtc {
                 let mut snapshot = StatsSnapshot::new(now);
                 snapshot.peer_rx = self.peer_bytes_rx;
                 snapshot.peer_tx = self.peer_bytes_tx;
+                snapshot.selected_candidate_pair =
+                    self.send_addr.as_ref().map(|s| CandidatePairStats {
+                        protocol: s.proto,
+                        local: CandidateStats { addr: s.source },
+                        remote: CandidateStats {
+                            addr: s.destination,
+                        },
+                    });
                 self.session.visit_stats(now, &mut snapshot);
                 stats.do_handle_timeout(&mut snapshot);
             }
@@ -1574,9 +1796,9 @@ impl Rtc {
 
         trace!("IN {:?}", r);
         self.last_now = now;
-        use net::DatagramRecv::*;
+        use DatagramRecvInner::*;
 
-        let bytes_rx = match r.contents {
+        let bytes_rx = match r.contents.inner {
             // TODO: stun is already parsed (depacketized) here
             Stun(_) => 0,
             Dtls(v) | Rtp(v) | Rtcp(v) => v.len(),
@@ -1584,10 +1806,19 @@ impl Rtc {
 
         self.peer_bytes_rx += bytes_rx as u64;
 
-        match r.contents {
-            Stun(_) => self.ice.handle_receive(now, r),
-            Dtls(_) => self.dtls.handle_receive(r)?,
-            Rtp(_) | Rtcp(_) => self.session.handle_receive(now, r),
+        match r.contents.inner {
+            Stun(stun) => {
+                let packet = io::StunPacket {
+                    proto: r.proto,
+                    source: r.source,
+                    destination: r.destination,
+                    message: stun,
+                };
+                self.ice.handle_packet(now, packet);
+            }
+            Dtls(dtls) => self.dtls.handle_receive(dtls)?,
+            Rtp(rtp) => self.session.handle_rtp_receive(now, rtp),
+            Rtcp(rtcp) => self.session.handle_rtcp_receive(now, rtcp),
         }
 
         Ok(())
@@ -1646,48 +1877,52 @@ impl Rtc {
     pub fn codec_config(&self) -> &CodecConfig {
         &self.session.codec_config
     }
+}
 
-    /// All media mids (not application). For integration tests.
-    #[doc(hidden)]
-    pub fn mids(&self) -> Vec<Mid> {
-        self.session.medias.iter().map(Media::mid).collect()
-    }
+/// Configuation for the DTLS certificate used for the Rtc instance. This can be set to
+/// allow a pregenerated certificate, or options to pass when generating a certificate
+/// on-the-fly.
+///
+/// The default value is DtlsCertConfig::Options(DtlsCertOptions::default())
+#[derive(Clone, Debug)]
+pub enum DtlsCertConfig {
+    /// The options to use for the DTLS certificate generated for this Rtc instance.
+    Options(DtlsCertOptions),
+    /// A pregenerated certificate to use for this Rtc instance.
+    PregeneratedCert(DtlsCert),
+}
 
-    /// All current RTP header extensions. For integration tests.
-    #[doc(hidden)]
-    pub fn exts(&self) -> &ExtensionMap {
-        &self.session.exts
-    }
-
-    /// Current local ICE credentials. For integration tests.
-    #[doc(hidden)]
-    pub fn local_ice_creds(&self) -> IceCreds {
-        self.ice.local_credentials().clone()
+impl Default for DtlsCertConfig {
+    fn default() -> Self {
+        DtlsCertConfig::Options(DtlsCertOptions::default())
     }
 }
 
 /// Customized config for creating an [`Rtc`] instance.
 ///
 /// ```
+/// # #[cfg(feature = "openssl")] {
 /// use str0m::RtcConfig;
 ///
 /// let rtc = RtcConfig::new()
 ///     .set_ice_lite(true)
 ///     .build();
+/// # }
 /// ```
 ///
 /// Configs implement [`Clone`] to help create multiple `Rtc` instances.
 #[derive(Debug, Clone)]
 pub struct RtcConfig {
-    local_ice_credentials: IceCreds,
-    dtls_cert: Option<DtlsCert>,
+    local_ice_credentials: Option<IceCreds>,
+    crypto_provider: CryptoProvider,
+    dtls_cert_config: DtlsCertConfig,
     fingerprint_verification: bool,
     ice_lite: bool,
     codec_config: CodecConfig,
     exts: ExtensionMap,
     stats_interval: Option<Duration>,
     /// Whether to use Bandwidth Estimation to discover the egress bandwidth.
-    bwe_initial_bitrate: Option<Bitrate>,
+    bwe_config: Option<BweConfig>,
     reordering_size_audio: usize,
     reordering_size_video: usize,
     send_buffer_audio: usize,
@@ -1696,52 +1931,100 @@ pub struct RtcConfig {
     enable_raw_packets: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BweConfig {
+    initial_bitrate: Bitrate,
+    enable_loss_controller: bool,
+}
+
 impl RtcConfig {
     /// Creates a new default config.
     pub fn new() -> Self {
         RtcConfig::default()
     }
 
-    /// The auto generated local ice credentials.
-    pub fn local_ice_credentials(&self) -> &IceCreds {
+    /// Get the local ICE credentials, if set.
+    ///
+    /// If not specified, local credentials will be randomly generated when
+    /// building the [`Rtc`] instance.
+    pub fn local_ice_credentials(&self) -> &Option<IceCreds> {
         &self.local_ice_credentials
     }
 
-    /// Get the configured DTLS certificate, if set.
-    ///
-    /// Returns [`None`] if no DTLS certificate is set. In such cases,
-    /// the certificate will be created on build and you can use the
-    /// direct API on an [`Rtc`] instance to obtain the local
-    /// DTLS fingerprint.
-    ///
-    /// ```
-    /// use str0m::RtcConfig;
-    ///
-    /// let fingerprint = RtcConfig::default()
-    ///     .build()
-    ///     .direct_api()
-    ///     .local_dtls_fingerprint();
-    /// ```
-    pub fn dtls_cert(&self) -> Option<&DtlsCert> {
-        self.dtls_cert.as_ref()
+    /// Explicitly sets local ICE credentials.
+    pub fn set_local_ice_credentials(mut self, local_ice_credentials: IceCreds) -> Self {
+        self.local_ice_credentials = Some(local_ice_credentials);
+        self
     }
 
-    /// Set the DTLS certificate for secure communication.
+    /// Set the crypto provider.
     ///
-    /// Generating a certificate can be a time-consuming process.
-    /// Use this API to reuse a previously created [`DtlsCert`] if available.
+    /// This happens implicitly if you use [`RtcConfig::set_dtls_cert_config()`].
+    ///
+    /// Panics: If you `set_dtls_cert_config()` followed by a different [`CryptoProvider`].
+    ///
+    /// This overrides what is set in [`CryptoProvider::install_process_default()`].
+    pub fn set_crypto_provider(mut self, p: CryptoProvider) -> Self {
+        if let DtlsCertConfig::PregeneratedCert(c) = &self.dtls_cert_config {
+            if p != c.crypto_provider() {
+                panic!("set_dtls_cert_config() locked crypto provider to: {}", p);
+            }
+        } else {
+            self.crypto_provider = p;
+        }
+        self
+    }
+
+    /// The configured crypto provider.
+    ///
+    /// Defaults to what's set in [`CryptoProvider::install_process_default()`] followed
+    /// by a fallback to [`CryptoProvider::OpenSsl`].
+    pub fn crypto_provider(&self) -> CryptoProvider {
+        self.crypto_provider
+    }
+
+    /// Returns the configured DTLS certificate configuration.
+    ///
+    /// Defaults to a configuration similar to libwebrtc:
+    /// ```
+    /// # use str0m::DtlsCertConfig;
+    /// # use str0m::config::{DtlsCertOptions, DtlsPKeyType};
+    ///
+    /// DtlsCertConfig::Options(DtlsCertOptions {
+    ///     common_name: "WebRTC".into(),
+    ///     pkey_type: DtlsPKeyType::EcDsaP256,
+    /// });
+    /// ```
+    pub fn dtls_cert_config(&self) -> &DtlsCertConfig {
+        &self.dtls_cert_config
+    }
+
+    /// Set the DTLS certificate configuration for certificate generation.
+    ///
+    /// Setting this permits you to assign a Pregenerated certificate, or
+    /// options for certificate generation, such as signing key type, and
+    /// subject name.
+    ///
+    /// If a Pregenerated certificate is set, this locks the `crypto_provider()`
+    /// setting to the [`CryptoProvider`], for the DTLS certificate.
     ///
     /// ```
-    /// use str0m::RtcConfig;
-    /// use str0m::change::DtlsCert;
+    /// # use str0m::{DtlsCertConfig, RtcConfig};
+    /// # use str0m::config::{DtlsCertOptions, DtlsPKeyType};
     ///
-    /// let dtls_cert = DtlsCert::new();
+    /// let dtls_cert_config = DtlsCertConfig::Options(DtlsCertOptions {
+    ///     common_name: "Clark Kent".into(),
+    ///     pkey_type: DtlsPKeyType::EcDsaP256,
+    /// });
     ///
     /// let rtc_config = RtcConfig::default()
-    ///     .set_dtls_cert(dtls_cert);
+    ///     .set_dtls_cert_config(dtls_cert_config);
     /// ```
-    pub fn set_dtls_cert(mut self, dtls_cert: DtlsCert) -> Self {
-        self.dtls_cert = Some(dtls_cert);
+    pub fn set_dtls_cert_config(mut self, dtls_cert_config: DtlsCertConfig) -> Self {
+        if let DtlsCertConfig::PregeneratedCert(ref cert) = dtls_cert_config {
+            self.crypto_provider = cert.crypto_provider();
+        }
+        self.dtls_cert_config = dtls_cert_config;
         self
     }
 
@@ -1760,10 +2043,11 @@ impl RtcConfig {
     /// Get fingerprint verification mode.
     ///
     /// ```
-    /// # use str0m::RtcConfig;
+    /// # use str0m::Rtc;
+    /// let config = Rtc::builder();
     ///
-    /// // Verify that fingerprint verification is enabled by default.
-    /// assert!(RtcConfig::default().fingerprint_verification());
+    /// // Defaults to true.
+    /// assert!(config.fingerprint_verification());
     /// ```
     pub fn fingerprint_verification(&self) -> bool {
         self.fingerprint_verification
@@ -1780,11 +2064,13 @@ impl RtcConfig {
     /// Tells whether ice lite is enabled.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::Rtc;
     /// let config = Rtc::builder();
     ///
     /// // Defaults to false.
     /// assert_eq!(config.ice_lite(), false);
+    /// # }
     /// ```
     pub fn ice_lite(&self) -> bool {
         self.ice_lite
@@ -1798,14 +2084,15 @@ impl RtcConfig {
     /// Clear all configured codecs.
     ///
     /// ```
+    /// # #[cfg(feature = "openssl")] {
     /// # use str0m::RtcConfig;
-    ///
     /// // For the session to use only OPUS and VP8.
     /// let mut rtc = RtcConfig::default()
     ///     .clear_codecs()
     ///     .enable_opus(true)
     ///     .enable_vp8(true)
     ///     .build();
+    /// # }
     /// ```
     pub fn clear_codecs(mut self) -> Self {
         self.codec_config.clear();
@@ -1874,6 +2161,12 @@ impl RtcConfig {
         &mut self.exts
     }
 
+    /// Set the extension map replacing the existing.
+    pub fn set_extension_map(mut self, exts: ExtensionMap) -> Self {
+        self.exts = exts;
+        self
+    }
+
     /// Clear out the standard extension mappings.
     pub fn clear_extension_map(mut self) -> Self {
         self.exts.clear();
@@ -1923,7 +2216,25 @@ impl RtcConfig {
     ///
     /// This includes setting the initial estimate to start with.
     pub fn enable_bwe(mut self, initial_estimate: Option<Bitrate>) -> Self {
-        self.bwe_initial_bitrate = initial_estimate;
+        match initial_estimate {
+            Some(b) => {
+                let conf = self.bwe_config.get_or_insert(BweConfig::new(b));
+                conf.initial_bitrate = b;
+            }
+            None => {
+                self.bwe_config = None;
+            }
+        }
+
+        self
+    }
+
+    /// Enable the experimental loss based BWE subsystem.
+    /// Defaults to disabled for now, will be enabled by default in the future.
+    pub fn enable_experimental_loss_based_bwe(mut self, enabled: bool) -> Self {
+        if let Some(c) = &mut self.bwe_config {
+            c.enable_loss_controller = enabled;
+        }
 
         self
     }
@@ -1938,7 +2249,7 @@ impl RtcConfig {
     /// assert_eq!(config.bwe_initial_bitrate(), None);
     /// ```
     pub fn bwe_initial_bitrate(&self) -> Option<Bitrate> {
-        self.bwe_initial_bitrate
+        self.bwe_config.as_ref().map(|c| c.initial_bitrate)
     }
 
     /// Sets the number of packets held back for reordering audio packets.
@@ -2017,6 +2328,8 @@ impl RtcConfig {
     /// fits in one. If you can guarantee that every `write()` is a single RTP packet, and is always
     /// followed by a `poll_output()`, it might be possible to set this value to 1. But that would give
     /// no margins for unexpected patterns.
+    ///
+    /// panics if set to 0.
     pub fn set_send_buffer_audio(mut self, size: usize) -> Self {
         assert!(size > 0);
         self.send_buffer_audio = size;
@@ -2107,17 +2420,27 @@ impl RtcConfig {
     }
 }
 
+impl BweConfig {
+    fn new(initial_bitrate: Bitrate) -> Self {
+        Self {
+            initial_bitrate,
+            enable_loss_controller: false,
+        }
+    }
+}
+
 impl Default for RtcConfig {
     fn default() -> Self {
         Self {
-            local_ice_credentials: IceCreds::new(),
-            dtls_cert: None,
+            local_ice_credentials: None,
+            crypto_provider: CryptoProvider::process_default().unwrap_or(CryptoProvider::OpenSsl),
+            dtls_cert_config: Default::default(),
             fingerprint_verification: true,
             ice_lite: false,
             codec_config: CodecConfig::new_with_defaults(),
             exts: ExtensionMap::standard(),
             stats_interval: None,
-            bwe_initial_bitrate: None,
+            bwe_config: None,
             reordering_size_audio: 15,
             reordering_size_video: 30,
             send_buffer_audio: 50,
@@ -2188,6 +2511,12 @@ macro_rules! log_stat {
 pub(crate) use log_stat;
 
 #[cfg(test)]
+#[doc(hidden)]
+pub fn init_crypto_default() {
+    crate::config::CryptoProvider::from_feature_flags().__test_install_process_default();
+}
+
+#[cfg(test)]
 mod test {
     use std::panic::UnwindSafe;
 
@@ -2210,13 +2539,10 @@ mod test {
     #[test]
     fn event_is_reasonably_sized() {
         let n = std::mem::size_of::<Event>();
-        println!("{:?}", n);
         assert!(n < 450);
     }
 }
 
-#[cfg(fuzzing)]
+#[cfg(feature = "_internal_test_exports")]
 #[allow(missing_docs)]
-pub mod fuzz {
-    pub use crate::streams::rtx_cache_buf::EvictingBuffer;
-}
+pub mod _internal_test_exports;

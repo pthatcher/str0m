@@ -1,10 +1,11 @@
 use crate::channel::ChannelId;
-use crate::dtls::Fingerprint;
-use crate::ice::IceCreds;
+use crate::crypto::Fingerprint;
 use crate::media::{Media, MediaKind};
+use crate::rtp_::MidRid;
 use crate::rtp_::{Mid, Rid, Ssrc};
 use crate::sctp::ChannelConfig;
-use crate::streams::{StreamRx, StreamTx, DEFAULT_RTX_CACHE_DURATION};
+use crate::streams::{StreamRx, StreamTx, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP};
+use crate::IceCreds;
 use crate::Rtc;
 use crate::RtcError;
 
@@ -187,10 +188,12 @@ impl<'a> DirectApi<'a> {
         // By default we do not suppress nacks, this has to be called explicitly by the user of direct API.
         let suppress_nack = false;
 
+        let midrid = MidRid(mid, rid);
+
         self.rtc
             .session
             .streams
-            .expect_stream_rx(ssrc, rtx, mid, rid, suppress_nack, None)
+            .expect_stream_rx(ssrc, rtx, midrid, suppress_nack)
     }
 
     /// Remove the receive stream for the given SSRC.
@@ -211,7 +214,8 @@ impl<'a> DirectApi<'a> {
 
     /// Obtain a recv stream by looking it up via mid/rid.
     pub fn stream_rx_by_mid(&mut self, mid: Mid, rid: Option<Rid>) -> Option<&mut StreamRx> {
-        self.rtc.session.streams.rx_by_mid_rid(mid, rid)
+        let midrid = MidRid(mid, rid);
+        self.rtc.session.streams.stream_rx_by_midrid(midrid, true)
     }
 
     /// Declare the intention to send data using the given SSRC.
@@ -228,17 +232,24 @@ impl<'a> DirectApi<'a> {
         mid: Mid,
         rid: Option<Rid>,
     ) -> &mut StreamTx {
-        let Some(media) = self.rtc.session.media_by_mid(mid) else {
+        let Some(media) = self.rtc.session.media_by_mid_mut(mid) else {
             panic!("No media declared for mid: {}", mid);
         };
 
         let is_audio = media.kind().is_audio();
 
+        let midrid = MidRid(mid, rid);
+
+        // If there is a RID tx, declare it so we an use it in Writer API
+        if let Some(rid) = rid {
+            media.add_to_rid_tx(rid);
+        }
+
         let stream = self
             .rtc
             .session
             .streams
-            .declare_stream_tx(ssrc, rtx, mid, rid);
+            .declare_stream_tx(ssrc, rtx, midrid);
 
         let size = if is_audio {
             self.rtc.session.send_buffer_audio
@@ -246,7 +257,7 @@ impl<'a> DirectApi<'a> {
             self.rtc.session.send_buffer_video
         };
 
-        stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION);
+        stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP);
 
         stream
     }
@@ -267,6 +278,49 @@ impl<'a> DirectApi<'a> {
 
     /// Obtain a send stream by looking it up via mid/rid.
     pub fn stream_tx_by_mid(&mut self, mid: Mid, rid: Option<Rid>) -> Option<&mut StreamTx> {
-        self.rtc.session.streams.tx_by_mid_rid(mid, rid)
+        let midrid = MidRid(mid, rid);
+        self.rtc.session.streams.stream_tx_by_midrid(midrid)
+    }
+
+    /// Reset a transmit stream to use a new SSRC and optionally a new RTX SSRC.
+    ///
+    /// This changes the SSRC of an existing stream and resets all relevant state.
+    /// Use this when you need to change the SSRC of an existing stream without creating a new one.
+    ///
+    /// If the stream has an RTX SSRC, `new_rtx` must be provided. If the stream doesn't
+    /// have an RTX SSRC, `new_rtx` is ignored.
+    ///
+    /// Returns a reference to the updated stream or None if:
+    /// - No stream was found for the given mid/rid
+    /// - The new SSRC is the same as the current one (no change needed)
+    /// - The new RTX SSRC is the same as the current one (no change needed)
+    pub fn reset_stream_tx(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        new_ssrc: Ssrc,
+        new_rtx: Option<Ssrc>,
+    ) -> Option<&mut StreamTx> {
+        let midrid = MidRid(mid, rid);
+
+        // Find the stream by mid/rid
+        let stream = self.rtc.session.streams.stream_tx_by_midrid(midrid)?;
+
+        // Don't change to the same SSRC
+        if stream.ssrc() == new_ssrc {
+            return None;
+        }
+
+        // If the stream has an RTX SSRC, New RTX must be provided and differ.
+        // But it is allowed to start or turn off RTX.
+        if stream.rtx().is_some() && stream.rtx() == new_rtx {
+            return None;
+        }
+
+        // Reset the stream with the new SSRC and RTX
+        stream.reset_ssrc(new_ssrc, new_rtx);
+
+        // Return a reference to the updated stream
+        Some(stream)
     }
 }

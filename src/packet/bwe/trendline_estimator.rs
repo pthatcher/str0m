@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
-use super::{BandwithUsage, InterGroupDelayDelta};
+use super::time::{TimeDelta, Timestamp};
+use super::{BandwidthUsage, InterGroupDelayDelta};
 
 const SMOOTHING_COEF: f64 = 0.9;
 const OVER_USE_THRESHOLD_DEFAULT_MS: f64 = 12.5;
@@ -20,7 +21,7 @@ pub(super) struct TrendlineEstimator {
     window_size: usize,
 
     /// The first instant we saw, used as zero point.
-    zero_time: Option<Instant>,
+    zero_time: Option<Timestamp>,
 
     /// The history of observed delay variations.
     history: VecDeque<Timing>,
@@ -47,7 +48,7 @@ pub(super) struct TrendlineEstimator {
     last_threshold_update: Option<Instant>,
 
     /// Our current hypothesis about the bandwidth usage.
-    hypothesis: BandwithUsage,
+    hypothesis: BandwidthUsage,
 }
 
 impl TrendlineEstimator {
@@ -63,7 +64,7 @@ impl TrendlineEstimator {
             previous_trend: 0.0,
             overuse: None,
             last_threshold_update: None,
-            hypothesis: BandwithUsage::Normal,
+            hypothesis: BandwidthUsage::Normal,
         }
     }
 
@@ -97,22 +98,25 @@ impl TrendlineEstimator {
         }
     }
 
-    pub(super) fn hypothesis(&self) -> BandwithUsage {
+    pub(super) fn hypothesis(&self) -> BandwidthUsage {
         self.hypothesis
     }
 
     fn do_add_to_history(&mut self, variation: InterGroupDelayDelta, now: Instant) {
-        let zero_time = *self
-            .zero_time
-            .get_or_insert(variation.last_remote_recv_time);
+        let last_remote_recv_time = Timestamp::from(variation.last_remote_recv_time);
+
+        let zero_time = *self.zero_time.get_or_insert(last_remote_recv_time);
+
+        let delay_delta = variation.arrival_delta.as_secs_f64() * 1000.0
+            - variation.send_delta.as_secs_f64() * 1000.0;
 
         self.num_delay_variations += 1;
         self.num_delay_variations = self.num_delay_variations.min(*DELAY_COUNT_RANGE.end());
-        self.accumulated_delay += variation.delay_delta;
+        self.accumulated_delay += delay_delta;
         self.smoothed_delay =
             self.smoothed_delay * SMOOTHING_COEF + (1.0 - SMOOTHING_COEF) * self.accumulated_delay;
 
-        let remote_recv_time = variation.last_remote_recv_time - zero_time;
+        let remote_recv_time = last_remote_recv_time - zero_time;
         let timing = Timing {
             at: now,
             remote_recv_time_ms: remote_recv_time.as_secs_f64() * 1000.0,
@@ -170,7 +174,8 @@ impl TrendlineEstimator {
 
     fn detect(&mut self, trend: f64, variation: InterGroupDelayDelta, now: Instant) {
         if self.num_delay_variations < 2 {
-            self.update_hypothesis(BandwithUsage::Normal);
+            self.update_hypothesis(BandwidthUsage::Normal);
+            return;
         }
 
         let modified_trend = self.num_delay_variations.min(*DELAY_COUNT_RANGE.start()) as f64
@@ -216,14 +221,14 @@ impl TrendlineEstimator {
             {
                 self.overuse = None;
 
-                self.update_hypothesis(BandwithUsage::Overuse);
+                self.update_hypothesis(BandwidthUsage::Overuse);
             }
         } else if modified_trend < -self.delay_threshold {
             self.overuse = None;
-            self.update_hypothesis(BandwithUsage::Underuse);
+            self.update_hypothesis(BandwidthUsage::Underuse);
         } else {
             self.overuse = None;
-            self.update_hypothesis(BandwithUsage::Normal);
+            self.update_hypothesis(BandwidthUsage::Normal);
         }
 
         self.previous_trend = trend;
@@ -265,7 +270,7 @@ impl TrendlineEstimator {
         );
     }
 
-    fn update_hypothesis(&mut self, new_hypothesis: BandwithUsage) {
+    fn update_hypothesis(&mut self, new_hypothesis: BandwidthUsage) {
         if self.hypothesis == new_hypothesis {
             return;
         }
@@ -277,6 +282,7 @@ impl TrendlineEstimator {
 
 #[derive(Debug)]
 struct Timing {
+    #[allow(unused)]
     at: Instant,
     remote_recv_time_ms: f64,
     smoothed_delay_ms: f64,
@@ -284,14 +290,14 @@ struct Timing {
 
 struct Overuse {
     count: usize,
-    time_overusing: Duration,
+    time_overusing: TimeDelta,
 }
 
 #[cfg(test)]
 mod test {
     use std::time::{Duration, Instant};
 
-    use crate::packet::bwe::BandwithUsage;
+    use crate::packet::bwe::BandwidthUsage;
 
     use super::{InterGroupDelayDelta, TrendlineEstimator};
 
@@ -302,14 +308,14 @@ mod test {
         let mut estimator = TrendlineEstimator::new(20);
 
         estimator.add_delay_observation(
-            delay_variation(0.0, duration_ms(1), remote_recv_time_base),
+            delay_variation(duration_ms(1), duration_ms(1), remote_recv_time_base),
             now,
         );
 
-        for i in 0..25 {
+        for _ in 0..25 {
             estimator.add_delay_observation(
                 delay_variation(
-                    10.0,
+                    duration_ms(11),
                     duration_ms(1),
                     remote_recv_time_base + duration_ms(350),
                 ),
@@ -330,7 +336,7 @@ mod test {
             for i in 0..5 {
                 estimator.add_delay_observation(
                     delay_variation(
-                        0.0,
+                        duration_ms(1),
                         duration_ms(1),
                         remote_recv_time_base + Duration::from_micros(5_000 * g + i * 40),
                     ),
@@ -339,12 +345,12 @@ mod test {
             }
         }
 
-        assert_eq!(estimator.hypothesis(), BandwithUsage::Normal);
+        assert_eq!(estimator.hypothesis(), BandwidthUsage::Normal);
         assert_eq!(estimator.history.len(), 20);
 
         estimator.add_delay_observation(
             delay_variation(
-                12.0,
+                duration_ms(17),
                 duration_ms(5),
                 remote_recv_time_base + Duration::from_micros(25_000),
             ),
@@ -352,13 +358,13 @@ mod test {
         );
         assert_eq!(
             estimator.hypothesis(),
-            BandwithUsage::Normal,
+            BandwidthUsage::Normal,
             "After getting an initial increasing delay the hypothesis should remain at normal"
         );
 
         estimator.add_delay_observation(
             delay_variation(
-                13.0,
+                duration_ms(18),
                 duration_ms(5),
                 remote_recv_time_base + Duration::from_micros(25_140),
             ),
@@ -366,13 +372,14 @@ mod test {
         );
         assert_eq!(
             estimator.hypothesis(),
-            BandwithUsage::Normal,
-            "After getting an a second increasing delay the hypothesis should remain at normal because we the time overusing threshold hasn't been reached yet"
+            BandwidthUsage::Normal,
+            "After getting an a second increasing delay the hypothesis should remain at normal \
+            because we the time overusing threshold hasn't been reached yet"
         );
 
         estimator.add_delay_observation(
             delay_variation(
-                14.0,
+                duration_ms(22),
                 duration_ms(8),
                 remote_recv_time_base + Duration::from_micros(25_250),
             ),
@@ -380,8 +387,9 @@ mod test {
         );
         assert_eq!(
             estimator.hypothesis(),
-            BandwithUsage::Overuse,
-            "After getting a third increasing delay the hypothesis should move to over because we have been overusing for more than 10ms"
+            BandwidthUsage::Overuse,
+            "After getting a third increasing delay the hypothesis should move to over because \
+            we have been overusing for more than 10ms"
         );
     }
 
@@ -390,13 +398,13 @@ mod test {
     }
 
     fn delay_variation(
-        delay: f64,
+        recv_delta: Duration,
         send_delta: Duration,
         last_remote_recv_time: Instant,
     ) -> InterGroupDelayDelta {
         InterGroupDelayDelta {
-            send_delta,
-            delay_delta: delay,
+            send_delta: send_delta.into(),
+            arrival_delta: recv_delta.into(),
             last_remote_recv_time,
         }
     }

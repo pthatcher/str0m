@@ -23,16 +23,14 @@ use str0m::{net::Receive, Candidate, Event, IceConnectionState, Input, Output, R
 mod util;
 
 fn init_log() {
-    use std::env;
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "chat=info,str0m=info");
-    }
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("chat=info,str0m=info"));
 
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
+        .with(env_filter)
         .init();
 }
 
@@ -50,7 +48,7 @@ pub fn main() {
     // Spin up a UDP socket for the RTC. All WebRTC traffic is going to be multiplexed over this single
     // server socket. Clients are identified via their respective remote (UDP) socket address.
     let socket = UdpSocket::bind(format!("{host_addr}:0")).expect("binding a random UDP port");
-    let addr = socket.local_addr().expect("a local socket adddress");
+    let addr = socket.local_addr().expect("a local socket address");
     info!("Bound UDP port: {}", addr);
 
     // The run loop is on a separate thread to the web server.
@@ -88,7 +86,7 @@ fn web_request(request: &Request, addr: SocketAddr, tx: SyncSender<Rtc>) -> Resp
 
     // Add the shared UDP socket as a host candidate
     let candidate = Candidate::host(addr, "udp").expect("a host candidate");
-    rtc.add_local_candidate(candidate);
+    rtc.add_local_candidate(candidate).unwrap();
 
     // Create an SDP Answer.
     let answer = rtc
@@ -242,7 +240,7 @@ fn read_socket_input<'a>(socket: &UdpSocket, buf: &'a mut Vec<u8>) -> Option<Inp
                 return None;
             };
 
-            return Some(Input::Receive(
+            Some(Input::Receive(
                 Instant::now(),
                 Receive {
                     proto: Protocol::Udp,
@@ -250,7 +248,7 @@ fn read_socket_input<'a>(socket: &UdpSocket, buf: &'a mut Vec<u8>) -> Option<Inp
                     destination: socket.local_addr().unwrap(),
                     contents,
                 },
-            ));
+            ))
         }
 
         Err(e) => match e.kind() {
@@ -495,8 +493,13 @@ impl Client {
             if let TrackOutState::ToOpen = track.state {
                 if let Some(track_in) = track.track_in.upgrade() {
                     let stream_id = track_in.origin.to_string();
-                    let mid =
-                        change.add_media(track_in.kind, Direction::SendOnly, Some(stream_id), None);
+                    let mid = change.add_media(
+                        track_in.kind,
+                        Direction::SendOnly,
+                        Some(stream_id),
+                        None,
+                        None,
+                    );
                     track.state = TrackOutState::Negotiating(mid);
                 }
             }
@@ -647,7 +650,6 @@ impl Client {
 
 /// Events propagated between client.
 #[allow(clippy::large_enum_variant)]
-
 enum Propagated {
     /// When we have nothing to propagate.
     Noop,

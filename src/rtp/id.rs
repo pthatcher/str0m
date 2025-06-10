@@ -4,9 +4,8 @@ use std::str::from_utf8;
 
 use serde::{Deserialize, Serialize};
 
-use rand::random;
-
 use crate::io::Id;
+use crate::util::NonCryptographicRng;
 
 macro_rules! str_id {
     ($id:ident, $name:literal, $num:tt, $new_len:tt) => {
@@ -77,11 +76,11 @@ macro_rules! str_id {
 }
 
 macro_rules! num_id {
-    ($id:ident, $t:ty) => {
+    ($id:ident, $t:tt) => {
         impl $id {
             /// Creates a new random id.
             pub fn new() -> Self {
-                $id(random())
+                $id(NonCryptographicRng::$t())
             }
         }
 
@@ -241,11 +240,47 @@ impl SeqNo {
     }
 }
 
+impl Default for SeqNo {
+    fn default() -> Self {
+        // https://www.rfc-editor.org/rfc/rfc3550#page-13
+        // The initial value of the sequence number SHOULD be random (unpredictable)
+        // to make known-plaintext attacks on encryption more difficult
+        // Upper half of range is avoided in order to prevent SRTP wraparound issues
+        // during startup.
+        // Sequence number 0 is avoided for historical reasons, presumably to avoid
+        // debugability or test usage conflicts.
+        // i.e the range is (1, 2^15-1)
+        Self((NonCryptographicRng::u16() % 32767 + 1) as u64)
+    }
+}
+
 impl Pt {
     /// Create a PT with a specific value.
     ///
     /// PTs are 7 bit. Values with 8 bits are not valid in RTP headers.
     pub const fn new_with_value(v: u8) -> Pt {
         Pt(v)
+    }
+}
+
+/// A combination of Mid/Rid
+///
+/// In many cases they go hand-in-hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MidRid(pub Mid, pub Option<Rid>);
+
+impl MidRid {
+    #[inline(always)]
+    pub fn mid(&self) -> Mid {
+        self.0
+    }
+
+    #[inline(always)]
+    pub fn rid(&self) -> Option<Rid> {
+        self.1
+    }
+
+    pub fn special_equals(&self, other: &MidRid) -> bool {
+        self.0 == other.0 && (self.1.is_none() || self.1 == other.1)
     }
 }

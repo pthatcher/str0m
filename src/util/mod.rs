@@ -4,6 +4,10 @@ mod bit_pattern;
 
 pub(crate) use bit_pattern::BitPattern;
 
+mod pii;
+
+pub(crate) use pii::Pii;
+
 pub(crate) mod value_history;
 
 mod time_tricks;
@@ -13,7 +17,7 @@ pub(crate) trait Soonest {
     fn soonest(self, other: Self) -> Self;
 }
 
-impl Soonest for (Option<Instant>, &'static str) {
+impl<T: Default> Soonest for (Option<Instant>, T) {
     fn soonest(self, other: Self) -> Self {
         match (self, other) {
             ((Some(v1), s1), (Some(v2), s2)) => {
@@ -23,7 +27,7 @@ impl Soonest for (Option<Instant>, &'static str) {
                     (Some(v2), s2)
                 }
             }
-            ((None, _), (None, _)) => (None, ""),
+            ((None, _), (None, _)) => (None, T::default()),
             ((None, _), (v, s)) => (v, s),
             ((v, s), (None, _)) => (v, s),
         }
@@ -36,7 +40,8 @@ impl Soonest for (Option<Instant>, &'static str) {
 /// ## Params
 /// - `ntp_time` the offset since 1900-01-01.
 /// - `delay` the delay(`DLSR`) since last sender report expressed as fractions of a second in 32 bits.
-/// - `last_report` the middle 32 bits of an NTP timestamp for the most recent sender report(LSR) or Receiver Report(LRR).
+/// - `last_report` the middle 32 bits of an NTP timestamp for the most recent sender report(LSR)
+///   or Receiver Report(LRR).
 pub(crate) fn calculate_rtt_ms(ntp_time: Duration, delay: u32, last_report: u32) -> Option<f32> {
     // [10 Nov 1995 11:33:25.125 UTC]       [10 Nov 1995 11:33:36.5 UTC]
     // n                 SR(n)              A=b710:8000 (46864.500 s)
@@ -78,4 +83,33 @@ pub(crate) fn calculate_rtt_ms(ntp_time: Duration, delay: u32, last_report: u32)
     let rtt_fraction = (rtt & (u16::MAX as u32)) as f32 / (u16::MAX as u32) as f32;
 
     Some(rtt_seconds as f32 * 1000.0 + rtt_fraction * 1000.0)
+}
+
+pub struct NonCryptographicRng;
+
+impl NonCryptographicRng {
+    #[inline(always)]
+    pub fn u8() -> u8 {
+        fastrand::u8(..)
+    }
+
+    #[inline(always)]
+    pub fn u16() -> u16 {
+        fastrand::u16(..)
+    }
+
+    #[inline(always)]
+    pub fn u32() -> u32 {
+        fastrand::u32(..)
+    }
+
+    #[inline(always)]
+    pub fn u64() -> u64 {
+        fastrand::u64(..)
+    }
+
+    #[inline(always)]
+    pub fn f32() -> f32 {
+        fastrand::f32()
+    }
 }

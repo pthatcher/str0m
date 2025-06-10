@@ -4,28 +4,28 @@ use std::time::Duration;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind};
 use str0m::rtp::rtcp::Twcc;
-use str0m::{Candidate, Rtc, RtcError};
+use str0m::{Rtc, RtcError};
 use tracing::info_span;
 
 mod common;
-use common::{init_log, negotiate, progress, TestRtc};
+use common::{init_crypto_default, init_log, negotiate, progress, TestRtc};
 
 #[test]
 pub fn twcc() -> Result<(), RtcError> {
     init_log();
+    init_crypto_default();
+
     let l_rtc = Rtc::builder().enable_raw_packets(true).build();
     let r_rtc = Rtc::builder().enable_raw_packets(true).build();
 
     let mut l = TestRtc::new_with_rtc(info_span!("L"), l_rtc);
     let mut r = TestRtc::new_with_rtc(info_span!("R"), r_rtc);
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
-    l.add_local_candidate(host1);
-    r.add_local_candidate(host2);
+    l.add_host_candidate((Ipv4Addr::new(1, 1, 1, 1), 1000).into());
+    r.add_host_candidate((Ipv4Addr::new(2, 2, 2, 2), 2000).into());
 
     let mid = negotiate(&mut l, &mut r, |change| {
-        change.add_media(MediaKind::Video, Direction::SendOnly, None, None)
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None)
     });
 
     loop {

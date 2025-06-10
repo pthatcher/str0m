@@ -1,18 +1,13 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::rtp_::MAX_BLANK_PADDING_PAYLOAD_SIZE;
-use crate::rtp_::{Bitrate, DataSize, Mid};
+use crate::rtp_::{Bitrate, DataSize, MidRid};
 use crate::util::already_happened;
 use crate::util::not_happening;
 use crate::util::Soonest;
 
-use super::MediaKind;
-
 const MAX_BITRATE: Bitrate = Bitrate::gbps(10);
 const MAX_DEBT_IN_TIME: Duration = Duration::from_millis(500);
-const MAX_PADDING_PACKET_SIZE: DataSize = DataSize::bytes(MAX_BLANK_PADDING_PAYLOAD_SIZE as u64);
 const PADDING_BURST_INTERVAL: Duration = Duration::from_millis(5);
 const PACING: Duration = Duration::from_millis(40);
 
@@ -54,14 +49,14 @@ impl Pacer for PacerImpl {
         }
     }
 
-    fn poll_queue(&mut self) -> Option<Mid> {
+    fn poll_queue(&mut self) -> Option<MidRid> {
         match self {
             PacerImpl::Null(v) => v.poll_queue(),
             PacerImpl::LeakyBucket(v) => v.poll_queue(),
         }
     }
 
-    fn register_send(&mut self, now: Instant, packet_size: DataSize, from: Mid) {
+    fn register_send(&mut self, now: Instant, packet_size: DataSize, from: MidRid) {
         match self {
             PacerImpl::Null(v) => v.register_send(now, packet_size, from),
             PacerImpl::LeakyBucket(v) => v.register_send(now, packet_size, from),
@@ -73,7 +68,7 @@ impl Pacer for PacerImpl {
 ///
 /// The pacer is responsible for ensuring correct pacing of packets onto the network at a given
 /// bitrate.
-pub trait Pacer {
+pub(crate) trait Pacer {
     /// Set the pacing bitrate. The pacing rate can be exceeded if required to drain excessively
     /// long packet queues.
     fn set_pacing_rate(&mut self, pacing_bitrate: Bitrate);
@@ -92,12 +87,12 @@ pub trait Pacer {
     ) -> Option<PaddingRequest>;
 
     /// Determines which mid to poll, if any.
-    fn poll_queue(&mut self) -> Option<Mid>;
+    fn poll_queue(&mut self) -> Option<MidRid>;
 
     /// Register a packet having been sent.
     ///
     /// **MUST** be called each time [`Pacer::poll_queue`] produces a mid.
-    fn register_send(&mut self, now: Instant, packet_size: DataSize, from: Mid);
+    fn register_send(&mut self, now: Instant, packet_size: DataSize, from: MidRid);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,13 +138,6 @@ pub enum QueuePriority {
 }
 
 impl QueueSnapshot {
-    /// Whether anything has ever been sent on this queue.
-    ///
-    /// Used to ensure we don't send padding before sending the first bits of media.
-    pub fn has_ever_sent(&self) -> bool {
-        self.last_emitted.is_some()
-    }
-
     /// Update the priority if the snapshot is non-empty.
     ///
     /// Sets the priority to the provided priority if the queue is non-empty, otherwise empty.
@@ -179,8 +167,8 @@ impl Default for QueueSnapshot {
 /// The state of a single upstream queue.
 /// The pacer manages packets across several upstream queues.
 #[derive(Debug, Clone, Copy)]
-pub struct QueueState {
-    pub mid: Mid,
+pub(crate) struct QueueState {
+    pub midrid: MidRid,
     pub unpaced: bool,
     pub use_for_padding: bool,
     pub snapshot: QueueSnapshot,
@@ -188,9 +176,9 @@ pub struct QueueState {
 
 /// A request to generate a specific amount of padding.
 #[derive(Debug, Clone, Copy)]
-pub struct PaddingRequest {
+pub(crate) struct PaddingRequest {
     /// The Mid that should generate and queue the padding.
-    pub mid: Mid,
+    pub midrid: MidRid,
     /// The amount of padding in bytes to generate.
     pub padding: usize,
 }
@@ -198,7 +186,7 @@ pub struct PaddingRequest {
 /// A null pacer that doesn't pace.
 #[derive(Debug, Default)]
 pub struct NullPacer {
-    last_sends: HashMap<Mid, Instant>,
+    last_sends: HashMap<MidRid, Instant>,
     queue_states: Vec<QueueState>,
     need_immediate_timeout: bool,
 }
@@ -231,15 +219,15 @@ impl Pacer for NullPacer {
         None
     }
 
-    fn poll_queue(&mut self) -> Option<Mid> {
+    fn poll_queue(&mut self) -> Option<MidRid> {
         let non_empty_queues = self
             .queue_states
             .iter()
             .filter(|q| q.snapshot.packet_count > 0);
         // Pick a queue using round robin, prioritize the least recently sent on queue.
-        let to_send_on = non_empty_queues.min_by_key(|q| self.last_sends.get(&q.mid));
+        let to_send_on = non_empty_queues.min_by_key(|q| self.last_sends.get(&q.midrid));
 
-        let result = to_send_on.map(|q| q.mid);
+        let result = to_send_on.map(|q| q.midrid);
 
         if result.is_some() {
             self.need_immediate_timeout = true;
@@ -248,7 +236,7 @@ impl Pacer for NullPacer {
         result
     }
 
-    fn register_send(&mut self, now: Instant, _packet_size: DataSize, from: Mid) {
+    fn register_send(&mut self, now: Instant, _packet_size: DataSize, from: MidRid) {
         let e = self.last_sends.entry(from).or_insert(now);
         *e = now;
     }
@@ -277,7 +265,7 @@ pub struct LeakyBucketPacer {
     /// The queue states given by last handle_timeout.
     queue_states: Vec<QueueState>,
     /// The next return value for `poll_queue``
-    next_poll_queue: Option<Mid>,
+    next_poll_queue: Option<MidRid>,
 }
 
 impl Pacer for LeakyBucketPacer {
@@ -317,7 +305,7 @@ impl Pacer for LeakyBucketPacer {
         self.maybe_update_adjusted_bitrate(now);
 
         if let Some(request) = self.maybe_create_padding_request() {
-            self.next_poll_queue = Some(request.mid);
+            self.next_poll_queue = Some(request.midrid);
             return Some(request);
         }
 
@@ -344,21 +332,21 @@ impl Pacer for LeakyBucketPacer {
             self.next_poll_queue = None;
             self.next_poll_time = Some(next_poll_time);
         } else {
-            self.next_poll_queue = queue.map(|q| q.mid);
+            self.next_poll_queue = queue.map(|q| q.midrid);
             self.next_poll_time = Some(next_poll_time);
         }
 
         None
     }
 
-    fn poll_queue(&mut self) -> Option<Mid> {
+    fn poll_queue(&mut self) -> Option<MidRid> {
         let next = self.next_poll_queue.take()?;
         self.request_immediate_timeout();
 
         Some(next)
     }
 
-    fn register_send(&mut self, now: Instant, packet_size: DataSize, _from: Mid) {
+    fn register_send(&mut self, now: Instant, packet_size: DataSize, _from: MidRid) {
         self.last_emitted = Some(now);
 
         self.media_debt += packet_size;
@@ -523,8 +511,12 @@ impl LeakyBucketPacer {
             // Min rate exceeds our pacing rate, increase the rate to force drain the queue.
             self.adjusted_bitrate = min_rate.clamp(Bitrate::ZERO, MAX_BITRATE);
             trace!(
-                "LeakyBucketPacer: Increased rate above pacing rate {} to {} in order to drain queue of size {}. Aim to drain each packet in the next {:?} on average",
-                self.pacing_bitrate, self.adjusted_bitrate, queue_size, target_queue_wait
+                "LeakyBucketPacer: Increased rate above pacing rate {} to {} in order to drain \
+                queue of size {}. Aim to drain each packet in the next {:?} on average",
+                self.pacing_bitrate,
+                self.adjusted_bitrate,
+                queue_size,
+                target_queue_wait
             );
         }
     }
@@ -562,20 +554,17 @@ impl LeakyBucketPacer {
         }
 
         // We must have a queue that supports padding.
-        let Some(queue) = self
+        let queue = self
             .queue_states
             .iter()
             .filter(|q| q.use_for_padding)
-            .max_by_key(|q| q.snapshot.last_emitted)
-        else {
-            return None;
-        };
+            .max_by_key(|q| q.snapshot.last_emitted)?;
 
         // We can generate padding
         let padding = (self.padding_bitrate * PADDING_BURST_INTERVAL).as_bytes_usize();
 
         Some(PaddingRequest {
-            mid: queue.mid,
+            midrid: queue.midrid,
             padding,
         })
     }
@@ -609,17 +598,13 @@ impl QueueSnapshot {
 
 #[cfg(test)]
 mod test {
-    use std::ops::Range;
-    use std::thread;
     use std::time::{Duration, Instant};
 
-    use crate::rtp_::{DataSize, RtpHeader};
+    use crate::rtp_::{DataSize, Mid, RtpHeader};
 
     use super::*;
 
     use queue::{PacketKind, Queue, QueuedPacket};
-    use rand::distributions::Standard;
-    use rand::prelude::*;
 
     #[test]
     fn test_typical_behavior() {
@@ -738,7 +723,8 @@ mod test {
             &mut pacer,
             &mut queue,
             now + duration_ms(52),
-            "Sixth packet (audio) should be released despite too much media debt because audio packets are not paced",
+            "Sixth packet (audio) should be released despite too much media debt because \
+            audio packets are not paced",
             |packet| {
                 assert_eq!(packet.kind, PacketKind::Audio);
                 assert_eq!(packet.header.sequence_number, 6);
@@ -972,7 +958,8 @@ mod test {
             &mut pacer,
             &mut queue,
             now + duration_ms(165),
-            "Third packet should be released because the sent padding doesn't increase the media debt too much",
+            "Third packet should be released because the sent padding doesn't \
+            increase the media debt too much",
             |packet| {
                 assert_eq!(packet.header.sequence_number, 3);
             },
@@ -997,7 +984,9 @@ mod test {
 
         assert!(
             total_rate >= lower_bound && total_rate <= upper_bound,
-            "Expected reuslting total rate to be within expected bounds. total_rate={total_rate}, media_rate={media_rate}, padding_rate={padding_rate}, config={config:?}, lower_bound={lower_bound}, upper_bound={upper_bound}"
+            "Expected reuslting total rate to be within expected bounds. \
+            total_rate={total_rate}, media_rate={media_rate}, padding_rate={padding_rate}, \
+            config={config:?}, lower_bound={lower_bound}, upper_bound={upper_bound}"
         );
     }
 
@@ -1006,7 +995,7 @@ mod test {
         let now = Instant::now();
 
         let mut state = QueueState {
-            mid: Mid::from("001"),
+            midrid: MidRid(Mid::from("001"), None),
             unpaced: false,
             use_for_padding: true,
             snapshot: QueueSnapshot {
@@ -1021,7 +1010,7 @@ mod test {
         };
 
         let other = QueueState {
-            mid: Mid::from("002"),
+            midrid: MidRid(Mid::from("002"), None),
             unpaced: false,
             use_for_padding: false,
             snapshot: QueueSnapshot {
@@ -1037,7 +1026,7 @@ mod test {
 
         state.snapshot.merge(&other.snapshot);
 
-        assert_eq!(state.mid, Mid::from("001"));
+        assert_eq!(state.midrid.mid(), Mid::from("001"));
         assert_eq!(state.snapshot.size, 40_usize);
         assert_eq!(state.snapshot.packet_count, 1337);
         assert_eq!(state.snapshot.total_queue_time_origin, duration_ms(1337));
@@ -1124,7 +1113,7 @@ mod test {
     }
 
     fn make_packet(seq_no: u16, size: usize, kind: PacketKind) -> (RtpHeader, usize, PacketKind) {
-        let mut header = RtpHeader {
+        let header = RtpHeader {
             sequence_number: seq_no,
             ..Default::default()
         };
@@ -1169,7 +1158,7 @@ mod test {
             frame_pacing,
         } = config;
 
-        let mut base = Instant::now();
+        let base = Instant::now();
         let mut queue = Queue::default();
         let mut pacer = LeakyBucketPacer::new(media_rate);
         pacer.set_pacing_rate(padding_rate);
@@ -1179,10 +1168,9 @@ mod test {
         let mut media_sent = DataSize::ZERO;
         let mut padding_sent = DataSize::ZERO;
         let mut elapsed = Duration::ZERO;
-        let mut rng = thread_rng();
 
-        let mut generate_padding = |queue: &mut Queue, now: Instant, request: PaddingRequest| {
-            let rand: f32 = (StdRng::from_entropy().sample(Standard));
+        let generate_padding = |queue: &mut Queue, now: Instant, request: PaddingRequest| {
+            let rand: f32 = fastrand::f32();
             let overshoot_factor: f32 = rand * max_overshoot_factor;
             let final_size = ((request.padding as f32) * (1.0 + overshoot_factor).round()) as usize;
             queue.generate_padding(final_size, now);
@@ -1194,16 +1182,16 @@ mod test {
             }
 
             let timeout = {
-                if let Some(mid) = pacer.poll_queue() {
+                if let Some(midrid) = pacer.poll_queue() {
                     let packet = queue
                         .next_packet()
-                        .unwrap_or_else(|| panic!("Should have a packet for mid {mid}"));
-                    queue.register_send(mid, base + elapsed);
+                        .unwrap_or_else(|| panic!("Should have a packet for {:?}", midrid));
+                    queue.register_send(midrid, base + elapsed);
                     queue.update_average_queue_time(base + elapsed);
                     pacer.register_send(
                         base + elapsed,
                         DataSize::bytes(packet.payload_len as u64),
-                        mid,
+                        midrid,
                     );
                     if packet.kind == PacketKind::Padding {
                         padding_sent += packet.payload_len.into();
@@ -1213,10 +1201,7 @@ mod test {
                     continue;
                 }
 
-                let t = pacer.poll_timeout();
-                let next_poll_in = t.map(|t| t - (base + elapsed));
-
-                t
+                pacer.poll_timeout()
             };
 
             let sleep_until_poll = timeout
@@ -1240,7 +1225,7 @@ mod test {
                 elapsed += sleep_until_media;
             }
 
-            let large_overshoot = (rand::random::<u8>() % 100) >= (100 - spike_probability);
+            let large_overshoot = (fastrand::u8(..) % 100) >= (100 - spike_probability);
             let mut to_add = if large_overshoot {
                 (media_rate * 2.5) * frame_pacing
             } else {
@@ -1336,21 +1321,22 @@ mod test {
                 .into_iter()
             }
 
-            pub(super) fn register_send(&mut self, mid: Mid, now: Instant) {
-                if self.video_queue.mid == mid {
+            pub(super) fn register_send(&mut self, midrid: MidRid, now: Instant) {
+                if self.video_queue.midrid == midrid {
                     self.video_queue.last_emitted = Some(now);
-                } else if self.audio_queue.mid == mid {
+                } else if self.audio_queue.midrid == midrid {
                     self.audio_queue.last_emitted = Some(now);
-                } else if self.padding_queue.mid == mid {
+                } else if self.padding_queue.midrid == midrid {
                     self.padding_queue.last_emitted = Some(now);
                 } else {
-                    panic!("Attempted to register send on unknown queue with id {mid:?}");
+                    panic!(
+                        "Attempted to register send on unknown queue with id {:?}",
+                        midrid
+                    );
                 }
             }
 
             pub(super) fn generate_padding(&mut self, mut pad_size: usize, now: Instant) {
-                let mut rng = thread_rng();
-
                 while pad_size > 0 {
                     let final_packet_size = pad_size.min(1200);
                     let final_packet_size = DataSize::bytes(final_packet_size as u64);
@@ -1368,10 +1354,6 @@ mod test {
                 }
             }
 
-            pub(super) fn padding_mid(&self) -> Mid {
-                self.padding_queue.mid
-            }
-
             fn queue_for_kind_mut(&mut self, kind: PacketKind) -> &mut Inner {
                 match kind {
                     PacketKind::Audio => &mut self.audio_queue,
@@ -1384,9 +1366,21 @@ mod test {
         impl Default for Queue {
             fn default() -> Self {
                 Self {
-                    audio_queue: Inner::new(Mid::from("001"), true, QueuePriority::Media),
-                    video_queue: Inner::new(Mid::from("002"), false, QueuePriority::Media),
-                    padding_queue: Inner::new(Mid::from("003"), false, QueuePriority::Padding),
+                    audio_queue: Inner::new(
+                        MidRid(Mid::from("001"), None),
+                        true,
+                        QueuePriority::Media,
+                    ),
+                    video_queue: Inner::new(
+                        MidRid(Mid::from("002"), None),
+                        false,
+                        QueuePriority::Media,
+                    ),
+                    padding_queue: Inner::new(
+                        MidRid(Mid::from("003"), None),
+                        false,
+                        QueuePriority::Padding,
+                    ),
                 }
             }
         }
@@ -1398,7 +1392,7 @@ mod test {
         }
 
         struct Inner {
-            mid: Mid,
+            midrid: MidRid,
             last_emitted: Option<Instant>,
             queue: VecDeque<QueuedPacket>,
             packet_count: u32,
@@ -1409,9 +1403,9 @@ mod test {
         }
 
         impl Inner {
-            fn new(mid: Mid, is_audio: bool, priority: QueuePriority) -> Self {
+            fn new(midrid: MidRid, is_audio: bool, priority: QueuePriority) -> Self {
                 Self {
-                    mid,
+                    midrid,
                     last_emitted: None,
                     queue: VecDeque::default(),
                     packet_count: 0,
@@ -1428,9 +1422,7 @@ mod test {
             }
 
             fn pop_packet(&mut self) -> Option<QueuedPacket> {
-                let Some(packet) = self.queue.pop_front() else {
-                    return None;
-                };
+                let packet = self.queue.pop_front()?;
 
                 let time_spent_queued = self
                     .last_update
@@ -1461,7 +1453,7 @@ mod test {
 
             fn queue_state(&self, now: Instant) -> QueueState {
                 QueueState {
-                    mid: self.mid,
+                    midrid: self.midrid,
                     unpaced: self.is_audio,
                     use_for_padding: !self.is_audio && self.last_emitted.is_some(),
                     snapshot: QueueSnapshot {
@@ -1476,6 +1468,8 @@ mod test {
                 }
             }
         }
+
+        use std::fmt;
 
         impl fmt::Display for PacketKind {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

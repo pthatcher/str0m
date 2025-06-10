@@ -2,25 +2,24 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use str0m::RtcConfig;
-use str0m::{Candidate, RtcError};
+use str0m::RtcError;
 use tracing::info_span;
 
 mod common;
-use common::{init_log, progress, TestRtc};
+use common::{init_crypto_default, init_log, progress, TestRtc};
 
 #[test]
 pub fn ice_restart() -> Result<(), RtcError> {
     init_log();
+    init_crypto_default();
 
     let mut l = TestRtc::new(info_span!("L"));
 
     let rtc = RtcConfig::new().set_ice_lite(true).build();
     let mut r = TestRtc::new_with_rtc(info_span!("R"), rtc);
 
-    let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp")?;
-    let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp")?;
-    l.add_local_candidate(host1);
-    r.add_local_candidate(host2);
+    l.add_host_candidate((Ipv4Addr::new(1, 1, 1, 1), 1000).into());
+    r.add_host_candidate((Ipv4Addr::new(2, 2, 2, 2), 2000).into());
 
     let (offer, pending) = l.span.in_scope(|| {
         let mut change = l.rtc.sdp_api();
@@ -43,8 +42,8 @@ pub fn ice_restart() -> Result<(), RtcError> {
         progress(&mut l, &mut r)?;
     }
 
-    let l_creds = l.local_ice_creds();
-    let r_creds = r.local_ice_creds();
+    let l_creds = l._local_ice_creds();
+    let r_creds = r._local_ice_creds();
 
     let (offer, pending) = r.span.in_scope(|| {
         let mut change = r.rtc.sdp_api();
@@ -76,12 +75,12 @@ pub fn ice_restart() -> Result<(), RtcError> {
 
     assert_ne!(
         r_creds,
-        r.local_ice_creds(),
+        r._local_ice_creds(),
         "After an ICE restart ICE credentials should have changed"
     );
     assert_ne!(
         l_creds,
-        l.local_ice_creds(),
+        l._local_ice_creds(),
         "After an ICE restart ICE credentials should have changed"
     );
 
