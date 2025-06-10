@@ -229,11 +229,7 @@ impl<'a> TryFrom<&'a [u8]> for MultiplexKind {
         let byte0 = value[0];
         let len = value.len();
 
-        if byte0 < 2 && len >= 20 {
-            Ok(MultiplexKind::Stun)
-        } else if byte0 >= 20 && byte0 < 64 {
-            Ok(MultiplexKind::Dtls)
-        } else if byte0 >= 128 && byte0 < 192 && len > 2 {
+        if byte0 >= 128 && byte0 < 192 && len > 2 { // RTP/RTCP
             let byte1 = value[1];
             let payload_type = byte1 & 0x7f;
 
@@ -248,6 +244,10 @@ impl<'a> TryFrom<&'a [u8]> for MultiplexKind {
             } else {
                 MultiplexKind::Rtp
             })
+        } else if byte0 >= 20 && byte0 < 64 { // DTLS
+            Ok(MultiplexKind::Dtls)
+        } else if byte0 < 2 && len >= 20 { // STUN
+            Ok(MultiplexKind::Stun)
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
