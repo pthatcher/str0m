@@ -86,6 +86,13 @@ impl<'a> DirectApi<'a> {
         self.rtc.dtls.remote_fingerprint().clone()
     }
 
+    pub fn configure_srtp(&mut self, profile: SrtpProfile, keying_material: Vec<u8>, active: bool) {
+        let srtp_crypto = self.rtc.crypto_provider.srtp_crypto();
+        self.rtc
+            .session
+            .set_keying_material(keying_material, &srtp_crypto, profile, active);
+    }
+
     /// Sets the remote DTLS fingerprint.
     pub fn set_remote_fingerprint(&mut self, dtls_fingerprint: Fingerprint) {
         self.rtc.remote_fingerprint = Some(dtls_fingerprint);
