@@ -663,6 +663,8 @@ mod rtp_;
 use rtp_::{Bitrate, DataSize};
 use rtp_::{Extension, ExtensionMap};
 
+pub use crypto::SrtpProfile;
+
 /// Low level RTP access.
 pub mod rtp {
     /// Feedback for RTP.
