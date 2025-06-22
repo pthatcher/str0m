@@ -86,8 +86,15 @@ impl<'a> DirectApi<'a> {
         self.rtc.dtls.remote_fingerprint().clone()
     }
 
-    pub fn configure_srtp(&mut self, profile: SrtpProfile, keying_material: Vec<u8>, active: bool) {
+    /// Set the SRTP keys directly, instead of using DTLS-SRTP
+    pub fn configure_srtp(
+        &mut self,
+        profile: crate::crypto::SrtpProfile,
+        keying_material: Vec<u8>,
+        active: bool,
+    ) {
         let srtp_crypto = self.rtc.crypto_provider.srtp_crypto();
+        let keying_material = crate::crypto::KeyingMaterial::new(keying_material);
         self.rtc
             .session
             .set_keying_material(keying_material, &srtp_crypto, profile, active);
