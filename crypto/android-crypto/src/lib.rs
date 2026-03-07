@@ -9,7 +9,8 @@
 
 mod dimpl_provider;
 mod dtls;
-mod jni_crypto;
+#[doc(hidden)]
+pub mod jni_crypto;
 mod jvm;
 mod sha1;
 mod sha256;

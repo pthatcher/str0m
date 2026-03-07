@@ -6,9 +6,9 @@
 
 use std::cell::RefCell;
 
-use jni::objects::{GlobalRef, JByteArray, JClass, JMethodID, JObject, JStaticMethodID, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JMethodID, JObject, JStaticMethodID};
 use jni::signature::{Primitive, ReturnType};
-use jni::sys::jvalue;
+use jni::sys::{self, jvalue};
 use jni::JNIEnv;
 
 use str0m_proto::crypto::CryptoError;
@@ -86,6 +86,8 @@ struct JniCache {
     mid_cipher_init3: JMethodID,
     mid_cipher_update_aad: JMethodID,
     mid_cipher_do_final: JMethodID,
+    mid_cipher_do_final_bb: JMethodID,
+    mid_cipher_update_aad_bb: JMethodID,
     mid_secure_random_next_bytes: JMethodID,
     mid_kpg_initialize: JMethodID,
     mid_kpg_generate_key_pair: JMethodID,
@@ -100,10 +102,27 @@ struct JniCache {
     mid_key_agreement_init: JMethodID,
     mid_key_agreement_do_phase: JMethodID,
     mid_key_agreement_generate_secret: JMethodID,
+
+    // ── Cached constructor method IDs ─────────────────────────────
+    ctor_secret_key_spec: JMethodID,
+    ctor_gcm_parameter_spec: JMethodID,
+    ctor_secure_random: JMethodID,
+    ctor_ec_gen_parameter_spec: JMethodID,
+    ctor_pkcs8_encoded_key_spec: JMethodID,
+    ctor_x509_encoded_key_spec: JMethodID,
+
+    // ── Cached object instances ───────────────────────────────────
+    /// Reusable `Cipher.getInstance("AES/GCM/NoPadding")` instance.
+    aes_gcm_cipher: GlobalRef,
+    /// Pre-allocated 12-byte Java `byte[]` for AES-GCM IVs.
+    gcm_iv_array: GlobalRef,
 }
 
 thread_local! {
     static JNI_CACHE: RefCell<Option<JniCache>> = const { RefCell::new(None) };
+
+    /// Cached `SecretKeySpec(key, "AES")` for AES-GCM: `(raw_key_bytes, global_ref)`.
+    static AES_KEY_SPEC_CACHE: RefCell<Option<(Vec<u8>, GlobalRef)>> = const { RefCell::new(None) };
 }
 
 /// Look up a Java class and create a [`GlobalRef`] for caching.
@@ -194,6 +213,14 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
     )?;
     let mid_cipher_update_aad = cache_method(env, &cipher, "updateAAD", "([B)V")?;
     let mid_cipher_do_final = cache_method(env, &cipher, "doFinal", "([B)[B")?;
+    let mid_cipher_do_final_bb = cache_method(
+        env,
+        &cipher,
+        "doFinal",
+        "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I",
+    )?;
+    let mid_cipher_update_aad_bb =
+        cache_method(env, &cipher, "updateAAD", "(Ljava/nio/ByteBuffer;)V")?;
     let mid_secure_random_next_bytes = cache_method(env, &secure_random_cls, "nextBytes", "([B)V")?;
     let mid_kpg_initialize = cache_method(
         env,
@@ -239,19 +266,63 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
     let mid_key_agreement_generate_secret =
         cache_method(env, &key_agreement, "generateSecret", "()[B")?;
 
+    let secret_key_spec = find_and_cache(env, "javax/crypto/spec/SecretKeySpec")?;
+    let gcm_parameter_spec = find_and_cache(env, "javax/crypto/spec/GCMParameterSpec")?;
+    let ec_gen_parameter_spec = find_and_cache(env, "java/security/spec/ECGenParameterSpec")?;
+    let pkcs8_encoded_key_spec = find_and_cache(env, "java/security/spec/PKCS8EncodedKeySpec")?;
+    let x509_encoded_key_spec = find_and_cache(env, "java/security/spec/X509EncodedKeySpec")?;
+
+    // Look up constructor method IDs.
+    let ctor_secret_key_spec =
+        cache_method(env, &secret_key_spec, "<init>", "([BLjava/lang/String;)V")?;
+    let ctor_gcm_parameter_spec = cache_method(env, &gcm_parameter_spec, "<init>", "(I[B)V")?;
+    let ctor_secure_random = cache_method(env, &secure_random_cls, "<init>", "()V")?;
+    let ctor_ec_gen_parameter_spec = cache_method(
+        env,
+        &ec_gen_parameter_spec,
+        "<init>",
+        "(Ljava/lang/String;)V",
+    )?;
+    let ctor_pkcs8_encoded_key_spec =
+        cache_method(env, &pkcs8_encoded_key_spec, "<init>", "([B)V")?;
+    let ctor_x509_encoded_key_spec = cache_method(env, &x509_encoded_key_spec, "<init>", "([B)V")?;
+
+    // Create a reusable Cipher instance for AES/GCM/NoPadding.
+    let cipher_class_ref = unsafe { as_class(&cipher) };
+    let str_aes_gcm_val = cache_string(env, "AES/GCM/NoPadding")?;
+    let aes_gcm_obj = unsafe {
+        get_instance(
+            env,
+            &cipher_class_ref,
+            mid_cipher_get_instance,
+            &as_obj(&str_aes_gcm_val),
+        )
+    }?;
+    let aes_gcm_cipher = env
+        .new_global_ref(aes_gcm_obj)
+        .map_err(|e| CryptoError::Other(format!("Failed to cache AES/GCM cipher: {e}")))?;
+
+    // Pre-allocate a 12-byte Java byte[] for GCM IVs.
+    let gcm_iv_local = env
+        .new_byte_array(12)
+        .map_err(|e| CryptoError::Other(format!("Failed to create IV array: {e}")))?;
+    let gcm_iv_array = env
+        .new_global_ref(&gcm_iv_local)
+        .map_err(|e| CryptoError::Other(format!("Failed to cache IV array: {e}")))?;
+
     Ok(JniCache {
         message_digest,
         mac,
-        secret_key_spec: find_and_cache(env, "javax/crypto/spec/SecretKeySpec")?,
+        secret_key_spec,
         cipher,
-        gcm_parameter_spec: find_and_cache(env, "javax/crypto/spec/GCMParameterSpec")?,
+        gcm_parameter_spec,
         secure_random: secure_random_cls,
         key_pair_generator,
-        ec_gen_parameter_spec: find_and_cache(env, "java/security/spec/ECGenParameterSpec")?,
+        ec_gen_parameter_spec,
         key_factory,
-        pkcs8_encoded_key_spec: find_and_cache(env, "java/security/spec/PKCS8EncodedKeySpec")?,
+        pkcs8_encoded_key_spec,
         signature,
-        x509_encoded_key_spec: find_and_cache(env, "java/security/spec/X509EncodedKeySpec")?,
+        x509_encoded_key_spec,
         key_agreement,
         str_sha256: cache_string(env, "SHA-256")?,
         str_sha384: cache_string(env, "SHA-384")?,
@@ -259,7 +330,7 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         str_hmac_sha256: cache_string(env, "HmacSHA256")?,
         str_hmac_sha384: cache_string(env, "HmacSHA384")?,
         str_aes_ecb: cache_string(env, "AES/ECB/NoPadding")?,
-        str_aes_gcm: cache_string(env, "AES/GCM/NoPadding")?,
+        str_aes_gcm: str_aes_gcm_val,
         str_aes: cache_string(env, "AES")?,
         str_ec: cache_string(env, "EC")?,
         str_secp256r1: cache_string(env, "secp256r1")?,
@@ -281,6 +352,8 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         mid_cipher_init3,
         mid_cipher_update_aad,
         mid_cipher_do_final,
+        mid_cipher_do_final_bb,
+        mid_cipher_update_aad_bb,
         mid_secure_random_next_bytes,
         mid_kpg_initialize,
         mid_kpg_generate_key_pair,
@@ -295,6 +368,14 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         mid_key_agreement_init,
         mid_key_agreement_do_phase,
         mid_key_agreement_generate_secret,
+        ctor_secret_key_spec,
+        ctor_gcm_parameter_spec,
+        ctor_secure_random,
+        ctor_ec_gen_parameter_spec,
+        ctor_pkcs8_encoded_key_spec,
+        ctor_x509_encoded_key_spec,
+        aes_gcm_cipher,
+        gcm_iv_array,
     })
 }
 
@@ -400,6 +481,145 @@ unsafe fn call_obj<'local>(
         .map_err(|e| CryptoError::Other(format!("method result not an object: {e}")))
 }
 
+/// Call a cached instance method that returns an int.
+///
+/// # Safety
+///
+/// `method_id` must be a valid method ID for the object's class.
+unsafe fn call_int(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    method_id: JMethodID,
+    args: &[jvalue],
+) -> Result<i32, CryptoError> {
+    unsafe {
+        env.call_method_unchecked(obj, method_id, ReturnType::Primitive(Primitive::Int), args)
+    }
+    .map_err(|e| CryptoError::Other(format!("method call failed: {e}")))?
+    .i()
+    .map_err(|e| CryptoError::Other(format!("method result not an int: {e}")))
+}
+
+/// Construct a new Java object using a cached constructor method ID.
+///
+/// # Safety
+///
+/// `ctor_id` must be a valid constructor method ID for the given `class`,
+/// and `args` must match the constructor's parameter types.
+unsafe fn new_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    class: &JClass<'_>,
+    ctor_id: JMethodID,
+    args: &[jvalue],
+) -> Result<JObject<'local>, CryptoError> {
+    unsafe { env.new_object_unchecked(class, ctor_id, args) }
+        .map_err(|e| CryptoError::Other(format!("constructor call failed: {e}")))
+}
+
+/// Update a Java byte array's contents via raw JNI, skipping `ExceptionCheck`.
+///
+/// # Safety
+///
+/// `array_raw` must be a valid `jbyteArray` with length >= `data.len()`.
+unsafe fn raw_set_byte_array_region(env: &JNIEnv<'_>, array_raw: sys::jbyteArray, data: &[u8]) {
+    let raw = env.get_raw();
+    unsafe {
+        ((**raw).SetByteArrayRegion.unwrap())(
+            raw,
+            array_raw,
+            0,
+            data.len() as sys::jsize,
+            data.as_ptr().cast::<sys::jbyte>(),
+        );
+    }
+}
+
+/// Wrap native memory in a `DirectByteBuffer` via raw JNI, skipping
+/// `ExceptionCheck`.
+///
+/// # Safety
+///
+/// `data` must be non-null and valid for at least `len` bytes for the
+/// lifetime of the returned local reference.
+unsafe fn raw_new_direct_byte_buffer<'local>(
+    env: &JNIEnv<'local>,
+    data: *mut u8,
+    len: usize,
+) -> JObject<'local> {
+    let raw = env.get_raw();
+    let obj = unsafe {
+        ((**raw).NewDirectByteBuffer.unwrap())(
+            raw,
+            data.cast::<std::ffi::c_void>(),
+            len as sys::jlong,
+        )
+    };
+    unsafe { JObject::from_raw(obj) }
+}
+
+/// Return a cached `SecretKeySpec(key, "AES")` [`JObject`], creating or
+/// replacing the cached entry when the key material changes.
+///
+/// # Safety
+///
+/// `classes` must be a valid, initialised `JniCache`.
+unsafe fn get_or_create_aes_key_spec<'local>(
+    env: &mut JNIEnv<'local>,
+    classes: &JniCache,
+    key: &[u8],
+) -> Result<JObject<'local>, CryptoError> {
+    // Fast path: return the cached spec if the key hasn't changed.
+    let hit = AES_KEY_SPEC_CACHE.with(|cell| {
+        let borrow = cell.borrow();
+        if let Some((cached_key, cached_ref)) = borrow.as_ref() {
+            if cached_key == key {
+                // Safety: the GlobalRef lives in thread-local and won't be
+                // dropped while we hold the borrow inside this with() call;
+                // however we return a raw pointer to avoid lifetime issues.
+                return Some(unsafe { JObject::from_raw(cached_ref.as_raw()) });
+            }
+        }
+        None
+    });
+
+    if let Some(obj) = hit {
+        return Ok(obj);
+    }
+
+    // Slow path: construct a new SecretKeySpec and cache it.
+    let key_spec_class = unsafe { as_class(&classes.secret_key_spec) };
+    let key_array = env
+        .byte_array_from_slice(key)
+        .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
+    let aes_algorithm = unsafe { as_obj(&classes.str_aes) };
+
+    let key_spec = unsafe {
+        new_obj(
+            env,
+            &key_spec_class,
+            classes.ctor_secret_key_spec,
+            &[
+                jvalue {
+                    l: key_array.as_raw(),
+                },
+                jvalue {
+                    l: aes_algorithm.as_raw(),
+                },
+            ],
+        )
+    }?;
+
+    let global = env
+        .new_global_ref(&key_spec)
+        .map_err(|e| CryptoError::Other(format!("Failed to cache SecretKeySpec: {e}")))?;
+
+    AES_KEY_SPEC_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some((key.to_vec(), global));
+    });
+
+    Ok(key_spec)
+}
+
 /// Execute a JNI operation with a cached set of class references.
 ///
 /// Attaches the current thread to the JVM (if not already attached), ensures
@@ -420,7 +640,16 @@ macro_rules! with_jni_env {
             }
             let cache_ref = cell.borrow();
             let classes = cache_ref.as_ref().expect("class cache just initialized");
-            $f(&mut env, classes)
+
+            // Scope all local references so they are freed when the frame is
+            // popped, preventing leaks on long-lived threads.
+            env.push_local_frame(16)
+                .map_err(|e| CryptoError::Other(format!("Failed to push local frame: {e}")))?;
+            let result = $f(&mut env, classes);
+            // Safety: pop_local_frame requires a valid env and frame pushed above.
+            unsafe { env.pop_local_frame(&JObject::null()) }
+                .map_err(|e| CryptoError::Other(format!("Failed to pop local frame: {e}")))?;
+            result
         })
     }};
 }
@@ -496,13 +725,21 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<[u8; 20], CryptoError> {
             .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
 
         // Create SecretKeySpec(key, "HmacSHA1")
-        let key_spec = env
-            .new_object(
+        let key_spec = unsafe {
+            new_obj(
+                env,
                 &key_spec_class,
-                "([BLjava/lang/String;)V",
-                &[JValue::Object(&key_array), JValue::Object(&algorithm)],
+                classes.ctor_secret_key_spec,
+                &[
+                    jvalue {
+                        l: key_array.as_raw(),
+                    },
+                    jvalue {
+                        l: algorithm.as_raw(),
+                    },
+                ],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create SecretKeySpec: {e}")))?;
+        }?;
 
         // Call mac.init(keySpec)
         unsafe {
@@ -571,13 +808,21 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], CryptoError> {
             .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
 
         // Create SecretKeySpec(key, "HmacSHA256")
-        let key_spec = env
-            .new_object(
+        let key_spec = unsafe {
+            new_obj(
+                env,
                 &key_spec_class,
-                "([BLjava/lang/String;)V",
-                &[JValue::Object(&key_array), JValue::Object(&algorithm)],
+                classes.ctor_secret_key_spec,
+                &[
+                    jvalue {
+                        l: key_array.as_raw(),
+                    },
+                    jvalue {
+                        l: algorithm.as_raw(),
+                    },
+                ],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create SecretKeySpec: {e}")))?;
+        }?;
 
         // Call mac.init(keySpec)
         unsafe {
@@ -646,13 +891,21 @@ pub fn hmac_sha384(key: &[u8], data: &[u8]) -> Result<[u8; 48], CryptoError> {
             .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
 
         // Create SecretKeySpec(key, "HmacSHA384")
-        let key_spec = env
-            .new_object(
+        let key_spec = unsafe {
+            new_obj(
+                env,
                 &key_spec_class,
-                "([BLjava/lang/String;)V",
-                &[JValue::Object(&key_array), JValue::Object(&algorithm)],
+                classes.ctor_secret_key_spec,
+                &[
+                    jvalue {
+                        l: key_array.as_raw(),
+                    },
+                    jvalue {
+                        l: algorithm.as_raw(),
+                    },
+                ],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create SecretKeySpec: {e}")))?;
+        }?;
 
         // Call mac.init(keySpec)
         unsafe {
@@ -729,13 +982,21 @@ pub fn aes_ecb_encrypt(key: &[u8], input: &[u8], output: &mut [u8]) -> Result<()
         let aes_algorithm = unsafe { as_obj(&classes.str_aes) };
 
         // Create SecretKeySpec(key, "AES")
-        let key_spec = env
-            .new_object(
+        let key_spec = unsafe {
+            new_obj(
+                env,
                 &key_spec_class,
-                "([BLjava/lang/String;)V",
-                &[JValue::Object(&key_array), JValue::Object(&aes_algorithm)],
+                classes.ctor_secret_key_spec,
+                &[
+                    jvalue {
+                        l: key_array.as_raw(),
+                    },
+                    jvalue {
+                        l: aes_algorithm.as_raw(),
+                    },
+                ],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create SecretKeySpec: {e}")))?;
+        }?;
 
         // Get ENCRYPT_MODE constant (value is 1)
         let encrypt_mode = 1i32;
@@ -806,50 +1067,32 @@ pub fn aes_gcm_encrypt(
     output: &mut [u8],
 ) -> Result<usize, CryptoError> {
     with_jni_env!(|env: &mut JNIEnv, classes: &JniCache| {
-        let cipher_class = unsafe { as_class(&classes.cipher) };
-        let key_spec_class = unsafe { as_class(&classes.secret_key_spec) };
         let gcm_spec_class = unsafe { as_class(&classes.gcm_parameter_spec) };
-        let transformation = unsafe { as_obj(&classes.str_aes_gcm) };
 
-        // Call Cipher.getInstance("AES/GCM/NoPadding")
-        let cipher = unsafe {
-            get_instance(
-                env,
-                &cipher_class,
-                classes.mid_cipher_get_instance,
-                &transformation,
-            )
-        }?;
+        // Reuse the cached Cipher instance
+        let cipher = unsafe { as_obj(&classes.aes_gcm_cipher) };
 
-        // Create key byte array and algorithm string
-        let key_array = env
-            .byte_array_from_slice(key)
-            .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
+        // Get or create cached SecretKeySpec for this key
+        let key_spec = unsafe { get_or_create_aes_key_spec(env, classes, key) }?;
 
-        let aes_algorithm = unsafe { as_obj(&classes.str_aes) };
-
-        // Create SecretKeySpec(key, "AES")
-        let key_spec = env
-            .new_object(
-                &key_spec_class,
-                "([BLjava/lang/String;)V",
-                &[JValue::Object(&key_array), JValue::Object(&aes_algorithm)],
-            )
-            .map_err(|e| CryptoError::Other(format!("Failed to create SecretKeySpec: {e}")))?;
-
-        // Create IV byte array
-        let iv_array = env
-            .byte_array_from_slice(iv)
-            .map_err(|e| CryptoError::Other(format!("Failed to create IV array: {e}")))?;
+        // Update the cached 12-byte IV array in place.
+        unsafe { raw_set_byte_array_region(env, classes.gcm_iv_array.as_raw(), iv) };
+        let iv_array = unsafe { as_obj(&classes.gcm_iv_array) };
 
         // Create GCMParameterSpec(128, iv) - 128 is the tag length in bits
-        let gcm_spec = env
-            .new_object(
+        let gcm_spec = unsafe {
+            new_obj(
+                env,
                 &gcm_spec_class,
-                "(I[B)V",
-                &[JValue::Int(128), JValue::Object(&iv_array)],
+                classes.ctor_gcm_parameter_spec,
+                &[
+                    jvalue { i: 128 },
+                    jvalue {
+                        l: iv_array.as_raw(),
+                    },
+                ],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create GCMParameterSpec: {e}")))?;
+        }?;
 
         // Get ENCRYPT_MODE constant (value is 1)
         let encrypt_mode = 1i32;
@@ -872,67 +1115,50 @@ pub fn aes_gcm_encrypt(
             )
         }?;
 
-        // Update AAD if present
+        // Update AAD via raw DirectByteBuffer (no ExceptionCheck overhead)
         if !aad.is_empty() {
-            let aad_array = env
-                .byte_array_from_slice(aad)
-                .map_err(|e| CryptoError::Other(format!("Failed to create AAD array: {e}")))?;
+            let aad_buf =
+                unsafe { raw_new_direct_byte_buffer(env, aad.as_ptr() as *mut u8, aad.len()) };
 
             unsafe {
                 call_void(
                     env,
                     &cipher,
-                    classes.mid_cipher_update_aad,
+                    classes.mid_cipher_update_aad_bb,
                     &[jvalue {
-                        l: aad_array.as_raw(),
+                        l: aad_buf.as_raw(),
                     }],
                 )
             }?;
         }
 
-        // Create input byte array
-        let input_array = env
-            .byte_array_from_slice(input)
-            .map_err(|e| CryptoError::Other(format!("Failed to create input array: {e}")))?;
+        // Wrap Rust memory in DirectByteBuffers via raw JNI (no ExceptionCheck).
+        let input_buf =
+            unsafe { raw_new_direct_byte_buffer(env, input.as_ptr() as *mut u8, input.len()) };
 
-        // Call cipher.doFinal(input)
-        let result = unsafe {
-            call_obj(
+        let output_buf =
+            unsafe { raw_new_direct_byte_buffer(env, output.as_mut_ptr(), output.len()) };
+
+        // Call cipher.doFinal(inputBuf, outputBuf) — writes directly into output
+        let result_len = unsafe {
+            call_int(
                 env,
                 &cipher,
-                classes.mid_cipher_do_final,
-                &[jvalue {
-                    l: input_array.as_raw(),
-                }],
+                classes.mid_cipher_do_final_bb,
+                &[
+                    jvalue {
+                        l: input_buf.as_raw(),
+                    },
+                    jvalue {
+                        l: output_buf.as_raw(),
+                    },
+                ],
             )
         }?;
 
-        // Copy result to output
-        let result_array: JByteArray = result.into();
-        let result_len = env
-            .get_array_length(&result_array)
-            .map_err(|e| CryptoError::Other(format!("Failed to get array length: {e}")))?
-            as usize;
-
-        if result_len > output.len() {
-            return Err(CryptoError::Other(format!(
-                "Output buffer too small: need {result_len}, have {}",
-                output.len()
-            )));
-        }
-
-        env.get_byte_array_region(
-            &result_array,
-            0,
-            bytemuck::cast_slice_mut(&mut output[..result_len]),
-        )
-        .map_err(|e| CryptoError::Other(format!("Failed to copy result: {e}")))?;
-
-        Ok(result_len)
+        Ok(result_len as usize)
     })
 }
-
-/// Perform AES-GCM decryption using javax.crypto.Cipher.
 pub fn aes_gcm_decrypt(
     key: &[u8],
     iv: &[u8],
@@ -941,50 +1167,32 @@ pub fn aes_gcm_decrypt(
     output: &mut [u8],
 ) -> Result<usize, CryptoError> {
     with_jni_env!(|env: &mut JNIEnv, classes: &JniCache| {
-        let cipher_class = unsafe { as_class(&classes.cipher) };
-        let key_spec_class = unsafe { as_class(&classes.secret_key_spec) };
         let gcm_spec_class = unsafe { as_class(&classes.gcm_parameter_spec) };
-        let transformation = unsafe { as_obj(&classes.str_aes_gcm) };
 
-        // Call Cipher.getInstance("AES/GCM/NoPadding")
-        let cipher = unsafe {
-            get_instance(
-                env,
-                &cipher_class,
-                classes.mid_cipher_get_instance,
-                &transformation,
-            )
-        }?;
+        // Reuse the cached Cipher instance
+        let cipher = unsafe { as_obj(&classes.aes_gcm_cipher) };
 
-        // Create key byte array and algorithm string
-        let key_array = env
-            .byte_array_from_slice(key)
-            .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
+        // Get or create cached SecretKeySpec for this key
+        let key_spec = unsafe { get_or_create_aes_key_spec(env, classes, key) }?;
 
-        let aes_algorithm = unsafe { as_obj(&classes.str_aes) };
-
-        // Create SecretKeySpec(key, "AES")
-        let key_spec = env
-            .new_object(
-                &key_spec_class,
-                "([BLjava/lang/String;)V",
-                &[JValue::Object(&key_array), JValue::Object(&aes_algorithm)],
-            )
-            .map_err(|e| CryptoError::Other(format!("Failed to create SecretKeySpec: {e}")))?;
-
-        // Create IV byte array
-        let iv_array = env
-            .byte_array_from_slice(iv)
-            .map_err(|e| CryptoError::Other(format!("Failed to create IV array: {e}")))?;
+        // Update the cached 12-byte IV array in place.
+        unsafe { raw_set_byte_array_region(env, classes.gcm_iv_array.as_raw(), iv) };
+        let iv_array = unsafe { as_obj(&classes.gcm_iv_array) };
 
         // Create GCMParameterSpec(128, iv) - 128 is the tag length in bits
-        let gcm_spec = env
-            .new_object(
+        let gcm_spec = unsafe {
+            new_obj(
+                env,
                 &gcm_spec_class,
-                "(I[B)V",
-                &[JValue::Int(128), JValue::Object(&iv_array)],
+                classes.ctor_gcm_parameter_spec,
+                &[
+                    jvalue { i: 128 },
+                    jvalue {
+                        l: iv_array.as_raw(),
+                    },
+                ],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create GCMParameterSpec: {e}")))?;
+        }?;
 
         // Get DECRYPT_MODE constant (value is 2)
         let decrypt_mode = 2i32;
@@ -1007,63 +1215,48 @@ pub fn aes_gcm_decrypt(
             )
         }?;
 
-        // Update AAD if present
+        // Update AAD via raw DirectByteBuffer (no ExceptionCheck overhead)
         if !aad.is_empty() {
-            let aad_array = env
-                .byte_array_from_slice(aad)
-                .map_err(|e| CryptoError::Other(format!("Failed to create AAD array: {e}")))?;
+            let aad_buf =
+                unsafe { raw_new_direct_byte_buffer(env, aad.as_ptr() as *mut u8, aad.len()) };
 
             unsafe {
                 call_void(
                     env,
                     &cipher,
-                    classes.mid_cipher_update_aad,
+                    classes.mid_cipher_update_aad_bb,
                     &[jvalue {
-                        l: aad_array.as_raw(),
+                        l: aad_buf.as_raw(),
                     }],
                 )
             }?;
         }
 
-        // Create input byte array
-        let input_array = env
-            .byte_array_from_slice(input)
-            .map_err(|e| CryptoError::Other(format!("Failed to create input array: {e}")))?;
+        // Wrap Rust memory in DirectByteBuffers via raw JNI (no ExceptionCheck).
+        let input_buf =
+            unsafe { raw_new_direct_byte_buffer(env, input.as_ptr() as *mut u8, input.len()) };
 
-        // Call cipher.doFinal(input)
-        let result = unsafe {
-            call_obj(
+        let output_buf =
+            unsafe { raw_new_direct_byte_buffer(env, output.as_mut_ptr(), output.len()) };
+
+        // Call cipher.doFinal(inputBuf, outputBuf) — writes directly into output
+        let result_len = unsafe {
+            call_int(
                 env,
                 &cipher,
-                classes.mid_cipher_do_final,
-                &[jvalue {
-                    l: input_array.as_raw(),
-                }],
+                classes.mid_cipher_do_final_bb,
+                &[
+                    jvalue {
+                        l: input_buf.as_raw(),
+                    },
+                    jvalue {
+                        l: output_buf.as_raw(),
+                    },
+                ],
             )
         }?;
 
-        // Copy result to output
-        let result_array: JByteArray = result.into();
-        let result_len = env
-            .get_array_length(&result_array)
-            .map_err(|e| CryptoError::Other(format!("Failed to get array length: {e}")))?
-            as usize;
-
-        if result_len > output.len() {
-            return Err(CryptoError::Other(format!(
-                "Output buffer too small: need {result_len}, have {}",
-                output.len()
-            )));
-        }
-
-        env.get_byte_array_region(
-            &result_array,
-            0,
-            bytemuck::cast_slice_mut(&mut output[..result_len]),
-        )
-        .map_err(|e| CryptoError::Other(format!("Failed to copy result: {e}")))?;
-
-        Ok(result_len)
+        Ok(result_len as usize)
     })
 }
 
@@ -1072,9 +1265,7 @@ pub fn secure_random(buf: &mut [u8]) -> Result<(), CryptoError> {
     with_jni_env!(|env: &mut JNIEnv, classes: &JniCache| {
         let random_class = unsafe { as_class(&classes.secure_random) };
 
-        let random = env
-            .new_object(&random_class, "()V", &[])
-            .map_err(|e| CryptoError::Other(format!("Failed to create SecureRandom: {e}")))?;
+        let random = unsafe { new_obj(env, &random_class, classes.ctor_secure_random, &[]) }?;
 
         // Create output byte array
         let output_array = env
@@ -1228,13 +1419,16 @@ pub fn generate_ec_key_pair_p256() -> Result<EcKeyPair, CryptoError> {
         let curve_name = unsafe { as_obj(&classes.str_secp256r1) };
 
         // Create ECGenParameterSpec
-        let ec_spec = env
-            .new_object(
+        let ec_spec = unsafe {
+            new_obj(
+                env,
                 &ec_spec_class,
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&curve_name)],
+                classes.ctor_ec_gen_parameter_spec,
+                &[jvalue {
+                    l: curve_name.as_raw(),
+                }],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create ECGenParameterSpec: {e}")))?;
+        }?;
 
         // Initialize with the spec
         unsafe {
@@ -1401,11 +1595,16 @@ pub fn ecdsa_sign_sha256(private_key_der: &[u8], data: &[u8]) -> Result<Vec<u8>,
             .byte_array_from_slice(private_key_der)
             .map_err(|e| CryptoError::Other(format!("Failed to create key byte array: {e}")))?;
 
-        let key_spec = env
-            .new_object(&key_spec_class, "([B)V", &[JValue::Object(&key_bytes)])
-            .map_err(|e| {
-                CryptoError::Other(format!("Failed to create PKCS8EncodedKeySpec: {e}"))
-            })?;
+        let key_spec = unsafe {
+            new_obj(
+                env,
+                &key_spec_class,
+                classes.ctor_pkcs8_encoded_key_spec,
+                &[jvalue {
+                    l: key_bytes.as_raw(),
+                }],
+            )
+        }?;
 
         // Generate private key from spec
         let private_key = unsafe {
@@ -1503,15 +1702,16 @@ pub fn ecdh_key_agreement(
             .byte_array_from_slice(private_key_der)
             .map_err(|e| CryptoError::Other(format!("Failed to create private key array: {e}")))?;
 
-        let private_key_spec = env
-            .new_object(
+        let private_key_spec = unsafe {
+            new_obj(
+                env,
                 &pkcs8_spec_class,
-                "([B)V",
-                &[JValue::Object(&private_key_bytes)],
+                classes.ctor_pkcs8_encoded_key_spec,
+                &[jvalue {
+                    l: private_key_bytes.as_raw(),
+                }],
             )
-            .map_err(|e| {
-                CryptoError::Other(format!("Failed to create PKCS8EncodedKeySpec: {e}"))
-            })?;
+        }?;
 
         let private_key = unsafe {
             call_obj(
@@ -1531,13 +1731,16 @@ pub fn ecdh_key_agreement(
             .byte_array_from_slice(&peer_spki)
             .map_err(|e| CryptoError::Other(format!("Failed to create public key array: {e}")))?;
 
-        let public_key_spec = env
-            .new_object(
+        let public_key_spec = unsafe {
+            new_obj(
+                env,
                 &x509_spec_class,
-                "([B)V",
-                &[JValue::Object(&public_key_bytes)],
+                classes.ctor_x509_encoded_key_spec,
+                &[jvalue {
+                    l: public_key_bytes.as_raw(),
+                }],
             )
-            .map_err(|e| CryptoError::Other(format!("Failed to create X509EncodedKeySpec: {e}")))?;
+        }?;
 
         let public_key = unsafe {
             call_obj(

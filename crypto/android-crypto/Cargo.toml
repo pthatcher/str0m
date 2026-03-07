@@ -28,6 +28,13 @@ bytemuck = "1.14"
 # Constant-time comparison for crypto
 subtle = "2.0.0"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = [] }
+
+[[bench]]
+name = "jni_crypto"
+harness = false
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_import_braces = "deny"
