@@ -84,6 +84,7 @@ struct JniCache {
     mid_mac_do_final: JMethodID,
     mid_mac_do_final_noarg: JMethodID,
     mid_mac_update_bb: JMethodID,
+    mid_mac_reset: JMethodID,
     mid_cipher_init2: JMethodID,
     mid_cipher_init3: JMethodID,
     mid_cipher_update_aad: JMethodID,
@@ -213,6 +214,7 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
     let mid_mac_do_final = cache_method(env, &mac, "doFinal", "([B)[B")?;
     let mid_mac_do_final_noarg = cache_method(env, &mac, "doFinal", "()[B")?;
     let mid_mac_update_bb = cache_method(env, &mac, "update", "(Ljava/nio/ByteBuffer;)V")?;
+    let mid_mac_reset = cache_method(env, &mac, "reset", "()V")?;
     let mid_cipher_init2 = cache_method(env, &cipher, "init", "(ILjava/security/Key;)V")?;
     let mid_cipher_init3 = cache_method(
         env,
@@ -374,6 +376,7 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         mid_mac_do_final,
         mid_mac_do_final_noarg,
         mid_mac_update_bb,
+        mid_mac_reset,
         mid_cipher_init2,
         mid_cipher_init3,
         mid_cipher_update_aad,
@@ -801,20 +804,32 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<[u8; 20], CryptoError> {
         // Reuse the cached Mac instance
         let mac = unsafe { as_obj(&classes.hmac_sha1_mac) };
 
-        // Get or create cached SecretKeySpec for this key
-        let key_spec = unsafe { get_or_create_hmac_sha1_key_spec(env, classes, key) }?;
+        // Check if the key matches the cached one; if so, just reset.
+        // Otherwise re-init with the new key spec.
+        let key_changed = HMAC_SHA1_KEY_SPEC_CACHE.with(|cell| {
+            let borrow = cell.borrow();
+            match borrow.as_ref() {
+                Some((cached_key, _)) if cached_key == key => false,
+                _ => true,
+            }
+        });
 
-        // Call mac.init(keySpec)
-        unsafe {
-            call_void(
-                env,
-                &mac,
-                classes.mid_mac_init,
-                &[jvalue {
-                    l: key_spec.as_raw(),
-                }],
-            )
-        }?;
+        if key_changed {
+            let key_spec = unsafe { get_or_create_hmac_sha1_key_spec(env, classes, key) }?;
+            unsafe {
+                call_void(
+                    env,
+                    &mac,
+                    classes.mid_mac_init,
+                    &[jvalue {
+                        l: key_spec.as_raw(),
+                    }],
+                )
+            }?;
+        } else {
+            // Same key — reset is cheaper than init
+            unsafe { call_void(env, &mac, classes.mid_mac_reset, &[]) }?;
+        }
 
         // Update via DirectByteBuffer (zero-copy)
         let data_buf =
