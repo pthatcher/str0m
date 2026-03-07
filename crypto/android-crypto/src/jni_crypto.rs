@@ -82,6 +82,8 @@ struct JniCache {
     mid_digest_digest: JMethodID,
     mid_mac_init: JMethodID,
     mid_mac_do_final: JMethodID,
+    mid_mac_do_final_noarg: JMethodID,
+    mid_mac_update_bb: JMethodID,
     mid_cipher_init2: JMethodID,
     mid_cipher_init3: JMethodID,
     mid_cipher_update_aad: JMethodID,
@@ -116,6 +118,8 @@ struct JniCache {
     aes_gcm_cipher: GlobalRef,
     /// Pre-allocated 12-byte Java `byte[]` for AES-GCM IVs.
     gcm_iv_array: GlobalRef,
+    /// Reusable `Mac.getInstance("HmacSHA1")` instance.
+    hmac_sha1_mac: GlobalRef,
 }
 
 thread_local! {
@@ -123,6 +127,9 @@ thread_local! {
 
     /// Cached `SecretKeySpec(key, "AES")` for AES-GCM: `(raw_key_bytes, global_ref)`.
     static AES_KEY_SPEC_CACHE: RefCell<Option<(Vec<u8>, GlobalRef)>> = const { RefCell::new(None) };
+
+    /// Cached `SecretKeySpec(key, "HmacSHA1")` for HMAC-SHA1: `(raw_key_bytes, global_ref)`.
+    static HMAC_SHA1_KEY_SPEC_CACHE: RefCell<Option<(Vec<u8>, GlobalRef)>> = const { RefCell::new(None) };
 }
 
 /// Look up a Java class and create a [`GlobalRef`] for caching.
@@ -204,6 +211,8 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
     let mid_digest_digest = cache_method(env, &message_digest, "digest", "([B)[B")?;
     let mid_mac_init = cache_method(env, &mac, "init", "(Ljava/security/Key;)V")?;
     let mid_mac_do_final = cache_method(env, &mac, "doFinal", "([B)[B")?;
+    let mid_mac_do_final_noarg = cache_method(env, &mac, "doFinal", "()[B")?;
+    let mid_mac_update_bb = cache_method(env, &mac, "update", "(Ljava/nio/ByteBuffer;)V")?;
     let mid_cipher_init2 = cache_method(env, &cipher, "init", "(ILjava/security/Key;)V")?;
     let mid_cipher_init3 = cache_method(
         env,
@@ -310,6 +319,21 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         .new_global_ref(&gcm_iv_local)
         .map_err(|e| CryptoError::Other(format!("Failed to cache IV array: {e}")))?;
 
+    // Create a reusable Mac instance for HmacSHA1.
+    let mac_class_ref = unsafe { as_class(&mac) };
+    let str_hmac_sha1_val = cache_string(env, "HmacSHA1")?;
+    let hmac_sha1_obj = unsafe {
+        get_instance(
+            env,
+            &mac_class_ref,
+            mid_mac_get_instance,
+            &as_obj(&str_hmac_sha1_val),
+        )
+    }?;
+    let hmac_sha1_mac = env
+        .new_global_ref(hmac_sha1_obj)
+        .map_err(|e| CryptoError::Other(format!("Failed to cache HmacSHA1 mac: {e}")))?;
+
     Ok(JniCache {
         message_digest,
         mac,
@@ -326,7 +350,7 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         key_agreement,
         str_sha256: cache_string(env, "SHA-256")?,
         str_sha384: cache_string(env, "SHA-384")?,
-        str_hmac_sha1: cache_string(env, "HmacSHA1")?,
+        str_hmac_sha1: str_hmac_sha1_val,
         str_hmac_sha256: cache_string(env, "HmacSHA256")?,
         str_hmac_sha384: cache_string(env, "HmacSHA384")?,
         str_aes_ecb: cache_string(env, "AES/ECB/NoPadding")?,
@@ -348,6 +372,8 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         mid_digest_digest,
         mid_mac_init,
         mid_mac_do_final,
+        mid_mac_do_final_noarg,
+        mid_mac_update_bb,
         mid_cipher_init2,
         mid_cipher_init3,
         mid_cipher_update_aad,
@@ -376,6 +402,7 @@ fn init_jni_cache(env: &mut JNIEnv) -> Result<JniCache, CryptoError> {
         ctor_x509_encoded_key_spec,
         aes_gcm_cipher,
         gcm_iv_array,
+        hmac_sha1_mac,
     })
 }
 
@@ -620,6 +647,66 @@ unsafe fn get_or_create_aes_key_spec<'local>(
     Ok(key_spec)
 }
 
+/// Return a cached `SecretKeySpec(key, "HmacSHA1")` [`JObject`], creating or
+/// replacing the cached entry when the key material changes.
+///
+/// # Safety
+///
+/// `classes` must be a valid, initialised `JniCache`.
+unsafe fn get_or_create_hmac_sha1_key_spec<'local>(
+    env: &mut JNIEnv<'local>,
+    classes: &JniCache,
+    key: &[u8],
+) -> Result<JObject<'local>, CryptoError> {
+    // Fast path: return the cached spec if the key hasn't changed.
+    let hit = HMAC_SHA1_KEY_SPEC_CACHE.with(|cell| {
+        let borrow = cell.borrow();
+        if let Some((cached_key, cached_ref)) = borrow.as_ref() {
+            if cached_key == key {
+                return Some(unsafe { JObject::from_raw(cached_ref.as_raw()) });
+            }
+        }
+        None
+    });
+
+    if let Some(obj) = hit {
+        return Ok(obj);
+    }
+
+    // Slow path: construct a new SecretKeySpec and cache it.
+    let key_spec_class = unsafe { as_class(&classes.secret_key_spec) };
+    let key_array = env
+        .byte_array_from_slice(key)
+        .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
+    let hmac_algorithm = unsafe { as_obj(&classes.str_hmac_sha1) };
+
+    let key_spec = unsafe {
+        new_obj(
+            env,
+            &key_spec_class,
+            classes.ctor_secret_key_spec,
+            &[
+                jvalue {
+                    l: key_array.as_raw(),
+                },
+                jvalue {
+                    l: hmac_algorithm.as_raw(),
+                },
+            ],
+        )
+    }?;
+
+    let global = env
+        .new_global_ref(&key_spec)
+        .map_err(|e| CryptoError::Other(format!("Failed to cache SecretKeySpec: {e}")))?;
+
+    HMAC_SHA1_KEY_SPEC_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some((key.to_vec(), global));
+    });
+
+    Ok(key_spec)
+}
+
 /// Execute a JNI operation with a cached set of class references.
 ///
 /// Attaches the current thread to the JVM (if not already attached), ensures
@@ -711,35 +798,11 @@ pub fn sha256(data: &[u8]) -> Result<[u8; 32], CryptoError> {
 /// Compute HMAC-SHA1 using javax.crypto.Mac.
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<[u8; 20], CryptoError> {
     with_jni_env!(|env: &mut JNIEnv, classes: &JniCache| {
-        let mac_class = unsafe { as_class(&classes.mac) };
-        let key_spec_class = unsafe { as_class(&classes.secret_key_spec) };
-        let algorithm = unsafe { as_obj(&classes.str_hmac_sha1) };
+        // Reuse the cached Mac instance
+        let mac = unsafe { as_obj(&classes.hmac_sha1_mac) };
 
-        // Call Mac.getInstance("HmacSHA1")
-        let mac =
-            unsafe { get_instance(env, &mac_class, classes.mid_mac_get_instance, &algorithm) }?;
-
-        // Create key byte array
-        let key_array = env
-            .byte_array_from_slice(key)
-            .map_err(|e| CryptoError::Other(format!("Failed to create key array: {e}")))?;
-
-        // Create SecretKeySpec(key, "HmacSHA1")
-        let key_spec = unsafe {
-            new_obj(
-                env,
-                &key_spec_class,
-                classes.ctor_secret_key_spec,
-                &[
-                    jvalue {
-                        l: key_array.as_raw(),
-                    },
-                    jvalue {
-                        l: algorithm.as_raw(),
-                    },
-                ],
-            )
-        }?;
+        // Get or create cached SecretKeySpec for this key
+        let key_spec = unsafe { get_or_create_hmac_sha1_key_spec(env, classes, key) }?;
 
         // Call mac.init(keySpec)
         unsafe {
@@ -753,22 +816,23 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<[u8; 20], CryptoError> {
             )
         }?;
 
-        // Create data byte array
-        let data_array = env
-            .byte_array_from_slice(data)
-            .map_err(|e| CryptoError::Other(format!("Failed to create data array: {e}")))?;
+        // Update via DirectByteBuffer (zero-copy)
+        let data_buf =
+            unsafe { raw_new_direct_byte_buffer(env, data.as_ptr() as *mut u8, data.len()) };
 
-        // Call mac.doFinal(data)
-        let result = unsafe {
-            call_obj(
+        unsafe {
+            call_void(
                 env,
                 &mac,
-                classes.mid_mac_do_final,
+                classes.mid_mac_update_bb,
                 &[jvalue {
-                    l: data_array.as_raw(),
+                    l: data_buf.as_raw(),
                 }],
             )
         }?;
+
+        // Call mac.doFinal() (no-arg variant)
+        let result = unsafe { call_obj(env, &mac, classes.mid_mac_do_final_noarg, &[]) }?;
 
         // Convert result to Rust array
         let result_array: JByteArray = result.into();
