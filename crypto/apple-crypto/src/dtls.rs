@@ -49,7 +49,7 @@ fn generate_certificate_impl() -> Result<DtlsCert, CryptoError> {
     let certificate = crate::cert::build_self_signed_certificate(
         "WebRTC",
         serial,
-        &public_key_data.bytes(),
+        public_key_data.bytes(),
         |tbs_certificate| {
             // Sign using ECDSA with SHA-256 directly with the generated key
             private_key
@@ -67,7 +67,7 @@ fn generate_certificate_impl() -> Result<DtlsCert, CryptoError> {
     let private_scalar = &private_key_data.bytes()[65..].try_into().map_err(|err| {
         CryptoError::Other(format!("Unexpected Apple private key contents: {err:?}"))
     })?;
-    let private_key_der = crate::cert::build_pkcs8(private_scalar, &public_key_data.bytes())?;
+    let private_key_der = crate::cert::build_pkcs8(private_scalar, public_key_data.bytes())?;
 
     Ok(DtlsCert {
         certificate,
