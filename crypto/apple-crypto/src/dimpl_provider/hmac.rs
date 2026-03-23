@@ -23,14 +23,29 @@ impl HmacProvider for AppleHmacProvider {
                     apple_cryptokit::hmac_sha256(key, data).map_err(|err| format!("{err:?}"))?;
                 let hmac_len = result.len();
                 out[0..hmac_len].copy_from_slice(&result);
-                Ok(hmac_len)
+                if hmac_len <= out.len() {
+                    out[0..hmac_len].copy_from_slice(&result);
+                    Ok(hmac_len)
+                } else {
+                    Err(format!(
+                        "Output buffer too small for SHA256. Needed: {hmac_len}, Was: {}",
+                        out.len()
+                    ))
+                }
             }
             dimpl::HashAlgorithm::SHA384 => {
                 let result =
                     apple_cryptokit::hmac_sha384(key, data).map_err(|err| format!("{err:?}"))?;
                 let hmac_len = result.len();
-                out[0..hmac_len].copy_from_slice(&result);
-                Ok(hmac_len)
+                if hmac_len <= out.len() {
+                    out[0..hmac_len].copy_from_slice(&result);
+                    Ok(hmac_len)
+                } else {
+                    Err(format!(
+                        "Output buffer too small for SHA384. Needed: {hmac_len}, Was: {}",
+                        out.len()
+                    ))
+                }
             }
             _ => Err(format!("Unsupported HMAC Hash: {hash:?}")),
         }
