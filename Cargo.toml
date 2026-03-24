@@ -35,7 +35,7 @@ unversioned = []
 
 # For crypto providers that have dimpl and non-dimpl DTLS support, use dimpl.
 # This has no effect for providers that always dimpl.
-prefer_dimpl = ["str0m-openssl?/prefer_dimpl"]
+prefer_dimpl = ["str0m-openssl?/prefer_dimpl", "str0m-wincrypto?/prefer_dimpl"]
 
 # Redacts personally identifiable information (PII) from logs debug and above
 pii = []

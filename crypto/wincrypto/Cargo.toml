@@ -11,11 +11,20 @@ edition = "2024"
 rust-version = "1.85.0"
 
 [dependencies]
-tracing = "0.1.37"
+#dimpl = { version = "0.4.3", default-features = false, optional = true }
+dimpl = {git = "https://github.com/algesten/dimpl.git", default-features = false, optional = true}
 str0m-proto = { version = "0.2.0", path = "../../proto" }
+tracing = "0.1.37"
 windows = { version = "0.62", features = [
   "Win32_Security_Cryptography",
   "Win32_Security_Authentication_Identity",
   "Win32_Security_Credentials",
   "Win32_System_Rpc",
 ] }
+
+[dev-dependencies]
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[features]
+prefer_dimpl = ["dep:dimpl"]
