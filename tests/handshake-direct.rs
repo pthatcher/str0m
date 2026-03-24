@@ -87,6 +87,7 @@ fn run_handshake_test(client_dtls: DtlsVersion, server_dtls: DtlsVersion) -> Res
     // Also skip Auto client → 1.2-only server: dimpl advertises X25519 in the hybrid
     // ClientHello but its DTLS 1.2 engine can't process X25519 in ServerKeyExchange.
     let dtls12_only = |name: &str| match name {
+        #[cfg(not(feature = "prefer_dimpl"))]
         "wincrypto" => true,
         #[cfg(not(feature = "prefer_dimpl"))]
         "openssl" => true,
