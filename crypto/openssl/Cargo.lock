@@ -48,8 +48,7 @@ dependencies = [
 [[package]]
 name = "dimpl"
 version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8da42827f6904e69bf1cc78ddcb74fab007a2b476099ab0a42e8cacf1ea1f6c0"
+source = "git+https://github.com/algesten/dimpl.git#52e8331274e5bc7399246363080b27bc8d2f0fc1"
 dependencies = [
  "arrayvec",
  "log",
@@ -296,6 +295,8 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 name = "str0m-openssl"
 version = "0.2.0"
 dependencies = [
+ "arrayvec",
+ "dimpl",
  "libc",
  "openssl",
  "openssl-sys",

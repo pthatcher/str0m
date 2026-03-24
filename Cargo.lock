@@ -567,8 +567,7 @@ dependencies = [
 [[package]]
 name = "dimpl"
 version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8da42827f6904e69bf1cc78ddcb74fab007a2b476099ab0a42e8cacf1ea1f6c0"
+source = "git+https://github.com/algesten/dimpl.git#52e8331274e5bc7399246363080b27bc8d2f0fc1"
 dependencies = [
  "aes-gcm",
  "arrayvec",
@@ -2017,6 +2016,7 @@ dependencies = [
 name = "str0m-openssl"
 version = "0.2.0"
 dependencies = [
+ "dimpl",
  "libc",
  "openssl",
  "openssl-sys",
@@ -2055,6 +2055,7 @@ dependencies = [
 name = "str0m-wincrypto"
 version = "0.4.0"
 dependencies = [
+ "dimpl",
  "str0m-proto",
  "tracing",
  "windows",
