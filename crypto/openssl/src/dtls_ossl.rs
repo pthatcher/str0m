@@ -397,6 +397,19 @@ fn dtls_create_ctx(cert: &DtlsCert) -> Result<SslContext, CryptoError> {
     ctx.set_private_key(&pkey)?;
     ctx.set_certificate(&x509)?;
 
+    if let Ok(path) = std::env::var("SSLKEYLOGFILE") {
+        ctx.set_keylog_callback(move |_ssl, line| {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(file, "{}", line);
+            }
+        });
+    }
+
     let mut options = SslOptions::empty();
     options.insert(SslOptions::SINGLE_ECDH_USE);
     options.insert(SslOptions::NO_DTLSV1);
