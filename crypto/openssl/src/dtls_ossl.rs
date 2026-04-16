@@ -239,9 +239,37 @@ fn export_srtp_keying_material<S>(
     let mut buf = vec![0_u8; srtp_profile.keying_material_len()];
     ssl.export_keying_material(&mut buf, DTLS_KEY_LABEL, None)?;
 
+    if let Ok(path) = std::env::var("SSLKEYLOGFILE") {
+        use std::io::Write;
+        let mut client_random = [0u8; 32];
+        ssl.client_random(&mut client_random);
+        let client_random_hex = to_hex(&client_random);
+        let keying_material_hex = to_hex(&buf);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(
+                file,
+                "SRTP_KEY_MATERIAL {} {}",
+                client_random_hex, keying_material_hex
+            );
+        }
+    }
+
     let mat = KeyingMaterial::new(&buf);
 
     Ok((mat, srtp_profile, peer_cert_der))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 impl<S> io::Read for TlsStream<S>
