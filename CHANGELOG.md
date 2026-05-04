@@ -4,7 +4,7 @@
   * Update to dimpl 0.6.1
   * Update openssl to 0.10.78
 
-# is-0.8.1
+# is-0.9.0
 
   * IceCandidate expose str0m/is-unique local property #951
   * Implement ICE role conflict resolution #950
