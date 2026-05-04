@@ -1,4 +1,4 @@
-# Unreleased
+# 0.19.0
 
   * Expose H265 some already referenced profile structs #948
   * Update to dimpl 0.6.1
