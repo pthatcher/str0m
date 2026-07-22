@@ -9,13 +9,7 @@ use str0m::media::Pt;
 use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use str0m::{Event, Rtc, RtcError};
 
-fn write_packet(
-    l: &mut common::TestRtc,
-    ssrc: Ssrc,
-    pt: Pt,
-    seq_no: SeqNo,
-    time: u32,
-) {
+fn write_packet(l: &mut common::TestRtc, ssrc: Ssrc, pt: Pt, seq_no: SeqNo, time: u32) {
     let wallclock = l.start + l.duration();
     let mut direct = l.direct_api();
     let stream = direct.stream_tx(&ssrc).expect("stream tx");
