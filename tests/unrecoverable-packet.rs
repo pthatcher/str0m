@@ -6,7 +6,7 @@ use common::{connect_l_r, connect_l_r_with_rtc, init_crypto_default, init_log, p
 use str0m::format::Codec;
 use str0m::media::MediaKind;
 use str0m::media::Pt;
-use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
+use str0m::rtp::{ExtensionValues, RtpWrite, SeqNo, Ssrc};
 use str0m::{Event, Rtc, RtcError};
 
 fn write_packet(l: &mut common::TestRtc, ssrc: Ssrc, pt: Pt, seq_no: SeqNo, time: u32) {
@@ -14,18 +14,11 @@ fn write_packet(l: &mut common::TestRtc, ssrc: Ssrc, pt: Pt, seq_no: SeqNo, time
     let mut direct = l.direct_api();
     let stream = direct.stream_tx(&ssrc).expect("stream tx");
 
-    stream
-        .write_rtp(
-            pt,
-            seq_no,
-            time,
-            wallclock,
-            false,
-            ExtensionValues::default(),
-            true,
-            vec![0x11, 0x22, 0x33, 0x44],
-        )
-        .expect("clean write");
+    stream.write_rtp(
+        RtpWrite::new(pt, seq_no, time, wallclock, vec![0x11, 0x22, 0x33, 0x44])
+            .ext_vals(ExtensionValues::default())
+            .nackable(true),
+    );
 }
 
 #[test]
