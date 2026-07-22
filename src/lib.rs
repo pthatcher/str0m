@@ -684,6 +684,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use str0m_proto::Pii;
 use streams::RtpPacket;
+use streams::RtpPacketUnrecoverable;
 use streams::StreamPaused;
 use util::InstantExt;
 
@@ -787,7 +788,8 @@ pub mod rtp {
     };
     pub use crate::rtp_::{RtpHeader, SeqNo, Ssrc, VideoOrientation};
     pub use crate::streams::{
-        RtpPacket, RtpWrite, StreamPaused, StreamRx, StreamTx, StreamTxQueueInfo,
+        RtpPacket, RtpPacketUnrecoverable, RtpWrite, StreamPaused, StreamRx, StreamTx,
+        StreamTxQueueInfo,
     };
 
     /// Debug output of the unencrypted RTP and RTCP packets.
@@ -1029,6 +1031,11 @@ pub enum Event {
 
     /// Incoming RTP data.
     RtpPacket(RtpPacket),
+
+    /// Packet in an incoming RTX-enabled stream that could not be recovered.
+    ///
+    /// This event is only emitted when RTP mode is enabled.
+    RtpPacketUnrecoverable(RtpPacketUnrecoverable),
 
     /// Incoming application-specific Payload-Specific Feedback (PSFB FMT=15, PT=206).
     ///
@@ -1553,6 +1560,7 @@ impl Rtc {
                 Event::ChannelData(_)
                 | Event::MediaData(_)
                 | Event::RtpPacket(_)
+                | Event::RtpPacketUnrecoverable(_)
                 | Event::SenderFeedback(_)
                 | Event::MediaEgressStats(_)
                 | Event::MediaIngressStats(_)

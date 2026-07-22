@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::rtp_::{Nack, ReceptionReport, SeqNo};
 
@@ -98,8 +98,8 @@ impl ReceiverRegister {
     }
 
     /// Generates a NACK report
-    pub fn nack_report(&mut self) -> Option<impl Iterator<Item = Nack>> {
-        self.nack.nack_reports()
+    pub fn nack_report(&mut self, now: Instant) -> Option<impl Iterator<Item = Nack>> {
+        self.nack.nack_reports(now)
     }
 
     /// Create a new reception report.
@@ -125,6 +125,14 @@ impl ReceiverRegister {
 
     pub fn max_seq(&self) -> Option<SeqNo> {
         self.nack.max_seq()
+    }
+
+    pub fn take_unrecoverable(&mut self) -> Vec<SeqNo> {
+        self.nack.take_unrecoverable()
+    }
+
+    pub fn mark_unrecoverable_timeout(&mut self, now: Instant, rtt: Duration) {
+        self.nack.mark_unrecoverable_timeout(now, rtt);
     }
 
     pub fn clear(&mut self, max_seq_no: Option<SeqNo>) {

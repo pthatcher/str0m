@@ -135,7 +135,7 @@ pub fn receive_register(data: &[u8]) -> Option<()> {
                 rr.update(seq.into(), arrival, rtp_time, clock_rate);
             }
             1 => {
-                rr.nack_report();
+                rr.nack_report(start);
             }
             2 => {
                 rr.reception_report();

@@ -14,7 +14,7 @@ use crate::stats::{MediaIngressStats, RemoteEgressStats, StatsSnapshot};
 use crate::util::{InstantExt, SystemTimeExt};
 use crate::util::{already_happened, calculate_rtt};
 
-use super::StreamPaused;
+use super::{StreamPaused, RtpPacketUnrecoverable};
 use super::register::ReceiverRegister;
 use super::{RtpPacket, rr_interval};
 
@@ -72,6 +72,9 @@ pub struct StreamRx {
     ///
     /// Set on first ever RTXpacket.
     register_rtx: Option<ReceiverRegister>,
+
+    /// Main-stream packets that were deemed unrecoverable.
+    unrecoverable: VecDeque<SeqNo>,
 
     /// Last observed media time in an RTP packet.
     last_time: Option<MediaTime>,
@@ -158,6 +161,7 @@ impl StreamRx {
             reset_roc: None,
             register: None,
             register_rtx: None,
+            unrecoverable: VecDeque::new(),
             last_time: None,
             pending_request_keyframe: None,
             pending_request_remb: None,
@@ -399,6 +403,8 @@ impl StreamRx {
         }
         self.check_paused_at = Some(now + self.pause_threshold);
 
+        let track_unrecoverable = !is_repair && self.has_rtx_nack();
+
         let register_ref = if is_repair {
             &mut self.register_rtx
         } else {
@@ -409,6 +415,10 @@ impl StreamRx {
         let register = register_ref.as_mut().unwrap();
 
         let is_new_packet = register.update(seq_no, now, header.timestamp, clock_rate.get());
+
+        if track_unrecoverable {
+            self.unrecoverable.extend(register.take_unrecoverable());
+        }
 
         // Get the previous time for comparison
         let previous_time = self.last_time.map(|t| t.numer());
@@ -651,8 +661,13 @@ impl StreamRx {
         !self.suppress_nack
     }
 
+    fn has_rtx_nack(&self) -> bool {
+        self.rtx.is_some() && !self.suppress_nack
+    }
+
     pub(crate) fn maybe_create_nack(
         &mut self,
+        now: Instant,
         sender_ssrc: Ssrc,
         feedback: &mut VecDeque<Rtcp>,
     ) -> Option<()> {
@@ -660,7 +675,15 @@ impl StreamRx {
             return None;
         }
 
-        let nacks = self.register.as_mut().and_then(|r| r.nack_report())?;
+        let has_rtx_nack = self.has_rtx_nack();
+        if has_rtx_nack {
+            if let (Some(register), Some(rtt)) = (self.register.as_mut(), self.stats.rtt) {
+                register.mark_unrecoverable_timeout(now, rtt);
+                self.unrecoverable.extend(register.take_unrecoverable());
+            }
+        }
+
+        let nacks = self.register.as_mut().and_then(|r| r.nack_report(now))?;
 
         for mut nack in nacks {
             nack.sender_ssrc = sender_ssrc;
@@ -709,6 +732,20 @@ impl StreamRx {
         })
     }
 
+    pub(crate) fn poll_unrecoverable_packet(&mut self) -> Option<RtpPacketUnrecoverable> {
+        if !self.has_rtx_nack() {
+            self.unrecoverable.clear();
+            return None;
+        }
+
+        let seq_no = self.unrecoverable.pop_front()?;
+
+        Some(RtpPacketUnrecoverable {
+            ssrc: self.ssrc,
+            seq_no,
+        })
+    }
+
     /// Poll the most recent sender info and when it was received
     pub(crate) fn poll_sender_info(&mut self) -> Option<(SenderInfo, Instant)> {
         let i = self.sender_info.as_mut()?;
@@ -729,6 +766,7 @@ impl StreamRx {
         if let Some(r) = &mut self.register_rtx {
             r.clear(self.rtx.and_then(max_seq_lookup));
         }
+        self.unrecoverable.clear();
         self.pending_request_keyframe = None;
     }
 
@@ -759,6 +797,7 @@ impl StreamRx {
         self.pending_request_keyframe = None;
         self.pending_request_remb = None;
         self.reset_roc = None;
+        self.unrecoverable.clear();
 
         // Note: We don't reset the RTX register here, as the RTX SSRC is managed separately
         // via maybe_reset_rtx() and is not directly tied to the main SSRC change.
@@ -801,6 +840,7 @@ impl StreamRx {
         self.register = None;
         self.register_rtx = None;
         self.reset_roc = Some(roc);
+        self.unrecoverable.clear();
     }
 
     pub(crate) fn is_midrid(&self, midrid: MidRid) -> bool {

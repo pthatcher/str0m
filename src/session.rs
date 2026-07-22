@@ -746,6 +746,10 @@ impl Session {
             if let Some(packet) = self.pending_packet.take() {
                 return Some(Event::RtpPacket(packet));
             }
+
+            if let Some(unrecoverable) = self.streams.poll_unrecoverable_packet() {
+                return Some(Event::RtpPacketUnrecoverable(unrecoverable));
+            }
         }
 
         if let Some(req) = self.streams.poll_keyframe_request() {

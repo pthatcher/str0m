@@ -104,6 +104,16 @@ pub struct StreamPaused {
     pub paused: bool,
 }
 
+/// Event when a packet is considered unrecoverable for an incoming encoded stream.
+#[derive(Debug)]
+pub struct RtpPacketUnrecoverable {
+    /// The main SSRC of the encoded stream.
+    pub ssrc: Ssrc,
+
+    /// Sequence number of the unrecoverable packet.
+    pub seq_no: SeqNo,
+}
+
 /// 255 is out of range for a real PT, which is 7 bit.
 const BLANK_PACKET_DEFAULT_PT: Pt = Pt::new_with_value(255);
 
@@ -453,7 +463,7 @@ impl Streams {
             }
 
             if do_nack {
-                stream.maybe_create_nack(sender_ssrc, feedback);
+                stream.maybe_create_nack(now, sender_ssrc, feedback);
             }
 
             stream.handle_timeout(now);
@@ -521,6 +531,12 @@ impl Streams {
 
     pub(crate) fn poll_stream_paused(&mut self) -> Option<StreamPaused> {
         self.streams_rx.values_mut().find_map(|s| s.poll_paused())
+    }
+
+    pub(crate) fn poll_unrecoverable_packet(&mut self) -> Option<RtpPacketUnrecoverable> {
+        self.streams_rx
+            .values_mut()
+            .find_map(|s| s.poll_unrecoverable_packet())
     }
 
     pub(crate) fn has_stream_rx(&self, ssrc: Ssrc) -> bool {

@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use crate::rtp_::{Nack, NackEntry, ReportList, SeqNo};
 
@@ -7,6 +8,9 @@ const MAX_MISORDER: u64 = 100;
 
 /// The max number of NACKs we perform for a single packet
 const MAX_NACKS: u8 = 5;
+
+/// Factor applied to RTT for timeout-based unrecoverable marking.
+const RTT_FACTOR: u32 = 4;
 
 /// Circular buffer size
 const BUFFER_SIZE: u64 = MAX_MISORDER + 1;
@@ -18,12 +22,17 @@ pub struct NackRegister {
 
     /// Range of seq numbers considered NACK reporting.
     active: Option<Range<SeqNo>>,
+
+    /// Packets that were evicted from the NACK window without being recovered.
+    unrecoverable: Vec<SeqNo>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct PacketStatus {
     received: bool,
     nack_count: u8,
+    last_nack_at: Option<Instant>,
+    unrecoverable_reported: bool,
 }
 
 impl PacketStatus {
@@ -37,14 +46,22 @@ impl PacketStatus {
         new
     }
 
+    fn mark_nack_sent(&mut self, now: Instant) {
+        self.nack_count += 1;
+        self.last_nack_at = Some(now);
+    }
+
     fn reset(&mut self) {
         self.received = false;
         self.nack_count = 0;
+        self.last_nack_at = None;
+        self.unrecoverable_reported = false;
     }
 }
 
 struct NackIterator<'a> {
     reg: &'a mut NackRegister,
+    now: Instant,
     next: u64,
     end: u64,
 }
@@ -61,13 +78,14 @@ impl<'a> Iterator for NackIterator<'a> {
             blp: 0,
         };
 
-        self.reg.packet_mut(self.next.into()).nack_count += 1;
+        self.reg
+            .packet_mut(self.next.into())
+            .mark_nack_sent(self.now);
         self.next += 1;
 
         for (i, s) in (self.next..self.end).take(16).enumerate() {
-            let packet = self.reg.packet_mut(s.into());
-            if packet.needs_nack() {
-                self.reg.packet_mut(self.next.into()).nack_count += 1;
+            if self.reg.packet_mut(s.into()).needs_nack() {
+                self.reg.packet_mut(s.into()).mark_nack_sent(self.now);
                 entry.blp |= 1 << i
             }
             self.next += 1;
@@ -85,6 +103,7 @@ impl NackRegister {
         let mut n = NackRegister {
             packets: vec![PacketStatus::default(); BUFFER_SIZE as usize],
             active: None,
+            unrecoverable: vec![],
         };
 
         if let Some(seq) = max_seq_no {
@@ -105,6 +124,10 @@ impl NackRegister {
             return false;
         }
 
+        if seq <= active.end && self.packet(seq).unrecoverable_reported {
+            return false;
+        }
+
         !self.packet(seq).received || seq > active.end
     }
 
@@ -117,6 +140,11 @@ impl NackRegister {
 
         if seq < active.start {
             // skip old seq numbers, report as not new
+            return false;
+        }
+
+        if seq <= active.end && self.packet(seq).unrecoverable_reported {
+            // Already marked unrecoverable; late packets are intentionally dropped.
             return false;
         }
 
@@ -138,9 +166,20 @@ impl NackRegister {
 
         // reset packets that are rolling our of the nack window
         for (i, s) in (*active.start..*start).enumerate() {
-            let p = self.packet_mut(s.into());
-            if !p.received && s != *seq {
-                trace!("Seq no {} missing after {} attempts", s, p.nack_count);
+            let mut mark_unrecoverable = false;
+            {
+                let p = self.packet_mut(s.into());
+                if !p.received && s != *seq {
+                    trace!("Seq no {} missing after {} attempts", s, p.nack_count);
+                    if !p.unrecoverable_reported {
+                        p.unrecoverable_reported = true;
+                        mark_unrecoverable = true;
+                    }
+                }
+            }
+
+            if mark_unrecoverable {
+                self.unrecoverable.push(s.into());
             }
             self.packet_mut(s.into()).reset();
 
@@ -168,16 +207,53 @@ impl NackRegister {
         self.active.as_ref().map(|a| a.end)
     }
 
+    pub fn take_unrecoverable(&mut self) -> Vec<SeqNo> {
+        std::mem::take(&mut self.unrecoverable)
+    }
+
+    pub fn mark_unrecoverable_timeout(&mut self, now: Instant, rtt: Duration) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+
+        let timeout = rtt.checked_mul(RTT_FACTOR).unwrap_or(Duration::MAX);
+
+        for s in *active.start..=*active.end {
+            let mut mark_unrecoverable = false;
+            {
+                let p = self.packet_mut(s.into());
+
+                if p.received || p.nack_count < MAX_NACKS || p.unrecoverable_reported {
+                    continue;
+                }
+
+                let Some(last_nack_at) = p.last_nack_at else {
+                    continue;
+                };
+
+                if now.saturating_duration_since(last_nack_at) >= timeout {
+                    p.unrecoverable_reported = true;
+                    mark_unrecoverable = true;
+                }
+            }
+
+            if mark_unrecoverable {
+                self.unrecoverable.push(s.into());
+            }
+        }
+    }
+
     /// Create a new nack report
     ///
     /// This modifies the state as it counts how many times packets have been nacked
-    pub fn nack_reports(&mut self) -> Option<impl Iterator<Item = Nack>> {
+    pub fn nack_reports(&mut self, now: Instant) -> Option<impl Iterator<Item = Nack>> {
         let Range { start, end } = self.active.clone()?;
         let start = (*start..=*end).find(|s| self.packet_mut((*s).into()).needs_nack())?;
 
         Some(
             ReportList::lists_from_iter(NackIterator {
                 reg: self,
+                now,
                 next: start,
                 end: *end,
             })
@@ -210,8 +286,9 @@ impl NackRegister {
 #[cfg(test)]
 mod test {
     use std::ops::Range;
+    use std::time::{Duration, Instant};
 
-    use crate::streams::register_nack::MAX_MISORDER;
+    use crate::streams::register_nack::{MAX_MISORDER, MAX_NACKS, RTT_FACTOR};
 
     use super::NackRegister;
 
@@ -315,13 +392,13 @@ mod test {
     #[test]
     fn nack_report_none() {
         let mut reg = NackRegister::new(None);
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
 
         reg.update(110.into());
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
 
         reg.update(111.into());
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
     }
 
     #[test]
@@ -335,13 +412,16 @@ mod test {
     #[test]
     fn nack_report_one() {
         let mut reg = NackRegister::new(None);
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
 
         reg.update(110.into());
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
 
         reg.update(112.into());
-        let report = reg.nack_reports().map(Vec::from_iter).expect("some report");
+        let report = reg
+            .nack_reports(Instant::now())
+            .map(Vec::from_iter)
+            .expect("some report");
         assert!(report.len() == 1);
         assert_eq!(report[0].reports.len(), 1);
         assert_eq!(report[0].reports[0].pid, 111);
@@ -351,13 +431,16 @@ mod test {
     #[test]
     fn nack_report_two() {
         let mut reg = NackRegister::new(None);
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
 
         reg.update(110.into());
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
 
         reg.update(113.into());
-        let report = reg.nack_reports().map(Vec::from_iter).expect("some report");
+        let report = reg
+            .nack_reports(Instant::now())
+            .map(Vec::from_iter)
+            .expect("some report");
         assert!(report.len() == 1);
         assert_eq!(report[0].reports.len(), 1);
         assert_eq!(report[0].reports[0].pid, 111);
@@ -372,7 +455,10 @@ mod test {
             reg.update((*i).into());
         }
 
-        let report = reg.nack_reports().map(Vec::from_iter).expect("some report");
+        let report = reg
+            .nack_reports(Instant::now())
+            .map(Vec::from_iter)
+            .expect("some report");
         assert!(report.len() == 1);
         assert_eq!(report[0].reports.len(), 1);
         assert_eq!(report[0].reports[0].pid, 102);
@@ -393,7 +479,10 @@ mod test {
             reg.update((*i).into());
         }
 
-        let report = reg.nack_reports().map(Vec::from_iter).expect("some report");
+        let report = reg
+            .nack_reports(Instant::now())
+            .map(Vec::from_iter)
+            .expect("some report");
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].reports.len(), 2);
         assert_eq!(report[0].reports[0].pid, 102);
@@ -414,7 +503,10 @@ mod test {
             reg.update((*i).into());
         }
 
-        let report = reg.nack_reports().map(Vec::from_iter).expect("some report");
+        let report = reg
+            .nack_reports(Instant::now())
+            .map(Vec::from_iter)
+            .expect("some report");
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].reports.len(), 1);
         assert_eq!(report[0].reports[0].pid, 102);
@@ -435,7 +527,7 @@ mod test {
             reg.update((*i).into());
         }
 
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
     }
 
     #[test]
@@ -446,7 +538,7 @@ mod test {
         ] {
             reg.update((*i).into());
         }
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
         let active = reg.active.clone().expect("nack range");
         assert_eq!(*active.start, 105);
 
@@ -455,13 +547,13 @@ mod test {
         ] {
             reg.update((*i).into());
         }
-        assert!(reg.nack_reports().is_some());
+        assert!(reg.nack_reports(Instant::now()).is_some());
         let active = reg.active.clone().expect("nack range");
         assert_eq!(*active.start, 107);
 
         reg.update(107.into()); // Got 107 via RTX
 
-        let nacks = reg.nack_reports().map(Vec::from_iter);
+        let nacks = reg.nack_reports(Instant::now()).map(Vec::from_iter);
         assert!(
             nacks.is_none(),
             "Expected no NACKs to be generated after repairing the stream, got {nacks:?}"
@@ -514,10 +606,77 @@ mod test {
         reg.update(3000.into());
         reg.update(3001.into());
 
-        let reports = reg.nack_reports().map(Vec::from_iter).expect("some report");
+        let reports = reg
+            .nack_reports(Instant::now())
+            .map(Vec::from_iter)
+            .expect("some report");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reports[0].pid, 2999);
         assert_eq!(reports[0].reports[0].blp, 4);
+    }
+
+    #[test]
+    fn unrecoverable_is_reported_when_packet_leaves_window() {
+        let mut reg = NackRegister::new(None);
+
+        reg.update(10.into());
+        reg.update((10 + MAX_MISORDER).into());
+        reg.update((12 + MAX_MISORDER).into());
+
+        let lost = reg.take_unrecoverable();
+        assert_eq!(lost, vec![11.into()]);
+        assert!(reg.take_unrecoverable().is_empty());
+    }
+
+    #[test]
+    fn unrecoverable_is_reported_after_last_nack_plus_4x_rtt() {
+        let mut reg = NackRegister::new(None);
+        let base = Instant::now();
+
+        reg.update(100.into());
+        reg.update(102.into()); // 101 is missing
+
+        for i in 0..MAX_NACKS {
+            let now = base + Duration::from_millis(i as u64 * 33);
+            let _ = reg.nack_reports(now).map(Vec::from_iter).expect("some report");
+        }
+
+        let last_nack = base + Duration::from_millis((MAX_NACKS as u64 - 1) * 33);
+
+        // Before timeout, nothing should be reported.
+        let rtt = Duration::from_millis(100);
+        let timeout = rtt.checked_mul(RTT_FACTOR).unwrap();
+
+        reg.mark_unrecoverable_timeout(last_nack + timeout - Duration::from_millis(1), rtt);
+        assert!(reg.take_unrecoverable().is_empty());
+
+        // At RTT_FACTOR * RTT, the packet becomes unrecoverable even before window eviction.
+        reg.mark_unrecoverable_timeout(last_nack + timeout, rtt);
+        assert_eq!(reg.take_unrecoverable(), vec![101.into()]);
+    }
+
+    #[test]
+    fn late_packet_is_dropped_after_timeout_unrecoverable() {
+        let mut reg = NackRegister::new(None);
+        let base = Instant::now();
+
+        reg.update(100.into());
+        reg.update(102.into()); // 101 is missing
+
+        for i in 0..MAX_NACKS {
+            let now = base + Duration::from_millis(i as u64 * 33);
+            let _ = reg.nack_reports(now).map(Vec::from_iter).expect("some report");
+        }
+
+        let last_nack = base + Duration::from_millis((MAX_NACKS as u64 - 1) * 33);
+        let rtt = Duration::from_millis(100);
+        let timeout = rtt.checked_mul(RTT_FACTOR).unwrap();
+        reg.mark_unrecoverable_timeout(last_nack + timeout, rtt);
+        assert_eq!(reg.take_unrecoverable(), vec![101.into()]);
+
+        // Even though 101 is still within the active window, it must now be dropped.
+        assert!(!reg.accepts(101.into()));
+        assert!(!reg.update(101.into()));
     }
 
     #[test]
@@ -540,7 +699,10 @@ mod test {
         reg.update(5996.into());
         reg.update(5997.into());
 
-        let reports = reg.nack_reports().map(Vec::from_iter).expect("some report");
+        let reports = reg
+            .nack_reports(Instant::now())
+            .map(Vec::from_iter)
+            .expect("some report");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reports[0].pid, 5995);
     }
@@ -560,7 +722,10 @@ mod test {
                 reg.update((*i).into());
             }
 
-            let reports = reg.nack_reports().map(Vec::from_iter).expect("some report");
+            let reports = reg
+                .nack_reports(Instant::now())
+                .map(Vec::from_iter)
+                .expect("some report");
             let pid = reports[0].reports[0].pid;
             assert_eq!(pid, *expected);
         }
@@ -573,7 +738,7 @@ mod test {
             reg.update(i.into());
         }
 
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
         let active = reg.active.clone().expect("nack range");
         assert_eq!(*active.start, 3003);
 
@@ -581,7 +746,7 @@ mod test {
             reg.update(i.into());
         }
 
-        let report = reg.nack_reports().map(Vec::from_iter);
+        let report = reg.nack_reports(Instant::now()).map(Vec::from_iter);
         assert!(report.is_none(), "Expected empty NACKs got {:?}", report);
         let active = reg.active.clone().expect("nack range");
         assert_eq!(*active.start, 3008);
@@ -593,7 +758,7 @@ mod test {
         for i in 65500..=65534 {
             reg.update(i.into());
         }
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
         let active = reg.active.clone().expect("nack range");
         assert_eq!(*active.start, 65534);
 
@@ -601,7 +766,7 @@ mod test {
             reg.update(i.into());
         }
 
-        assert!(reg.nack_reports().is_some());
+        assert!(reg.nack_reports(Instant::now()).is_some());
         let active = reg.active.clone().expect("nack range");
         assert_eq!(*active.start, 65535);
 
@@ -611,7 +776,7 @@ mod test {
 
         reg.update(65535.into());
 
-        assert!(reg.nack_reports().is_none());
+        assert!(reg.nack_reports(Instant::now()).is_none());
         let active = reg.active.clone().expect("nack range");
         assert_eq!(*active.start, 65666);
     }
@@ -629,7 +794,7 @@ mod test {
         }
 
         let reports: Vec<_> = reg
-            .nack_reports()
+            .nack_reports(Instant::now())
             .expect("should generate reports")
             .flat_map(|nack| nack.reports)
             .collect();
