@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use str0m::format::Codec;
 use str0m::media::MediaKind;
-use str0m::rtp::{ExtensionValues, RtpWrite, Ssrc};
+use str0m::rtp::{ExtensionValues, RtpPacketReceived, RtpWrite, Ssrc};
 use str0m::{Event, RtcError};
 
 mod common;
@@ -89,7 +89,7 @@ pub fn rtp_direct_mid_rid() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(v)
             } else {
                 None

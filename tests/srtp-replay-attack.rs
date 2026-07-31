@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use str0m::format::Codec;
 use str0m::media::MediaKind;
 use str0m::net::Receive;
-use str0m::rtp::{ExtensionValues, RawPacket, RtpWrite, SeqNo, Ssrc};
+use str0m::rtp::{ExtensionValues, RawPacket, RtpPacketReceived, RtpWrite, SeqNo, Ssrc};
 use str0m::{Event, Input, Output, Rtc, RtcError};
 
 mod common;
@@ -85,7 +85,7 @@ pub fn srtp_replay_attack_rtp_mode() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(v)
             } else {
                 None

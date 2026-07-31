@@ -5,7 +5,9 @@ use netem::{NetemConfig, Probability, RandomLoss};
 use str0m::format::Codec;
 use str0m::media::MediaKind;
 use str0m::media::Pt;
-use str0m::rtp::{ExtensionValues, RawPacket, RtpWrite, Ssrc, Vp8Descriptor, Vp8Patch};
+use str0m::rtp::{
+    ExtensionValues, RawPacket, RtpPacketReceived, RtpWrite, Ssrc, Vp8Descriptor, Vp8Patch,
+};
 use str0m::{Event, RtcError};
 
 mod common;
@@ -93,7 +95,7 @@ pub fn rtp_direct_ssrc() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(v)
             } else {
                 None
@@ -187,7 +189,7 @@ pub fn rtp_direct_vp8_patch() -> Result<(), RtcError> {
         let has_two_media_packets = r
             .events
             .iter()
-            .filter(|(_, e)| matches!(e, Event::RtpPacket(_)))
+            .filter(|(_, e)| matches!(e, Event::RtpPacketReceived(_)))
             .take(2)
             .count()
             == 2;
@@ -201,7 +203,7 @@ pub fn rtp_direct_vp8_patch() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(v)
             } else {
                 None
@@ -310,9 +312,9 @@ pub fn rtp_direct_vp8_patch_survives_rtx() -> Result<(), RtcError> {
     assert_eq!(rtx_payload.get(2..), Some(VP8_REWRITTEN_PAYLOAD.as_slice()));
 
     let recovered_packet = r.events.iter().find_map(|(_, event)| match event {
-        Event::RtpPacket(packet) if packet.header.sequence_number == rewritten_seq as u16 => {
-            Some(packet)
-        }
+        Event::RtpPacketReceived(RtpPacketReceived {
+            rtp_packet: packet, ..
+        }) if packet.header.sequence_number == rewritten_seq as u16 => Some(packet),
         _ => None,
     });
 

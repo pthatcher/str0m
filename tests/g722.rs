@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use str0m::format::Codec;
 use str0m::media::{Direction, Frequency, MediaKind, MediaTime};
-use str0m::rtp::{RtpWrite, Ssrc};
+use str0m::rtp::{RtpPacketReceived, RtpWrite, Ssrc};
 use str0m::{Event, Rtc, RtcError};
 
 mod common;
@@ -194,7 +194,7 @@ pub fn g722_rtp_mode_is_8khz_both_ways() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| match e {
-            Event::RtpPacket(v) => Some(v),
+            Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) => Some(v),
             _ => None,
         })
         .collect();
@@ -285,7 +285,7 @@ pub fn g722_sample_send_to_rtp_receive() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| match e {
-            Event::RtpPacket(v) => Some(v),
+            Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) => Some(v),
             _ => None,
         })
         .collect();

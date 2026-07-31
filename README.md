@@ -442,7 +442,7 @@ let rtc = Rtc::builder()
 
 RTP mode gives us some new API points.
 
-1. [`Event::RtpPacket`][rtppak] emitted for every incoming RTP packet. Empty packets for bandwidth
+1. [`Event::RtpPacketReceived`][rtppak] emitted for every incoming RTP packet. Empty packets for bandwidth
    estimation are silently discarded.
 2. [`StreamTx::write_rtp`][wrtrtp] to write outgoing RTP packets.
 3. [`StreamRx::request_keyframe`][reqkey2] to request keyframes from remote.
@@ -639,7 +639,7 @@ Yes use the direct API!
 [evmed]:      https://docs.rs/str0m/*/str0m/enum.Event.html#variant.MediaData
 [writer]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.write
 [reqkey]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.request_keyframe
-[rtppak]:     https://docs.rs/str0m/*/str0m/enum.Event.html#variant.RtpPacket
+[rtppak]:     https://docs.rs/str0m/*/str0m/enum.Event.html#variant.RtpPacketReceived
 [wrtrtp]:     https://docs.rs/str0m/*/str0m/rtp/struct.StreamTx.html#method.write_rtp
 [reqkey2]:    https://docs.rs/str0m/*/str0m/rtp/struct.StreamRx.html#method.request_keyframe
 [bitwhip]:    https://github.com/bitwhip/bitwhip

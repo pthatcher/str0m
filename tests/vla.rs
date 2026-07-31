@@ -4,7 +4,7 @@ use str0m::media::{MediaKind, MediaTime};
 use str0m::rtp::vla::{ResolutionAndFramerate, Serializer as VlaSerializer};
 use str0m::rtp::vla::{SimulcastStreamAllocation, SpatialLayerAllocation};
 use str0m::rtp::vla::{TemporalLayerAllocation, URI as VLA_URI, VideoLayersAllocation};
-use str0m::rtp::{Extension, ExtensionValues, RtpWrite, Ssrc};
+use str0m::rtp::{Extension, ExtensionValues, RtpPacketReceived, RtpWrite, Ssrc};
 use str0m::{Event, Rtc, RtcError};
 
 mod common;
@@ -76,7 +76,10 @@ pub fn vla_rtp_mode() -> Result<(), RtcError> {
         progress(&mut l, &mut r)?;
 
         for (_, event) in &r.events {
-            if let Event::RtpPacket(packet) = event {
+            if let Event::RtpPacketReceived(RtpPacketReceived {
+                rtp_packet: packet, ..
+            }) = event
+            {
                 if let Some(v) = packet
                     .header
                     .ext_vals

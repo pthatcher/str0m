@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use str0m::format::Codec;
 use str0m::media::{Frequency, MediaKind, MediaTime};
-use str0m::rtp::{ExtensionValues, RtpWrite, Ssrc};
+use str0m::rtp::{ExtensionValues, RtpPacketReceived, RtpWrite, Ssrc};
 use str0m::{Event, RtcError};
 use tracing::info;
 
@@ -217,7 +217,7 @@ pub fn change_ssrc_reset_receive() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(v)
             } else {
                 None

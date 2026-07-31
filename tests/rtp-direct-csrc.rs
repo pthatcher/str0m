@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use str0m::format::Codec;
 use str0m::media::{MediaKind, Pt};
-use str0m::rtp::{ExtensionValues, RtpWrite, Ssrc, Vp8Descriptor};
+use str0m::rtp::{ExtensionValues, RtpPacketReceived, RtpWrite, Ssrc, Vp8Descriptor};
 use str0m::{Event, RtcError};
 
 mod common;
@@ -78,7 +78,7 @@ pub fn rtp_direct_csrc_basic() -> Result<(), RtcError> {
         let has_media_packet = r
             .events
             .iter()
-            .any(|(_, e)| matches!(e, Event::RtpPacket(_)));
+            .any(|(_, e)| matches!(e, Event::RtpPacketReceived(_)));
 
         if has_media_packet || l.duration() > Duration::from_secs(10) {
             break;
@@ -89,7 +89,7 @@ pub fn rtp_direct_csrc_basic() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(v)
             } else {
                 None
@@ -155,7 +155,7 @@ pub fn rtp_direct_csrc_max_entries() -> Result<(), RtcError> {
         let has_media_packet = r
             .events
             .iter()
-            .any(|(_, e)| matches!(e, Event::RtpPacket(_)));
+            .any(|(_, e)| matches!(e, Event::RtpPacketReceived(_)));
 
         if has_media_packet || l.duration() > Duration::from_secs(10) {
             break;
@@ -166,7 +166,7 @@ pub fn rtp_direct_csrc_max_entries() -> Result<(), RtcError> {
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(v)
             } else {
                 None
@@ -243,7 +243,7 @@ pub fn rtp_direct_csrc_with_vp8_patch() -> Result<(), RtcError> {
         let has_media_packet = r
             .events
             .iter()
-            .any(|(_, e)| matches!(e, Event::RtpPacket(_)));
+            .any(|(_, e)| matches!(e, Event::RtpPacketReceived(_)));
 
         if has_media_packet || l.duration() > Duration::from_secs(10) {
             break;
@@ -251,7 +251,7 @@ pub fn rtp_direct_csrc_with_vp8_patch() -> Result<(), RtcError> {
     }
 
     let mut media = r.events.iter().filter_map(|(_, e)| {
-        if let Event::RtpPacket(v) = e {
+        if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
             Some(v)
         } else {
             None

@@ -15,7 +15,7 @@ mod pii_log_redaction {
 
     use str0m::format::Codec;
     use str0m::media::MediaKind;
-    use str0m::rtp::{ExtensionValues, RtpWrite, Ssrc};
+    use str0m::rtp::{ExtensionValues, RtpPacketReceived, RtpWrite, Ssrc};
     use str0m::{Event, RtcError};
 
     use super::*;
@@ -147,7 +147,7 @@ mod pii_log_redaction {
             .events
             .iter()
             .filter_map(|(_, e)| {
-                if let Event::RtpPacket(v) = e {
+                if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                     Some(v)
                 } else {
                     None

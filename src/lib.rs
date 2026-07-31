@@ -456,7 +456,7 @@
 //!
 //! RTP mode gives us some new API points.
 //!
-//! 1. [`Event::RtpPacket`][rtppak] emitted for every incoming RTP packet. Empty packets for bandwidth
+//! 1. [`Event::RtpPacketReceived`][rtppak] emitted for every incoming RTP packet. Empty packets for bandwidth
 //!    estimation are silently discarded.
 //! 2. [`StreamTx::write_rtp`][wrtrtp] to write outgoing RTP packets.
 //! 3. [`StreamRx::request_keyframe`][reqkey2] to request keyframes from remote.
@@ -653,7 +653,7 @@
 //! [evmed]:      https://docs.rs/str0m/*/str0m/enum.Event.html#variant.MediaData
 //! [writer]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.write
 //! [reqkey]:     https://docs.rs/str0m/*/str0m/media/struct.Writer.html#method.request_keyframe
-//! [rtppak]:     https://docs.rs/str0m/*/str0m/enum.Event.html#variant.RtpPacket
+//! [rtppak]:     https://docs.rs/str0m/*/str0m/enum.Event.html#variant.RtpPacketReceived
 //! [wrtrtp]:     https://docs.rs/str0m/*/str0m/rtp/struct.StreamTx.html#method.write_rtp
 //! [reqkey2]:    https://docs.rs/str0m/*/str0m/rtp/struct.StreamRx.html#method.request_keyframe
 //! [bitwhip]:    https://github.com/bitwhip/bitwhip
@@ -683,7 +683,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use str0m_proto::Pii;
-use streams::RtpPacket;
+use streams::RtpPacketReceived;
 use streams::StreamPaused;
 use util::InstantExt;
 
@@ -787,7 +787,7 @@ pub mod rtp {
     };
     pub use crate::rtp_::{RtpHeader, SeqNo, Ssrc, VideoOrientation};
     pub use crate::streams::{
-        RtpPacket, RtpWrite, StreamPaused, StreamRx, StreamTx, StreamTxQueueInfo,
+        RtpPacket, RtpPacketReceived, RtpWrite, StreamPaused, StreamRx, StreamTx, StreamTxQueueInfo,
     };
 
     /// Debug output of the unencrypted RTP and RTCP packets.
@@ -1028,7 +1028,7 @@ pub enum Event {
     SenderFeedback(SenderFeedback),
 
     /// Incoming RTP data.
-    RtpPacket(RtpPacket),
+    RtpPacketReceived(RtpPacketReceived),
 
     /// Incoming application-specific Payload-Specific Feedback (PSFB FMT=15, PT=206).
     ///
@@ -1552,7 +1552,7 @@ impl Rtc {
             Output::Event(e) => match e {
                 Event::ChannelData(_)
                 | Event::MediaData(_)
-                | Event::RtpPacket(_)
+                | Event::RtpPacketReceived(_)
                 | Event::SenderFeedback(_)
                 | Event::MediaEgressStats(_)
                 | Event::MediaIngressStats(_)

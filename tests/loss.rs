@@ -11,7 +11,7 @@ use common::{connect_l_r, init_crypto_default, progress, vp8_data};
 use netem::{GilbertElliot, LossModel, NetemConfig};
 use str0m::format::Codec;
 use str0m::media::MediaKind;
-use str0m::rtp::{RtpWrite, Ssrc};
+use str0m::rtp::{RtpPacketReceived, RtpWrite, Ssrc};
 use str0m::{Event, RtcError};
 
 use crate::common::init_log;
@@ -101,7 +101,7 @@ fn run_loss_test(loss_model: impl Into<LossModel>, seed: u64) -> Result<usize, R
         .events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::RtpPacket(v) = e {
+            if let Event::RtpPacketReceived(RtpPacketReceived { rtp_packet: v, .. }) = e {
                 Some(*v.seq_no)
             } else {
                 None

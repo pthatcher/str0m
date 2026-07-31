@@ -30,7 +30,7 @@ use crate::rtp_::{RtpHeader, SessionId, TwccPacketId, extend_u16};
 use crate::rtp_::{SrtpContext, Ssrc};
 use crate::rtp_::{TwccRecvRegister, TwccSendRegister};
 use crate::stats::StatsSnapshot;
-use crate::streams::{RtpPacket, Streams};
+use crate::streams::{RtpPacketReceived, Streams};
 use crate::util::{Soonest, already_happened, not_happening};
 use crate::{Reason, net};
 use crate::{RtcConfig, RtcError};
@@ -93,8 +93,8 @@ pub(crate) struct Session {
     // temporary buffer when getting the next (unencrypted) RTP packet from Media line.
     poll_packet_buf: Vec<u8>,
 
-    // Next packet for RtpPacket event.
-    pending_packet: Option<RtpPacket>,
+    // Next packet for RtpPacketReceived event.
+    pending_packet_received: Option<RtpPacketReceived>,
 
     // Whether we sent a single outgoing RTP packet.
     packet_first_sent: bool,
@@ -176,7 +176,7 @@ impl Session {
             pacer,
             pacer_control: PacerControl::new(),
             poll_packet_buf: vec![0; 2000],
-            pending_packet: None,
+            pending_packet_received: None,
             packet_first_sent: false,
             media_bytes_rx: 0,
             media_bytes_tx: 0,
@@ -624,7 +624,11 @@ impl Session {
             // However only if this is a packet not seen before. This filters out spurious
             // resends for padding.
             if receipt.is_new_packet {
-                self.pending_packet = Some(packet);
+                self.pending_packet_received = Some(RtpPacketReceived {
+                    mid: stream.mid(),
+                    rid: stream.rid(),
+                    rtp_packet: packet,
+                });
             }
         } else {
             // In non-RTP mode, we let the Media use a Depayloader.
@@ -743,8 +747,8 @@ impl Session {
         }
 
         if self.rtp_mode {
-            if let Some(packet) = self.pending_packet.take() {
-                return Some(Event::RtpPacket(packet));
+            if let Some(packet) = self.pending_packet_received.take() {
+                return Some(Event::RtpPacketReceived(packet));
             }
         }
 
