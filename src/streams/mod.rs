@@ -179,6 +179,38 @@ pub(crate) struct Streams {
     /// Threshold above which an outgoing RTP packet triggers an MTU warning. Used as a
     /// hard cap when selecting RTX cache entries for spurious padding.
     mtu_warn: usize,
+
+    /// `None` means dirty, and the next read recomputes it. See [`Streams::invalidate`].
+    cached_deadlines: Option<CachedDeadlines>,
+
+    /// Whether caching is enabled at all. See [`RtcConfig::enable_stream_timeout_cache`].
+    ///
+    /// When `false`, `cached_deadlines` is never stored and `pending_events` is never
+    /// cleared, so every input does the full sweep and every poll does the full scan.
+    cache_enabled: bool,
+
+    // %%% invert this to "definitely has no events to poll"
+    /// Whether any stream might have an event to poll.
+    ///
+    /// Conservative: `true` means "maybe", `false` means "definitely not".
+    pending_events: bool,
+}
+
+/// Deadlines aggregated over all streams.
+///
+/// Recomputed by a full sweep, and invalidated whenever a `&mut` reference to a stream
+/// escapes `Streams`, since that can move a deadline closer.
+#[derive(Debug, Clone, Copy)]
+struct CachedDeadlines {
+    // %%% store SR and RR separately
+    /// Earliest RR/SR deadline over all streams.
+    feedback: Option<Instant>,
+
+    /// Set when some send stream needs `handle_timeout` to timestamp queued packets.
+    send_stream: Option<Instant>,
+
+    /// Earliest instant at which [`Streams::handle_timeout`] has any work to do.
+    any_at: Instant,
 }
 
 /// Delay between cleaning up the RxLookup.
@@ -195,7 +227,7 @@ struct RxLookup {
 }
 
 impl Streams {
-    pub(crate) fn new(enable_stats: bool, mtu_warn: usize) -> Self {
+    pub(crate) fn new(enable_stats: bool, mtu_warn: usize, cache_enabled: bool) -> Self {
         Self {
             streams_rx: Default::default(),
             rx_lookup: Default::default(),
@@ -206,7 +238,88 @@ impl Streams {
             any_nack_active: None,
             enable_stats,
             mtu_warn,
+            cached_deadlines: None,
+            cache_enabled,
+            // Without caching we can never conclude there are no events to poll.
+            pending_events: !cache_enabled,
         }
+    }
+
+    /// Called whenever a `&mut` reference to a stream escapes `Streams`, or the set of
+    /// streams changes, since either can move a deadline closer or produce an event.
+    fn invalidate_cache(&mut self) {
+        // %%% why not recalculat eargerly?
+        self.cached_deadlines = None;
+        self.pending_events = true;
+    }
+
+    // %%% why not return a &CachedDeadlines?
+    fn deadlines(&mut self) -> CachedDeadlines {
+        if let Some(cached_deadlines) = self.cached_deadlines {
+            return cached_deadlines;
+        }
+
+        let cached_deadlines = self.compute_deadlines();
+
+        if self.cache_enabled {
+            self.cached_deadlines = Some(cached_deadlines);
+        }
+
+        cached_deadlines
+    }
+
+    fn compute_deadlines(&self) -> CachedDeadlines {
+        let mut feedback_at = None;
+        let mut send_stream_at = None;
+        let mut any_at = self.rx_lookup_at();
+
+        // It seems like this could be done with an reduce or fold
+        for stream_rx in self.streams_rx.values() {
+            if !stream_rx.ssrc().is_probe() {
+                // Probe streams never produce receiver reports. See `need_rr`.
+                feedback_at = min_instant(feedback_at, stream_rx.receiver_report_at());
+            }
+            any_at = any_at.min(stream_rx.timeout_at());
+        }
+
+        for stream_tx in self.streams_tx.values() {
+            feedback_at = min_instant(feedback_at, stream_tx.sender_report_at());
+            if stream_tx.need_timeout() {
+                send_stream_at = Some(already_happened());
+            }
+            any_at = any_at.min(stream_tx.timeout_at());
+        }
+
+        CachedDeadlines {
+            feedback: feedback_at,
+            send_stream: send_stream_at,
+            any_at,
+        }
+    }
+
+    /// Fold the state of one receive stream back into the cached deadlines.
+    ///
+    /// The RTP receive path deliberately doesn't invalidate the cache, see
+    /// [`Streams::stream_rx_for_rtp`]. Receiving a packet can however schedule a pause
+    /// check sooner than anything cached, and flip the stream out of the paused state,
+    /// so fold that back in here. Only ever lowers a deadline.
+    pub(crate) fn fold_rx_stream_state(&mut self, timeout_at: Instant, has_pending_event: bool) {
+        self.pending_events |= has_pending_event;
+
+        let Some(t) = &mut self.cached_deadlines else {
+            return;
+        };
+
+        t.any_at = t.any_at.min(timeout_at);
+    }
+
+    /// Record that all stream events have been drained.
+    pub(crate) fn clear_pending_events(&mut self) {
+        if !self.cache_enabled {
+            return;
+        }
+
+        self.pending_events = false;
     }
 
     pub(crate) fn map_dynamic_by_rid(
@@ -330,6 +443,7 @@ impl Streams {
     ) -> &mut StreamRx {
         // New stream might have enabled nacks.
         self.any_nack_active = None;
+        self.invalidate_cache();
 
         let stream = self
             .streams_rx
@@ -344,6 +458,8 @@ impl Streams {
     }
 
     pub fn remove_stream_rx(&mut self, ssrc: Ssrc) -> bool {
+        self.invalidate_cache();
+
         let stream = self.streams_rx.remove(&ssrc);
         let existed = stream.is_some();
 
@@ -358,12 +474,16 @@ impl Streams {
         rtx: Option<Ssrc>,
         midrid: MidRid,
     ) -> &mut StreamTx {
+        self.invalidate_cache();
+
         self.streams_tx
             .entry(ssrc)
             .or_insert_with(|| StreamTx::new(ssrc, rtx, midrid, self.enable_stats, self.mtu_warn))
     }
 
     pub fn remove_stream_tx(&mut self, ssrc: Ssrc) -> bool {
+        self.invalidate_cache();
+
         self.streams_tx.remove(&ssrc).is_some()
     }
 
@@ -375,17 +495,45 @@ impl Streams {
     }
 
     pub(crate) fn reset_send_buffers(&mut self) {
+        self.invalidate_cache();
+
         for stream in self.streams_tx.values_mut() {
             stream.reset_buffers();
         }
     }
 
     pub fn stream_rx(&mut self, ssrc: &Ssrc) -> Option<&mut StreamRx> {
+        self.invalidate_cache();
         self.streams_rx.get_mut(ssrc)
     }
 
     pub fn stream_tx(&mut self, ssrc: &Ssrc) -> Option<&mut StreamTx> {
+        self.invalidate_cache();
         self.streams_tx.get_mut(ssrc)
+    }
+
+    /// Look up a receive stream for an incoming RTP packet.
+    ///
+    /// Deliberately does not invalidate the cached timeouts. Handling an incoming RTP
+    /// packet can only push this stream's deadlines further out, never closer.
+    pub(crate) fn stream_rx_for_rtp(&mut self, ssrc: &Ssrc) -> Option<&mut StreamRx> {
+        self.streams_rx.get_mut(ssrc)
+    }
+
+    /// Look up a send stream for the outgoing packet path.
+    ///
+    /// Deliberately does not invalidate the cached timeouts. Sending drains the stream
+    /// and samples queue state, neither of which moves a deadline closer.
+    pub(crate) fn stream_tx_for_send(&mut self, midrid: MidRid) -> Option<&mut StreamTx> {
+        self.streams_tx.values_mut().find(|s| s.is_midrid(midrid))
+    }
+
+    /// Iterate send streams to sample pacer queue state.
+    ///
+    /// Deliberately does not invalidate the cached timeouts. See
+    /// [`Streams::stream_tx_for_send`].
+    pub(crate) fn streams_tx_for_queue_state(&mut self) -> impl Iterator<Item = &mut StreamTx> {
+        self.streams_tx.values_mut()
     }
 
     /// Lookup the "main" SSRC and mid for a given SSRC(main or RTX).
@@ -421,22 +569,21 @@ impl Streams {
         None
     }
 
-    pub(crate) fn regular_feedback_at(&self) -> Option<Instant> {
-        let r = self.streams_rx.values().map(|s| s.receiver_report_at());
-        let s = self.streams_tx.values().map(|s| s.sender_report_at());
-        r.chain(s).min()
+    pub(crate) fn regular_feedback_at(&mut self) -> Option<Instant> {
+        self.deadlines().feedback
     }
 
     pub(crate) fn paused_at(&self) -> Option<Instant> {
-        self.streams_rx.values().find_map(|s| s.paused_at())
+        // Deliberately not cached. The minimum is owned by whichever stream received a
+        // packet least recently, and every incoming packet moves that stream's deadline
+        // out, which would leave a cached minimum stale and low. That is safe but makes
+        // `poll_timeout` report deadlines that have nothing to do, waking the app for
+        // no reason. Scanning is cheaper than the spurious wakeups.
+        self.streams_rx.values().filter_map(|s| s.paused_at()).min()
     }
 
-    pub(crate) fn send_stream(&self) -> Option<Instant> {
-        if self.streams_tx.values().any(|s| s.need_timeout()) {
-            Some(already_happened())
-        } else {
-            None
-        }
+    pub(crate) fn send_stream(&mut self) -> Option<Instant> {
+        self.deadlines().send_stream
     }
 
     pub(crate) fn is_receiving(&self) -> bool {
@@ -452,6 +599,16 @@ impl Streams {
         config: &CodecConfig,
         feedback: &mut VecDeque<Rtcp>,
     ) {
+        // The sweep below is O(streams) and runs for every input to the Rtc instance.
+        // Skip it entirely while we know no stream has anything to do.
+        if !do_nack {
+            if let Some(t) = self.cached_deadlines {
+                if now < t.any_at {
+                    return;
+                }
+            }
+        }
+
         self.mids_to_report.clear(); // Clear for checking StreamRx.
         for stream in self.streams_rx.values() {
             if stream.need_rr(now) {
@@ -503,9 +660,21 @@ impl Streams {
                 .retain(|_, l| now - l.last_used <= RX_LOOKUP_EXPIRY);
             self.last_rx_lookup_cleanup = now;
         }
+
+        // The sweep may have produced paused/unpaused transitions, and it just moved
+        // every deadline, so recompute from the state we now have.
+        self.cached_deadlines = None;
+        self.pending_events = true;
+        if self.cache_enabled {
+            self.deadlines();
+        }
     }
 
     pub(crate) fn poll_keyframe_request(&mut self) -> Option<KeyframeRequest> {
+        if !self.pending_events {
+            return None;
+        }
+
         self.streams_tx.values_mut().find_map(|s| {
             let kind = s.poll_keyframe_request()?;
             Some(KeyframeRequest {
@@ -517,6 +686,10 @@ impl Streams {
     }
 
     pub(crate) fn poll_sender_feedback(&mut self) -> Option<SenderFeedback> {
+        if !self.pending_events {
+            return None;
+        }
+
         self.streams_rx.values_mut().find_map(|s| {
             let (sender_info, at) = s.poll_sender_info()?;
 
@@ -530,12 +703,20 @@ impl Streams {
     }
 
     pub(crate) fn poll_remb_request(&mut self) -> Option<(Mid, Bitrate)> {
+        if !self.pending_events {
+            return None;
+        }
+
         self.streams_tx
             .values_mut()
             .find_map(|s| s.poll_remb_request().map(|b| (s.mid(), b)))
     }
 
     pub(crate) fn poll_stream_paused(&mut self) -> Option<StreamPaused> {
+        if !self.pending_events {
+            return None;
+        }
+
         self.streams_rx.values_mut().find_map(|s| s.poll_paused())
     }
 
@@ -548,10 +729,12 @@ impl Streams {
     }
 
     pub(crate) fn streams_rx(&mut self) -> impl Iterator<Item = &mut StreamRx> {
+        self.invalidate_cache();
         self.streams_rx.values_mut()
     }
 
     pub(crate) fn streams_tx(&mut self) -> impl Iterator<Item = &mut StreamTx> {
+        self.invalidate_cache();
         self.streams_tx.values_mut()
     }
 
@@ -623,6 +806,7 @@ impl Streams {
     }
 
     pub(crate) fn stream_tx_by_midrid(&mut self, midrid: MidRid) -> Option<&mut StreamTx> {
+        self.invalidate_cache();
         self.streams_tx.values_mut().find(|s| s.is_midrid(midrid))
     }
 
@@ -631,6 +815,8 @@ impl Streams {
         midrid: MidRid,
         reset_cached_nack_flag: bool,
     ) -> Option<&mut StreamRx> {
+        self.invalidate_cache();
+
         if reset_cached_nack_flag {
             // Invalidate nack_active since it's possible to manipulate the
             // nack setting on the returned StreamRx.
@@ -641,6 +827,8 @@ impl Streams {
     }
 
     pub(crate) fn remove_streams_by_mid(&mut self, mid: Mid) {
+        self.invalidate_cache();
+
         self.streams_tx.retain(|_, s| s.mid() != mid);
         self.streams_rx.retain(|_, s| s.mid() != mid);
         self.rx_lookup.retain(|_, v| v.mid != mid);
@@ -648,11 +836,13 @@ impl Streams {
 
     /// An iterator over all the tx streams for a given mid.
     pub(crate) fn streams_tx_by_mid(&mut self, mid: Mid) -> impl Iterator<Item = &mut StreamTx> {
+        self.invalidate_cache();
         self.streams_tx.values_mut().filter(move |s| s.mid() == mid)
     }
 
     /// An iterator over all the rx streams for a given mid.
     pub(crate) fn streams_rx_by_mid(&mut self, mid: Mid) -> impl Iterator<Item = &mut StreamRx> {
+        self.invalidate_cache();
         self.streams_rx.values_mut().filter(move |s| s.mid() == mid)
     }
 
@@ -673,6 +863,8 @@ impl Streams {
     }
 
     pub(crate) fn change_stream_rx_ssrc(&mut self, ssrc_from: Ssrc, ssrc_to: Ssrc) -> bool {
+        self.invalidate_cache();
+
         // This unwrap is OK, because we can't call change_stream_rx_ssrc without first
         // knowing there is such a StreamRx.
         let maybe_change = self.streams_rx.get_mut(&ssrc_from).unwrap();
@@ -698,6 +890,8 @@ impl Streams {
     }
 
     fn change_stream_rx_rtx(&mut self, rtx_from: Ssrc, rtx_to: Ssrc) {
+        self.invalidate_cache();
+
         // Invalidate since we might need to enable nacks now.
         self.any_nack_active = None;
 
@@ -731,6 +925,13 @@ impl Streams {
 
     fn rx_lookup_at(&self) -> Instant {
         self.last_rx_lookup_cleanup + RX_LOOKUP_CLEANUP_INTERVAL
+    }
+}
+
+fn min_instant(current: Option<Instant>, next: Instant) -> Option<Instant> {
+    match current {
+        Some(v) if v <= next => Some(v),
+        _ => Some(next),
     }
 }
 

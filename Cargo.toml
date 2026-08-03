@@ -24,17 +24,7 @@ rust-version = "1.85.0"
 # security patching than updating statically linked software.
 
 [workspace]
-members = [
-  "crates/proto",
-  "crates/is",
-  "crates/netem",
-  "crates/_str0m_test",
-  "crypto/aws-lc-rs",
-  "crypto/rust-crypto",
-  "crypto/openssl",
-  "crypto/apple-crypto",
-  "crypto/wincrypto"
-]
+members = ["crates/proto", "crates/is", "crates/netem", "crates/_str0m_test", "crypto/aws-lc-rs", "crypto/rust-crypto", "crypto/openssl", "crypto/apple-crypto", "crypto/wincrypto"]
 exclude = ["crates/fuzz"]
 
 [workspace.dependencies]
@@ -182,3 +172,7 @@ required-features = ["examples"]
 [[example]]
 name = "http-post"
 required-features = ["examples"]
+
+[[bench]]
+name = "stream_timeout_cache"
+harness = false

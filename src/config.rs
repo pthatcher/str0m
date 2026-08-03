@@ -52,6 +52,7 @@ pub struct RtcConfig {
     pub(crate) dtls_version: DtlsVersion,
     pub(crate) vp9_packetizer_mode: Vp9PacketizerMode,
     pub(crate) snap_enabled: bool,
+    pub(crate) stream_timeout_cache: bool,
     pub(crate) mtu: RangeInclusive<usize>,
 }
 
@@ -595,6 +596,55 @@ impl RtcConfig {
         self
     }
 
+    /// Enable caching of the aggregated stream timeouts.
+    ///
+    /// Without this, every input to the [`Rtc`] instance sweeps all send and receive
+    /// streams to find the ones that need feedback, pause checks or send queue
+    /// timestamping, and every [`Rtc::poll_output()`][crate::Rtc::poll_output] sweeps
+    /// them again to find pending events. That work is `O(streams)` per packet.
+    ///
+    /// When enabled, str0m caches the earliest instant at which any stream needs
+    /// handling, and skips those sweeps entirely while there is nothing to do. The
+    /// cache is discarded whenever something happens that could move a deadline
+    /// closer, so behavior is unchanged - only the amount of work differs.
+    ///
+    /// This mainly pays off for instances with many streams, such as an SFU
+    /// receiving lots of simulcast layers.
+    ///
+    /// To see what it is worth for a given workload, run the benchmark that compares
+    /// both settings on a simulated SFU connection:
+    ///
+    /// ```text
+    /// taskset -c 3 cargo bench --bench stream_timeout_cache
+    /// ```
+    ///
+    /// Default: `false`
+    ///
+    /// ```
+    /// # use std::time::Instant;
+    /// # use str0m::Rtc;
+    /// let rtc = Rtc::builder()
+    ///     .enable_stream_timeout_cache(true)
+    ///     .build(Instant::now());
+    /// ```
+    pub fn enable_stream_timeout_cache(mut self, enabled: bool) -> Self {
+        self.stream_timeout_cache = enabled;
+        self
+    }
+
+    /// Checks if the stream timeout cache is enabled.
+    ///
+    /// ```
+    /// # use str0m::Rtc;
+    /// let config = Rtc::builder();
+    ///
+    /// // Defaults to false.
+    /// assert_eq!(config.stream_timeout_cache(), false);
+    /// ```
+    pub fn stream_timeout_cache(&self) -> bool {
+        self.stream_timeout_cache
+    }
+
     /// Set which DTLS version to use.
     ///
     /// Defaults to [`DtlsVersion::Dtls12`].
@@ -713,6 +763,7 @@ impl Default for RtcConfig {
             dtls_version: DtlsVersion::Dtls12,
             vp9_packetizer_mode: Vp9PacketizerMode::default(),
             snap_enabled: false,
+            stream_timeout_cache: false,
             mtu: DATAGRAM_MTU_TARGET..=DATAGRAM_MTU_WARN,
         }
     }

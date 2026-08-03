@@ -83,11 +83,13 @@ pub struct TestRtc {
 impl TestRtc {
     pub fn new(peer: Peer) -> Self {
         let now = Instant::now();
-        let rtc = if let Some(crypto) = peer.crypto_provider() {
-            Rtc::builder().set_crypto_provider(crypto).build(now)
+        let builder = Rtc::builder();
+        let builder = if let Some(crypto) = peer.crypto_provider() {
+            builder.set_crypto_provider(crypto)
         } else {
-            Rtc::new(now)
+            builder
         };
+        let rtc = apply_env_config(builder).build(now);
 
         Self::new_with_rtc(peer.span(), rtc)
     }
@@ -102,7 +104,7 @@ impl TestRtc {
         } else {
             builder
         };
-        let rtc = f(builder).build(now);
+        let rtc = apply_env_config(f(builder)).build(now);
         Self::new_with_rtc(peer.span(), rtc)
     }
 
@@ -509,6 +511,19 @@ fn get_crypto_provider_by_name(name: &str) -> CryptoProvider {
     }
 }
 
+/// Applies settings that are toggled per test run via environment variables.
+///
+/// `STREAM_TIMEOUT_CACHE=1` runs the suite with
+/// [`RtcConfig::enable_stream_timeout_cache`] on, so both the cached and uncached
+/// paths get covered.
+pub fn apply_env_config(builder: RtcConfig) -> RtcConfig {
+    let enabled = std::env::var("STREAM_TIMEOUT_CACHE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+
+    builder.enable_stream_timeout_cache(enabled)
+}
+
 pub fn connect_l_r() -> (TestRtc, TestRtc) {
     let mut rtc1_builder = Rtc::builder().set_rtp_mode(true).enable_raw_packets(true);
 
@@ -521,6 +536,9 @@ pub fn connect_l_r() -> (TestRtc, TestRtc) {
     if let Some(crypto) = Peer::Right.crypto_provider() {
         rtc2_builder = rtc2_builder.set_crypto_provider(crypto);
     }
+
+    let rtc1_builder = apply_env_config(rtc1_builder);
+    let rtc2_builder = apply_env_config(rtc2_builder);
 
     let now = Instant::now();
     connect_l_r_with_rtc(rtc1_builder.build(now), rtc2_builder.build(now))

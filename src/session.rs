@@ -150,7 +150,7 @@ impl Session {
         Session {
             id,
             medias: vec![],
-            streams: Streams::new(enable_stats, *config.mtu.end()),
+            streams: Streams::new(enable_stats, *config.mtu.end(), config.stream_timeout_cache),
             app: None,
             reordering_size_audio: config.reordering_size_audio,
             reordering_size_video: config.reordering_size_video,
@@ -309,7 +309,10 @@ impl Session {
     }
 
     fn update_queue_state(&mut self, now: Instant) {
-        let iter = self.streams.streams_tx().map(|m| m.queue_state(now));
+        let iter = self
+            .streams
+            .streams_tx_for_queue_state()
+            .map(|m| m.queue_state(now));
 
         let Some(padding_request) = self.pacer.handle_timeout(now, iter) else {
             return;
@@ -317,7 +320,7 @@ impl Session {
 
         let stream = self
             .streams
-            .stream_tx_by_midrid(padding_request.midrid)
+            .stream_tx_for_send(padding_request.midrid)
             .expect("pacer to use an existing stream");
 
         stream.generate_padding(padding_request.padding);
@@ -485,7 +488,7 @@ impl Session {
 
         // mid_and_ssrc_for_header guarantees stream exists.
         // Media may not exist for internal probe streams (SSRC 0).
-        let stream = self.streams.stream_rx(&ssrc).unwrap();
+        let stream = self.streams.stream_rx_for_rtp(&ssrc).unwrap();
 
         let maybe_params = if ssrc.is_probe() {
             self.probe_payload_params.as_ref()
@@ -618,6 +621,15 @@ impl Session {
         let payload: Arc<[u8]> = Arc::from(data);
 
         let packet = stream.handle_rtp(now, header, payload, seq_no, receipt.time);
+        let stream_mid = stream.mid();
+        let stream_rid = stream.rid();
+        let stream_timeout_at = stream.timeout_at();
+        let stream_has_event = stream.has_pending_event();
+
+        // The receive path doesn't invalidate the cached stream state, so fold the
+        // (possibly sooner) deadline and any unpaused event back in explicitly.
+        self.streams
+            .fold_rx_stream_state(stream_timeout_at, stream_has_event);
 
         if self.rtp_mode {
             // In RTP mode, we store the packet temporarily here for the next poll_output().
@@ -625,8 +637,8 @@ impl Session {
             // resends for padding.
             if receipt.is_new_packet {
                 self.pending_packet_received = Some(RtpPacketReceived {
-                    mid: stream.mid(),
-                    rid: stream.rid(),
+                    mid: stream_mid,
+                    rid: stream_rid,
                     rtp_packet: packet,
                 });
             }
@@ -635,7 +647,7 @@ impl Session {
             // unwrap is fine because mid_and_ssrc_for_header guarantees it.
             let media = self.medias.iter_mut().find(|m| m.mid() == mid).unwrap();
             media.depayload(
-                stream.rid(),
+                stream_rid,
                 packet,
                 self.reordering_size_audio,
                 self.reordering_size_video,
@@ -763,6 +775,10 @@ impl Session {
         if let Some((mid, bitrate)) = self.streams.poll_remb_request() {
             return Some(Event::EgressBitrateEstimate(BweKind::Remb(mid, bitrate)));
         }
+
+        // All stream events are drained. Subsequent polls can skip the scans until
+        // something happens that might produce a new event.
+        self.streams.clear_pending_events();
 
         for media in &mut self.medias {
             if media.need_open_event {
@@ -909,7 +925,7 @@ impl Session {
         let buf = &mut self.poll_packet_buf;
         let twcc_seq = self.twcc;
 
-        let stream = self.streams.stream_tx_by_midrid(midrid)?;
+        let stream = self.streams.stream_tx_for_send(midrid)?;
 
         let params = &self.codec_config;
         let exts = media.remote_extmap();
@@ -1010,7 +1026,7 @@ impl Session {
         self.medias.iter().any(|m| m.mid() == mid)
     }
 
-    fn regular_feedback_at(&self) -> Option<Instant> {
+    fn regular_feedback_at(&mut self) -> Option<Instant> {
         self.streams.regular_feedback_at()
     }
 

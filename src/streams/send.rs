@@ -903,6 +903,24 @@ impl StreamTx {
         self.last_sender_report + rr_interval(kind.is_audio())
     }
 
+    /// Earliest instant at which this stream has `handle_timeout` work to do.
+    ///
+    /// Used by [`Streams`][super::Streams] to skip the sweep over all streams. Must never
+    /// be later than the point in time this stream actually needs handling.
+    pub(crate) fn timeout_at(&self) -> Instant {
+        // The first handle_timeout initializes `kind`, `cname` and `pt_for_padding`.
+        if self.kind.is_none() {
+            return already_happened();
+        }
+
+        // Newly queued packets are timestamped by handle_timeout.
+        if self.need_timeout() {
+            return already_happened();
+        }
+
+        self.sender_report_at()
+    }
+
     pub(crate) fn poll_keyframe_request(&mut self) -> Option<KeyframeRequestKind> {
         self.pending_request_keyframe.take()
     }

@@ -12,7 +12,7 @@ use crate::rtp_::{RtcpFb, RtpHeader, SenderInfo, SeqNo};
 use crate::rtp_::{SdesType, Ssrc};
 use crate::stats::{MediaIngressStats, RemoteEgressStats, StatsSnapshot};
 use crate::util::{InstantExt, SystemTimeExt};
-use crate::util::{already_happened, calculate_rtt};
+use crate::util::{already_happened, calculate_rtt, not_happening};
 
 use super::StreamPaused;
 use super::register::ReceiverRegister;
@@ -316,6 +316,39 @@ impl StreamRx {
 
     pub(crate) fn paused_at(&self) -> Option<Instant> {
         self.check_paused_at
+    }
+
+    /// Earliest instant at which this stream has `handle_timeout` work to do.
+    ///
+    /// Used by [`Streams`][super::Streams] to skip the sweep over all streams. Must never
+    /// be later than the point in time this stream actually needs handling.
+    pub(crate) fn timeout_at(&self) -> Instant {
+        // Pending requests are turned into RTCP feedback on the next sweep.
+        if self.pending_request_keyframe.is_some() || self.pending_request_remb.is_some() {
+            return already_happened();
+        }
+
+        // Probe streams never produce receiver reports. See `need_rr`.
+        let rr_at = if self.ssrc.is_probe() {
+            not_happening()
+        } else {
+            self.receiver_report_at()
+        };
+
+        match self.check_paused_at {
+            Some(v) => rr_at.min(v),
+            None => rr_at,
+        }
+    }
+
+    /// Whether this stream has an event waiting to be polled.
+    pub(crate) fn has_pending_event(&self) -> bool {
+        if self.ssrc.is_probe() {
+            // Probe streams emit neither paused nor sender info events.
+            return false;
+        }
+
+        self.need_paused_event || self.sender_info.as_ref().is_some_and(|i| !i.emitted)
     }
 
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
